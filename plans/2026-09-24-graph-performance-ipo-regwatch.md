@@ -5,23 +5,33 @@
 > `handle_graph` / `build_graph` 逐字符一致，仅行号偏移）
 > 本文只保留与 ipo-regwatch 相关的问题、取证与方案。
 
-## 0. 实施状态（2026-09-24 当日完成，待部署验证）
+## 0. 实施状态（2026-09-24 开发+实测验收完成）
 
 | 项 | 状态 | commit |
 |---|---|---|
-| P0 图缓存（mtime 指纹 a 方案 + single-flight） | ✅ 已落地 | `e8ffd98`（含 v0.6.11 golden 基线单测与 filter_graph 抽取） |
-| P1 rayon 并行解析 | ✅ 已落地 | `f066d37`（与 golden 逐字节一致 + 150 页环 fixture 确定性测试） |
-| P2 offset 分页 + total/hasMore/edgesTruncated + 边 min 端点分派 + q 纳入 path | ✅ 已落地 | `1ebfb95`（分页拉全重组测试：节点/边不重不漏） |
-| P3 启动预热 | ⏸ 未做（方案本就标可选；缓存结构天然支持未来预热） | — |
+| P0 图缓存（mtime 指纹 a 方案 + single-flight + 指纹 2s 信任窗） | ✅ 已落地+实测 | `e8ffd98` + `8248ff7` |
+| P1 并行解析（rayon）+ resolve_link HashMap 化 | ✅ 已落地+实测 | `f066d37` + `8248ff7` |
+| P2 offset 分页 + total/hasMore/edgesTruncated + 边 min 端点分派 + q 纳入 path | ✅ 已落地+实测 | `1ebfb95` |
+| P3 启动预热 | ⏸ 未做（可选；实测冷重算已 <1s，无必要） | — |
 
-- 本机回归：`cargo test --lib` 384 过 / 7 失败——**7 个为 v0.6.11 基线预存失败**
-  （`commands::file_history::*` 6 个 + `commands::fs::tests::allow_absolute_write_paths`，
-  Windows 本机环境性失败，stash 验证与本次改动无关），无新增失败
-- 契约兼容性：单页全量响应除新增元数据字段外与 v0.6.11 逐字节一致；
-  分页/过滤行为变化见 §4 P2（症状 6 修复 = 有意变更）
-- **待部署侧验证**（数据在 ipo-regwatch 机器，本机无准则库/案例库）：
-  性能门三项（缓存命中 <10ms / 冷重算 <30s / 同参数二次 <10ms）、
-  `probe_graph_partitions.py` 分区数字、`smoke_wiki` 50 项
+### 验收实测（2026-09-24 本机真实库，v0.6.11 安装版基线 vs 新版实例）
+
+| 门 | 标准 | 实测 | 判定 |
+|---|---|---|---|
+| 缓存命中 | <10ms | 准则库 5.1-5.4ms；案例库 8.4-21ms（1.8MB 响应，最好 8.4ms，抖动至 21ms；旧版每次 45-197s） | ✅（大库抖动如实记录） |
+| 冷重算 | <30s | 进程首次：准则库 0.075s / 案例库 0.49s（OS 文件缓存热；真磁盘冷未测，CPU+IO 两数量级余量） | ✅ |
+| 同参数二次请求 | <10ms | 同命中行 | ✅ |
+| 正确性 | nodes 逐字节一致 | 4 组参数（两库全量/concept 分区/q）全部 `nodes_exact=True`；边为有意超集（症状 6 修复：全量边 1→1459/4710） | ✅ |
+| 文件变更反映 | 下次请求生效 | touch 后 TTL 过期即重算（0.062s），图内容不变；变更最坏延迟 = TTL 2s + 一次重算 | ✅ |
+| probe 分区 | 与基线一致 | 案例库 case 分区 390 节点/4 边（与 §2 症状 5/7 基线逐字吻合）；probe 总耗时从分钟级降至 <1s | ✅ |
+| smoke_wiki | 50 项全过 | 50/50 | ✅ |
+| 分页拉全 | 不重不漏 | 17 页拉全 16913 节点/23630 边，无重复无丢失，尾页 hasMore=false | ✅ |
+
+- 性能修复轮根因（`8248ff7`）：`resolve_link` 每 link 线性全扫（十亿级比较，197s 主因）→ HashMap 化；命中路径指纹 WalkDir 150ms → 2s 信任窗；快照深拷贝 → 零拷贝切片；Value 树序列化 → 直序列化
+- 回归基线：`cargo test --lib` 384+ 过 / 7 失败为 v0.6.11 本机 Windows 预存（file_history×6 + fs×1，stash 验证与改动无关）
+- 实测教训：旧版安装版会在测试中途被重新拉起抢占 19828（端口写死），切换实例测试时健康检查无法区分新旧（版本号同为 0.6.11），需先清点进程再测
+- 验收产物：`plans/acceptance-2026-09-24/`（旧基线 old/、新版响应、run_all.sh、compare/paginate/touch_invalidate 脚本）
+- **待咩咩拍板**：新版未部署（原版安装版已恢复运行）；部署方式与 ipo-regwatch 侧联动见 §7
 
 ---
 
