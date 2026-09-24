@@ -31,7 +31,13 @@
 - 回归基线：`cargo test --lib` 384+ 过 / 7 失败为 v0.6.11 本机 Windows 预存（file_history×6 + fs×1，stash 验证与改动无关）
 - 实测教训：旧版安装版会在测试中途被重新拉起抢占 19828（端口写死），切换实例测试时健康检查无法区分新旧（版本号同为 0.6.11），需先清点进程再测
 - 验收产物：`plans/acceptance-2026-09-24/`（旧基线 old/、新版响应、run_all.sh、compare/paginate/touch_invalidate 脚本）
-- **待咩咩拍板**：新版未部署（原版安装版已恢复运行）；部署方式与 ipo-regwatch 侧联动见 §7
+- **已部署（2026-09-24 深夜咩咩拍板「覆盖」）**：安装目录 `C:\Users\Yang\AppData\Local\LLM Wiki\llm-wiki.exe`
+  已替换为优化版（原版备份同目录 `llm-wiki.exe.v0.6.11.bak`）；部署后实测 GUI 正常、
+  案例库冷重算 0.44s、命中 9.4ms。ipo-regwatch 侧联动（graph 预算收紧、
+  `truncated_suspect` 改读 `total`、S2 图谱路 A/B）见 §7 待做
+- 🚨 构建铁律：**桌面 exe 必须 `npx tauri build --no-bundle`**（tauri CLI 注入资产配置）；
+  裸 `cargo build --release` 产物 WebView 会连 devUrl `localhost:1420`，
+  打开后显示「无法访问此页面 localhost 拒绝连接」（2026-09-24 实测踩坑）
 
 ---
 
