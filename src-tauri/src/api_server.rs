@@ -2386,6 +2386,10 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(200)
         .clamp(1, 1000);
+    let offset = params
+        .get("offset")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
 
     match build_graph_cached(&project.path) {
         Ok(snapshot) => {
@@ -2394,11 +2398,18 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
                 snapshot.edges.clone(),
                 q.as_deref(),
                 node_type.as_deref(),
+                offset,
                 limit,
             );
+            let has_more = offset + filtered.nodes.len() < filtered.total;
             ok(json!({
                 "ok": true,
                 "projectId": project.id,
+                "total": filtered.total,
+                "offset": offset,
+                "limit": limit,
+                "hasMore": has_more,
+                "edgesTruncated": filtered.edges_truncated,
                 "nodes": filtered.nodes,
                 "edges": filtered.edges
             }))
@@ -2410,32 +2421,84 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
 struct GraphQueryResult {
     nodes: Vec<ApiGraphNode>,
     edges: Vec<ApiGraphEdge>,
+    /// Node count after q/nodeType filtering, before pagination truncation.
+    total: usize,
+    /// Whether the edges list was cut by MAX_GRAPH_EDGES_PER_RESPONSE.
+    edges_truncated: bool,
 }
 
-/// v0.6.11 graph query semantics, extracted verbatim from `handle_graph` so
-/// it is unit-testable: `q` (pre-lowercased) matches id/label substring,
-/// `node_type` (pre-lowercased) matches equality, nodes truncate to `limit`,
-/// then edges keep only those with both endpoints among the returned nodes.
+/// Defensive ceiling so a pathological wiki can't produce an unbounded
+/// edges array in one response. Real graphs stay far below it.
+const MAX_GRAPH_EDGES_PER_RESPONSE: usize = 20_000;
+
+/// /graph query semantics.
+///
+/// Filtering: `q` (pre-lowercased) matches id/label/path substring;
+/// `node_type` (pre-lowercased) matches equality.
+///
+/// Pagination: nodes are the filtered list sliced to
+/// `[offset, offset+limit)`, with `total` reporting the pre-slice count so
+/// callers can page through everything instead of guessing truncation.
+///
+/// Edges: an edge is returned by the page that owns its lower-indexed
+/// endpoint (`min(source_idx, target_idx)` inside the window). Both
+/// endpoints must survive filtering, but the other endpoint may live
+/// outside the current window — paging through all pages therefore
+/// reassembles the full edge set with no duplicates and no silent drops
+/// (the v0.6.11 behavior joined edges against the truncated node set and
+/// lost every edge whose far end was cut away).
 fn filter_graph(
     mut nodes: Vec<ApiGraphNode>,
     edges: Vec<ApiGraphEdge>,
     q: Option<&str>,
     node_type: Option<&str>,
+    offset: usize,
     limit: usize,
 ) -> GraphQueryResult {
     if let Some(q) = q {
-        nodes.retain(|n| n.id.to_lowercase().contains(q) || n.label.to_lowercase().contains(q));
+        nodes.retain(|n| {
+            n.id.to_lowercase().contains(q)
+                || n.label.to_lowercase().contains(q)
+                || n.path.to_lowercase().contains(q)
+        });
     }
     if let Some(node_type) = node_type {
         nodes.retain(|n| n.node_type == node_type);
     }
-    nodes.truncate(limit);
-    let ids: BTreeSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
-    let edges: Vec<ApiGraphEdge> = edges
-        .into_iter()
-        .filter(|e| ids.contains(&e.source) && ids.contains(&e.target))
+    let total = nodes.len();
+    let end = offset.saturating_add(limit).min(total);
+    let page_nodes: Vec<ApiGraphNode> = if offset < total {
+        nodes[offset..end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let index_of: std::collections::HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
         .collect();
-    GraphQueryResult { nodes, edges }
+    let mut page_edges: Vec<ApiGraphEdge> = Vec::new();
+    let mut edges_truncated = false;
+    for edge in edges {
+        // Both endpoints must survive filtering; an edge dangling into
+        // removed nodes is dropped entirely.
+        let (Some(&si), Some(&ti)) = (index_of.get(edge.source.as_str()), index_of.get(edge.target.as_str()))
+        else {
+            continue;
+        };
+        // The page owning the edge is the one containing its lower-indexed
+        // endpoint.
+        let owner = si.min(ti);
+        if owner >= offset && owner < end {
+            if page_edges.len() >= MAX_GRAPH_EDGES_PER_RESPONSE {
+                edges_truncated = true;
+                break;
+            }
+            page_edges.push(edge);
+        }
+    }
+    GraphQueryResult { nodes: page_nodes, edges: page_edges, total, edges_truncated }
 }
 
 // ---- graph snapshot cache -------------------------------------------
@@ -3733,45 +3796,88 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn graph_edge_pairs(r: &GraphQueryResult) -> Vec<(&str, &str)> {
+        r.edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect()
+    }
+
     #[test]
     fn graph_query_filter_and_edge_join_baseline() {
         let root = test_project_dir();
         let (nodes, edges) = graph_fixture(&root);
+        let pairs = graph_edge_pairs;
 
-        // nodeType filter keeps only matching nodes; edges then require BOTH
-        // endpoints among returned nodes, so a single-node result loses every
-        // edge (the truncation-drops-edges symptom, pinned as current law).
-        let r = filter_graph(nodes.clone(), edges.clone(), None, Some("note"), 200);
-        assert_eq!(r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
-        assert!(r.edges.is_empty());
+        // Full page: same nodes/edges the v0.6.11 single-page response
+        // returned (query-hub edge drops because its source node was
+        // filtered out at build time), plus the new paging metadata.
+        let r = filter_graph(nodes.clone(), edges.clone(), None, None, 0, 200);
+        assert_eq!(r.total, 4);
+        assert_eq!(
+            r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["attention", "gpu-cluster", "transformer", "检索"]
+        );
+        assert_eq!(pairs(&r), vec![
+            ("attention", "检索"),
+            ("gpu-cluster", "检索"),
+            ("transformer", "attention"),
+        ]);
+        assert!(!r.edges_truncated);
 
-        // q matches id (attention contains "att") — same single-node shape.
-        let r = filter_graph(nodes.clone(), edges.clone(), Some("att"), None, 200);
-        assert_eq!(r.nodes.len(), 1);
-        assert_eq!(r.nodes[0].id, "attention");
-        assert!(r.edges.is_empty());
-
-        // q matches label ("gpu cluster" contains "cluster").
-        let r = filter_graph(nodes.clone(), edges.clone(), Some("cluster"), None, 200);
-        assert_eq!(r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["gpu-cluster"]);
-
-        // limit=3 truncates away 检索: both 检索-edges vanish, query-hub edge
-        // was already gone (query nodes are filtered), transformer edge kept.
-        let r = filter_graph(nodes.clone(), edges.clone(), None, None, 3);
+        // Truncated page keeps edges whose far endpoint fell outside the
+        // window (the v0.6.11 symptom 6 fix): both 检索 edges survive even
+        // though 检索 itself is on the next page.
+        let r = filter_graph(nodes.clone(), edges.clone(), None, None, 0, 3);
         assert_eq!(
             r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["attention", "gpu-cluster", "transformer"]
         );
-        let pairs: Vec<(&str, &str)> =
-            r.edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
-        assert_eq!(pairs, vec![("transformer", "attention")]);
+        assert_eq!(r.total, 4);
+        assert_eq!(pairs(&r), vec![
+            ("attention", "检索"),
+            ("gpu-cluster", "检索"),
+            ("transformer", "attention"),
+        ]);
 
-        // limit >= total keeps every node; edges still require both
-        // endpoints among returned nodes, so the query-hub edge is dropped
-        // here (its source node was already filtered out by build_graph).
-        let r = filter_graph(nodes, edges, None, None, 200);
-        assert_eq!(r.nodes.len(), 4);
-        assert_eq!(r.edges.len(), 3);
+        // Second (last) page owns no edges: every edge's lower-indexed
+        // endpoint lives on page one. Union of both pages reassembles the
+        // full graph — no duplicate, no drop.
+        let r2 = filter_graph(nodes.clone(), edges.clone(), None, None, 3, 200);
+        assert_eq!(
+            r2.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["检索"]
+        );
+        assert_eq!(r2.total, 4);
+        assert!(pairs(&r2).is_empty());
+
+        // Offset beyond total: empty page, not an error.
+        let r3 = filter_graph(nodes.clone(), edges.clone(), None, None, 40, 200);
+        assert!(r3.nodes.is_empty());
+        assert_eq!(r3.total, 4);
+
+        // nodeType filter: single node, every edge loses an endpoint to the
+        // filter, so no edges come back.
+        let r = filter_graph(nodes.clone(), edges.clone(), None, Some("note"), 0, 200);
+        assert_eq!(r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
+        assert_eq!(r.total, 1);
+        assert!(r.edges.is_empty());
+
+        // q matches id (attention contains "att").
+        let r = filter_graph(nodes.clone(), edges.clone(), Some("att"), None, 0, 200);
+        assert_eq!(r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
+
+        // q matches label ("gpu cluster" contains "cluster").
+        let r = filter_graph(nodes.clone(), edges.clone(), Some("cluster"), None, 0, 200);
+        assert_eq!(
+            r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["gpu-cluster"]
+        );
+
+        // q now also matches path: "sub" only appears in
+        // wiki/sub/attention.md, a recall the id/label-only match missed.
+        let r = filter_graph(nodes, edges, Some("sub"), None, 0, 200);
+        assert_eq!(
+            r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["attention"]
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3886,6 +3992,56 @@ mod tests {
         assert_eq!(winner.path, "wiki/page-007.md");
         // Ring edges (150) + per-page links to 检索 (150), all deduped.
         assert_eq!(edges1.len(), 300);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_pagination_reassembles_full_graph() {
+        let root = test_project_dir();
+        let wiki = root.join("wiki");
+        for i in 0..150 {
+            let next = if i + 1 < 150 { i + 1 } else { 0 };
+            fs::write(
+                wiki.join(format!("page-{i:03}.md")),
+                format!("---\ntype: note\n---\n# Page {i}\n\n[[page-{next:03}]] [[检索]]\n"),
+            )
+            .unwrap();
+        }
+        fs::write(wiki.join("检索.md"), "type: workflow\n").unwrap();
+
+        let path = root.to_string_lossy().to_string();
+        let (nodes, edges) = build_graph(&path).unwrap();
+        let full = filter_graph(nodes.clone(), edges.clone(), None, None, 0, 1000);
+        assert_eq!(full.total, 151);
+        assert_eq!(full.edges.len(), 300);
+
+        // Page through with a limit that splits the ring across pages; the
+        // min-owner rule must reassemble exactly the single-page result.
+        let mut got_ids: Vec<String> = Vec::new();
+        let mut got_edges: Vec<(String, String)> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let r = filter_graph(nodes.clone(), edges.clone(), None, None, offset, 40);
+            got_ids.extend(r.nodes.iter().map(|n| n.id.clone()));
+            got_edges.extend(r.edges.iter().map(|e| (e.source.clone(), e.target.clone())));
+            let consumed = offset + r.nodes.len();
+            assert!(consumed <= r.total, "pagination ran past total");
+            if consumed == r.total {
+                break;
+            }
+            offset = consumed;
+        }
+        assert_eq!(got_ids, full.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>());
+        assert_eq!(got_edges.len(), 300);
+        let unique: BTreeSet<&(String, String)> = got_edges.iter().collect();
+        assert_eq!(unique.len(), got_edges.len(), "paged edges must not repeat");
+        let full_pairs: BTreeSet<(String, String)> = full
+            .edges
+            .iter()
+            .map(|e| (e.source.clone(), e.target.clone()))
+            .collect();
+        let got_set: BTreeSet<(String, String)> = got_edges.into_iter().collect();
+        assert_eq!(got_set, full_pairs);
         let _ = fs::remove_dir_all(root);
     }
 }
