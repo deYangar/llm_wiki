@@ -67,6 +67,9 @@ sha2 = "0.10"
 md-5 = "0.10"
 notify = "8"
 walkdir = "2"
+# build_graph parses thousands of wiki files per rebuild; rayon parallelizes
+# the per-file read + title/type/wikilink extraction across cores.
+rayon = "1"
 epub = "2.1.5"
 mobi = "0.8"
 html2text = { version = "0.17.1", default-features = false, features = ["xml"] }

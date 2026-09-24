@@ -4772,6 +4772,7 @@ dependencies = [
  "notify",
  "office_oxide",
  "pdfium-render",
+ "rayon",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
