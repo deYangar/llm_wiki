@@ -1,7 +1,8 @@
 # /graph 图谱接口性能优化方案（服务 ipo-regwatch）
 
 > 日期：2026-09-24 · 消费方：ipo-regwatch（IPO 监管智能问答平台）
-> 分析基线：本仓库 main（v0.4.22）；本机运行版本 v0.6.11（见 §6 版本对齐）
+> 分析基线：main = **v0.6.11**（2026-09-24 已与运行实例对齐；与 v0.4.22 的
+> `handle_graph` / `build_graph` 逐字符一致，仅行号偏移）
 > 本文只保留与 ipo-regwatch 相关的问题、取证与方案。
 
 ---
@@ -30,18 +31,21 @@ ipo-regwatch 以两台 LLM Wiki 为知识底座（准则库 6081 页 / 案例库
 
 ## 3. 根因（源码定位）
 
-**`build_graph()`（`src-tauri/src/api_server.rs:1257`）每次请求都全量重算：**
+**`build_graph()`（`src-tauri/src/api_server.rs:2411`）每次请求都全量重算：**
 
 1. `WalkDir` 遍历 wiki 目录全部 `.md` 文件（准则库 6081 个）
 2. 逐文件 `read_to_string` 全文读入
 3. 逐文件 `extract_title` + `extract_type` + `extract_wikilinks`（全文解析）
 4. BTreeMap 组装 + 链接解析建边
 
-**零缓存、零索引**。`q`/`nodeType`/`limit` 过滤发生在建图完成之后（`api_server.rs:1237-1245`），
+**零缓存、零索引**。`q`/`nodeType`/`limit` 过滤发生在建图完成之后（`api_server.rs:2391-2399`），
 这解释了症状 1（耗时与过滤参数无关）。
 
-**线程模型不缺并发**：server 已是每请求一线程（`api_server.rs:90 thread::spawn`），
+**线程模型不缺并发**：server 已是每请求一线程（`api_server.rs:102 thread::spawn`），
 带 429 限流与并发槽保护。单请求慢与线程数无关。
+
+> 事实备注（0.6.11 复核）：`q` 过滤只匹配 `id` 与 `label`，**不含 `path`**；
+> P2 改造时顺手把 `path` 纳入过滤可提升按路径检索的召回。
 
 **辅助证据**：`/search` 只需 1~2s（有独立索引），说明慢是 /graph 独有的「每次全量读盘解析」问题。
 
@@ -88,12 +92,13 @@ title/type/wikilink 解析并行（CPU 密集部分天然可并行，文件间�
 | 正确性门 | 改造前后对同一 project、同一组 q/nodeType/limit 的 nodes+edges 逐字节一致（P2 的 total/offset 除外）；文件新增/修改/删除后图在下次请求反映变更 |
 | 回归门 | 消费方 `smoke_wiki` 50 项全过；`probe_graph_partitions.py` 分区数字与基线一致（数据未变时） |
 
-## 6. 版本对齐风险（改造前必须确认）
+## 6. 版本对齐（已解决，2026-09-24）
 
-- 本仓库 main = **v0.4.22**；ipo-regwatch 本机运行实例 = **v0.6.11**
-- 本方案的源码引用（行号、函数名）基于 0.4.22；0.6.11 若有重构需先比对
-- **改造分支必须基于与运行实例同源的代码**，否则编译产物与生产行为不一致
-- 待办：把 0.6.11 源码对齐进 fork（推送或提供 tarball），再开工 P0-P3
+- ~~fork main = v0.4.22 vs 运行实例 = v0.6.11~~ —— 上游已同步 v0.6.11，
+  本地 main 已对齐（`e808211`）并复核：`handle_graph` / `build_graph` 与
+  0.4.22 逐字符一致，仅行号偏移（1257→2411 等），方案全部适用
+- 上游历史曾被强推改写，与旧基点 rebase 会把上游旧 commit 误当本地改动重放；
+  正确姿势是 `reset --hard origin/main` + cherry-pick 本地 commit
 
 ## 7. 与消费方的联动（ipo-regwatch 侧）
 
