@@ -264,22 +264,44 @@ fn process_request(app: AppHandle, mut request: tiny_http::Request) {
         eprintln!("[API Server] request panicked: {payload:?}");
         err(500, "Internal API server error")
     });
-    respond_json(request, response.status, response.body, origin.as_deref());
+    respond_api(request, response, origin.as_deref());
+}
+
+fn respond_api(request: tiny_http::Request, response: ApiResponse, origin: Option<&str>) {
+    if let Some(raw) = response.raw {
+        let mut resp = Response::from_data(raw).with_status_code(StatusCode(response.status));
+        if let Ok(header) =
+            Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        {
+            resp = resp.with_header(header);
+        }
+        for header in cors_headers(origin) {
+            resp.add_header(header);
+        }
+        let _ = request.respond(resp);
+        return;
+    }
+    respond_json(request, response.status, response.body, origin);
 }
 
 struct ApiResponse {
     status: u16,
     body: Value,
+    /// Pre-serialized body; when set, `body` is ignored. Lets handlers with
+    /// multi-megabyte payloads (e.g. /graph) skip building a serde_json
+    /// Value tree and serialize straight to bytes.
+    raw: Option<Vec<u8>>,
 }
 
 fn ok(body: Value) -> ApiResponse {
-    ApiResponse { status: 200, body }
+    ApiResponse { status: 200, body, raw: None }
 }
 
 fn err(status: u16, message: impl Into<String>) -> ApiResponse {
     ApiResponse {
         status,
         body: json!({ "ok": false, "error": message.into() }),
+        raw: None,
     }
 }
 
@@ -2394,33 +2416,69 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
     match build_graph_cached(&project.path) {
         Ok(snapshot) => {
             let filtered = filter_graph(
-                snapshot.nodes.clone(),
-                snapshot.edges.clone(),
+                &snapshot.nodes,
+                &snapshot.edges,
                 q.as_deref(),
                 node_type.as_deref(),
                 offset,
                 limit,
             );
-            let has_more = offset + filtered.nodes.len() < filtered.total;
-            ok(json!({
-                "ok": true,
-                "projectId": project.id,
-                "total": filtered.total,
-                "offset": offset,
-                "limit": limit,
-                "hasMore": has_more,
-                "edgesTruncated": filtered.edges_truncated,
-                "nodes": filtered.nodes,
-                "edges": filtered.edges
-            }))
+            let has_more = offset + filtered.nodes.as_slice().len() < filtered.total;
+            let payload = GraphApiResponse {
+                ok: true,
+                project_id: &project.id,
+                total: filtered.total,
+                offset,
+                limit,
+                has_more,
+                edges_truncated: filtered.edges_truncated,
+                nodes: filtered.nodes.as_slice(),
+                edges: &filtered.edges,
+            };
+            match serde_json::to_vec(&payload) {
+                Ok(bytes) => ApiResponse { status: 200, body: Value::Null, raw: Some(bytes) },
+                Err(e) => err(500, format!("graph serialization failed: {e}")),
+            }
         }
         Err(e) => err(500, e),
     }
 }
 
-struct GraphQueryResult {
-    nodes: Vec<ApiGraphNode>,
-    edges: Vec<ApiGraphEdge>,
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphApiResponse<'a> {
+    ok: bool,
+    project_id: &'a str,
+    total: usize,
+    offset: usize,
+    limit: usize,
+    has_more: bool,
+    edges_truncated: bool,
+    nodes: &'a [ApiGraphNode],
+    edges: &'a [&'a ApiGraphEdge],
+}
+
+/// Page nodes as either a borrowed slice of the snapshot (unfiltered
+/// queries keep the snapshot's own order, so the page window IS a slice)
+/// or an owned copy (filtered queries collect a subset). Keeps cache hits
+/// copy-free for the default enumeration path.
+enum PageNodes<'a> {
+    Slice(&'a [ApiGraphNode]),
+    Owned(Vec<ApiGraphNode>),
+}
+
+impl PageNodes<'_> {
+    fn as_slice(&self) -> &[ApiGraphNode] {
+        match self {
+            PageNodes::Slice(slice) => slice,
+            PageNodes::Owned(owned) => owned,
+        }
+    }
+}
+
+struct GraphQueryResult<'a> {
+    nodes: PageNodes<'a>,
+    edges: Vec<&'a ApiGraphEdge>,
     /// Node count after q/nodeType filtering, before pagination truncation.
     total: usize,
     /// Whether the edges list was cut by MAX_GRAPH_EDGES_PER_RESPONSE.
@@ -2447,55 +2505,94 @@ const MAX_GRAPH_EDGES_PER_RESPONSE: usize = 20_000;
 /// reassembles the full edge set with no duplicates and no silent drops
 /// (the v0.6.11 behavior joined edges against the truncated node set and
 /// lost every edge whose far end was cut away).
-fn filter_graph(
-    mut nodes: Vec<ApiGraphNode>,
-    edges: Vec<ApiGraphEdge>,
+fn filter_graph<'a>(
+    nodes: &'a [ApiGraphNode],
+    edges: &'a [OwnedGraphEdge],
     q: Option<&str>,
     node_type: Option<&str>,
     offset: usize,
     limit: usize,
-) -> GraphQueryResult {
-    if let Some(q) = q {
-        nodes.retain(|n| {
+) -> GraphQueryResult<'a> {
+    let matches_query = |n: &ApiGraphNode| match (q, node_type) {
+        (Some(q), Some(node_type)) => {
+            (n.id.to_lowercase().contains(q)
+                || n.label.to_lowercase().contains(q)
+                || n.path.to_lowercase().contains(q))
+                && n.node_type == node_type
+        }
+        (Some(q), None) => {
             n.id.to_lowercase().contains(q)
                 || n.label.to_lowercase().contains(q)
                 || n.path.to_lowercase().contains(q)
-        });
-    }
-    if let Some(node_type) = node_type {
-        nodes.retain(|n| n.node_type == node_type);
-    }
-    let total = nodes.len();
-    let end = offset.saturating_add(limit).min(total);
-    let page_nodes: Vec<ApiGraphNode> = if offset < total {
-        nodes[offset..end].to_vec()
-    } else {
-        Vec::new()
+        }
+        (None, Some(node_type)) => n.node_type == node_type,
+        (None, None) => true,
     };
+    // Unfiltered queries keep the snapshot's own ordering, so the page
+    // window is a straight slice of `nodes` (zero-copy) and the
+    // precomputed min_index is the filtered position as-is; filtered
+    // queries collect an owned subset and build an id→index map.
+    let unfiltered = q.is_none() && node_type.is_none();
+    let (page_nodes, total, filtered): (PageNodes<'a>, usize, Option<Vec<&'a ApiGraphNode>>) =
+        if unfiltered {
+            let total = nodes.len();
+            let end = offset.saturating_add(limit).min(total);
+            (
+                if offset < total { PageNodes::Slice(&nodes[offset..end]) } else { PageNodes::Owned(Vec::new()) },
+                total,
+                None,
+            )
+        } else {
+            let filtered: Vec<&ApiGraphNode> = nodes.iter().filter(|n| matches_query(n)).collect();
+            let total = filtered.len();
+            let end = offset.saturating_add(limit).min(total);
+            (
+                if offset < total {
+                    PageNodes::Owned(filtered[offset..end].iter().map(|n| (*n).clone()).collect())
+                } else {
+                    PageNodes::Owned(Vec::new())
+                },
+                total,
+                Some(filtered),
+            )
+        };
+    let end = offset.saturating_add(limit).min(total);
 
-    let index_of: std::collections::HashMap<&str, usize> = nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.id.as_str(), i))
-        .collect();
-    let mut page_edges: Vec<ApiGraphEdge> = Vec::new();
+    let index_of: Option<std::collections::HashMap<&str, usize>> = match &filtered {
+        None => None,
+        Some(filtered) => Some(
+            filtered
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.id.as_str(), i))
+                .collect(),
+        ),
+    };
+    let mut page_edges: Vec<&ApiGraphEdge> = Vec::new();
     let mut edges_truncated = false;
-    for edge in edges {
+    for owned in edges {
         // Both endpoints must survive filtering; an edge dangling into
-        // removed nodes is dropped entirely.
-        let (Some(&si), Some(&ti)) = (index_of.get(edge.source.as_str()), index_of.get(edge.target.as_str()))
-        else {
-            continue;
+        // removed nodes (including edges leaving query-type pages, which
+        // never join the node list) is dropped entirely.
+        let owner = match &index_of {
+            None => owned.min_index,
+            Some(index_of) => {
+                let (Some(&si), Some(&ti)) =
+                    (index_of.get(owned.edge.source.as_str()), index_of.get(owned.edge.target.as_str()))
+                else {
+                    continue;
+                };
+                si.min(ti)
+            }
         };
         // The page owning the edge is the one containing its lower-indexed
         // endpoint.
-        let owner = si.min(ti);
         if owner >= offset && owner < end {
             if page_edges.len() >= MAX_GRAPH_EDGES_PER_RESPONSE {
                 edges_truncated = true;
                 break;
             }
-            page_edges.push(edge);
+            page_edges.push(&owned.edge);
         }
     }
     GraphQueryResult { nodes: page_nodes, edges: page_edges, total, edges_truncated }
@@ -2513,13 +2610,55 @@ fn filter_graph(
 
 struct GraphSnapshot {
     nodes: Vec<ApiGraphNode>,
-    edges: Vec<ApiGraphEdge>,
+    /// Edges with each endpoint's position in `nodes` precomputed at build
+    /// time. Unfiltered queries slice pages by `min_index` directly and
+    /// skip building an id→position map on every cache hit.
+    edges: Vec<OwnedGraphEdge>,
+}
+
+struct OwnedGraphEdge {
+    edge: ApiGraphEdge,
+    min_index: usize,
+}
+
+/// Precompute each edge's lower endpoint position in `nodes`; edges whose
+/// endpoints never join the node list (edges leaving query-type pages) get
+/// usize::MAX, which no page window can own — they are dropped everywhere,
+/// matching the v0.6.11 behavior of joining edges against the node set.
+fn own_edges(nodes: &[ApiGraphNode], edges: Vec<ApiGraphEdge>) -> Vec<OwnedGraphEdge> {
+    let id_pos: std::collections::HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+    edges
+        .into_iter()
+        .map(|edge| OwnedGraphEdge {
+            min_index: id_pos
+                .get(edge.source.as_str())
+                .zip(id_pos.get(edge.target.as_str()))
+                .map(|(&s, &t)| s.min(t))
+                .unwrap_or(usize::MAX),
+            edge,
+        })
+        .collect()
 }
 
 struct GraphCacheEntry {
     fingerprint: u64,
     snapshot: Arc<GraphSnapshot>,
+    /// When the fingerprint was last verified. Re-checking walks the wiki
+    /// tree metadata (~150ms for 17k files), so fresh fingerprints are
+    /// trusted for FINGERPRINT_RECHECK_TTL instead of paying that on every
+    /// cache hit; a file change is reflected at worst TTL + one rebuild
+    /// later.
+    fingerprint_at: Instant,
 }
+
+/// How long a verified fingerprint is trusted before the next /graph
+/// request re-walks the metadata. The recheck cost is amortized to at most
+/// one walk per project per TTL window.
+const FINGERPRINT_RECHECK_TTL: Duration = Duration::from_secs(2);
 
 static GRAPH_CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, GraphCacheEntry>>> =
     OnceLock::new();
@@ -2559,15 +2698,39 @@ fn graph_fingerprint(wiki_root: &Path) -> u64 {
 }
 
 fn build_graph_cached(project_path: &str) -> Result<Arc<GraphSnapshot>, String> {
-    let fingerprint = graph_fingerprint(&wiki_root_of(project_path));
+    build_graph_cached_with_ttl(project_path, FINGERPRINT_RECHECK_TTL)
+}
 
+fn build_graph_cached_with_ttl(
+    project_path: &str,
+    ttl: Duration,
+) -> Result<Arc<GraphSnapshot>, String> {
+    // Fast path: a fingerprint verified within the TTL is trusted as-is,
+    // skipping the metadata walk entirely.
     let cache = GRAPH_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Ok(entries) = cache.lock() {
-        if let Some(entry) = entries.get(Path::new(project_path)) {
-            if entry.fingerprint == fingerprint {
-                return Ok(entry.snapshot.clone());
+    if ttl > Duration::ZERO {
+        if let Ok(entries) = cache.lock() {
+            if let Some(entry) = entries.get(Path::new(project_path)) {
+                if entry.fingerprint_at.elapsed() < ttl {
+                    return Ok(entry.snapshot.clone());
+                }
             }
         }
+    }
+
+    let fingerprint = graph_fingerprint(&wiki_root_of(project_path));
+    // Verify + refresh + fetch under one lock; None means stale or missing.
+    let try_hit = |cache: &Mutex<std::collections::HashMap<PathBuf, GraphCacheEntry>>| {
+        let mut entries = cache.lock().ok()?;
+        let entry = entries.get_mut(Path::new(project_path))?;
+        if entry.fingerprint != fingerprint {
+            return None;
+        }
+        entry.fingerprint_at = Instant::now();
+        Some(entry.snapshot.clone())
+    };
+    if let Some(snapshot) = try_hit(cache) {
+        return Ok(snapshot);
     }
 
     // Miss. Take a per-project build lock so concurrent misses for the same
@@ -2583,20 +2746,21 @@ fn build_graph_cached(project_path: &str) -> Result<Arc<GraphSnapshot>, String> 
     };
     let _guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    if let Ok(entries) = cache.lock() {
-        if let Some(entry) = entries.get(Path::new(project_path)) {
-            if entry.fingerprint == fingerprint {
-                return Ok(entry.snapshot.clone());
-            }
-        }
+    if let Some(snapshot) = try_hit(cache) {
+        return Ok(snapshot);
     }
 
     let (nodes, edges) = build_graph(project_path)?;
+    let edges = own_edges(&nodes, edges);
     let snapshot = Arc::new(GraphSnapshot { nodes, edges });
     if let Ok(mut entries) = cache.lock() {
         entries.insert(
             PathBuf::from(project_path),
-            GraphCacheEntry { fingerprint, snapshot: snapshot.clone() },
+            GraphCacheEntry {
+                fingerprint,
+                snapshot: snapshot.clone(),
+                fingerprint_at: Instant::now(),
+            },
         );
     }
     Ok(snapshot)
@@ -2641,12 +2805,26 @@ fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdg
         raw.insert(id, (title, node_type, rel_path, links));
     }
     let ids: BTreeSet<String> = raw.keys().cloned().collect();
+    // Precomputed lookup tables for resolve_link. The original form ran a
+    // linear scan over all ids for every non-exact wikilink match; with
+    // 17k nodes and tens of thousands of links that dominated the build.
+    // BTreeSet iteration is ascending and or_insert keeps the FIRST id per
+    // folded key, i.e. the lexicographically smallest — matching the old
+    // `ids.iter().find()` first-match semantics.
+    let mut by_lower = std::collections::HashMap::with_capacity(ids.len());
+    let mut by_norm = std::collections::HashMap::with_capacity(ids.len());
+    for id in &ids {
+        by_lower.entry(id.to_lowercase()).or_insert_with(|| id.clone());
+        by_norm
+            .entry(id.to_lowercase().replace(' ', "-"))
+            .or_insert_with(|| id.clone());
+    }
     let mut link_count: BTreeMap<String, usize> = raw.keys().map(|id| (id.clone(), 0)).collect();
     let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
     for (source, (_, _, _, links)) in &raw {
         for link in links {
-            let Some(target) = resolve_link(link, &ids) else {
+            let Some(target) = resolve_link(link, &ids, &by_lower, &by_norm) else {
                 continue;
             };
             if &target == source {
@@ -2713,14 +2891,25 @@ fn extract_wikilinks(content: &str) -> Vec<String> {
     out
 }
 
-fn resolve_link(raw: &str, ids: &BTreeSet<String>) -> Option<String> {
+fn resolve_link(
+    raw: &str,
+    ids: &BTreeSet<String>,
+    by_lower: &std::collections::HashMap<String, String>,
+    by_norm: &std::collections::HashMap<String, String>,
+) -> Option<String> {
     if ids.contains(raw) {
         return Some(raw.to_string());
     }
-    let normalized = raw.to_lowercase().replace(' ', "-");
-    ids.iter()
-        .find(|id| id.to_lowercase() == normalized || id.to_lowercase() == raw.to_lowercase())
-        .cloned()
+    let lower = raw.to_lowercase();
+    let normalized = lower.replace(' ', "-");
+    // The old form scanned ids in ascending order taking the first match on
+    // either predicate; each table hit holds its smallest matching id, so
+    // the overall winner is the smaller of the two candidates.
+    match (by_norm.get(&normalized), by_lower.get(&lower)) {
+        (Some(a), Some(b)) => Some(if a <= b { a.clone() } else { b.clone() }),
+        (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+        (None, None) => None,
+    }
 }
 
 fn handle_rescan(app: &AppHandle, project_id: &str) -> ApiResponse {
@@ -3796,7 +3985,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn graph_edge_pairs(r: &GraphQueryResult) -> Vec<(&str, &str)> {
+    fn graph_edge_pairs<'a>(r: &'a GraphQueryResult) -> Vec<(&'a str, &'a str)> {
         r.edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect()
     }
 
@@ -3804,15 +3993,16 @@ mod tests {
     fn graph_query_filter_and_edge_join_baseline() {
         let root = test_project_dir();
         let (nodes, edges) = graph_fixture(&root);
+        let edges = own_edges(&nodes, edges);
         let pairs = graph_edge_pairs;
 
         // Full page: same nodes/edges the v0.6.11 single-page response
         // returned (query-hub edge drops because its source node was
         // filtered out at build time), plus the new paging metadata.
-        let r = filter_graph(nodes.clone(), edges.clone(), None, None, 0, 200);
+        let r = filter_graph(&nodes, &edges, None, None, 0, 200);
         assert_eq!(r.total, 4);
         assert_eq!(
-            r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["attention", "gpu-cluster", "transformer", "检索"]
         );
         assert_eq!(pairs(&r), vec![
@@ -3825,9 +4015,9 @@ mod tests {
         // Truncated page keeps edges whose far endpoint fell outside the
         // window (the v0.6.11 symptom 6 fix): both 检索 edges survive even
         // though 检索 itself is on the next page.
-        let r = filter_graph(nodes.clone(), edges.clone(), None, None, 0, 3);
+        let r = filter_graph(&nodes, &edges, None, None, 0, 3);
         assert_eq!(
-            r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["attention", "gpu-cluster", "transformer"]
         );
         assert_eq!(r.total, 4);
@@ -3840,45 +4030,85 @@ mod tests {
         // Second (last) page owns no edges: every edge's lower-indexed
         // endpoint lives on page one. Union of both pages reassembles the
         // full graph — no duplicate, no drop.
-        let r2 = filter_graph(nodes.clone(), edges.clone(), None, None, 3, 200);
+        let r2 = filter_graph(&nodes, &edges, None, None, 3, 200);
         assert_eq!(
-            r2.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            r2.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["检索"]
         );
         assert_eq!(r2.total, 4);
         assert!(pairs(&r2).is_empty());
 
         // Offset beyond total: empty page, not an error.
-        let r3 = filter_graph(nodes.clone(), edges.clone(), None, None, 40, 200);
-        assert!(r3.nodes.is_empty());
+        let r3 = filter_graph(&nodes, &edges, None, None, 40, 200);
+        assert!(r3.nodes.as_slice().is_empty());
         assert_eq!(r3.total, 4);
 
         // nodeType filter: single node, every edge loses an endpoint to the
         // filter, so no edges come back.
-        let r = filter_graph(nodes.clone(), edges.clone(), None, Some("note"), 0, 200);
-        assert_eq!(r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
+        let r = filter_graph(&nodes, &edges, None, Some("note"), 0, 200);
+        assert_eq!(r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
         assert_eq!(r.total, 1);
         assert!(r.edges.is_empty());
 
         // q matches id (attention contains "att").
-        let r = filter_graph(nodes.clone(), edges.clone(), Some("att"), None, 0, 200);
-        assert_eq!(r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
+        let r = filter_graph(&nodes, &edges, Some("att"), None, 0, 200);
+        assert_eq!(r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
 
         // q matches label ("gpu cluster" contains "cluster").
-        let r = filter_graph(nodes.clone(), edges.clone(), Some("cluster"), None, 0, 200);
+        let r = filter_graph(&nodes, &edges, Some("cluster"), None, 0, 200);
         assert_eq!(
-            r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["gpu-cluster"]
         );
 
         // q now also matches path: "sub" only appears in
         // wiki/sub/attention.md, a recall the id/label-only match missed.
-        let r = filter_graph(nodes, edges, Some("sub"), None, 0, 200);
+        let r = filter_graph(&nodes, &edges, Some("sub"), None, 0, 200);
         assert_eq!(
-            r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["attention"]
+        );
+
+        // q + nodeType must both hold: "att" matches attention's id, but
+        // the node_type mismatch excludes it (guards the && vs || pitfall).
+        let r = filter_graph(&nodes, &edges, Some("att"), Some("hardware"), 0, 200);
+        assert!(r.nodes.as_slice().is_empty());
+        let r = filter_graph(&nodes, &edges, Some("att"), Some("note"), 0, 200);
+        assert_eq!(
+            r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["attention"]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_link_table_lookup_matches_first_match_semantics() {
+        // ids as a set iterate ascending; the folded tables must keep the
+        // lexicographically smallest id per conflict group, and a link
+        // hitting both tables must resolve to the smaller candidate —
+        // exactly what the old ascending `ids.iter().find()` returned.
+        let ids: BTreeSet<String> = ["Alpha", "alpha", "beta-one", "Beta One", "gamma"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut by_lower = std::collections::HashMap::new();
+        let mut by_norm = std::collections::HashMap::new();
+        for id in &ids {
+            by_lower.entry(id.to_lowercase()).or_insert_with(|| id.clone());
+            by_norm
+                .entry(id.to_lowercase().replace(' ', "-"))
+                .or_insert_with(|| id.clone());
+        }
+        // Exact hit.
+        assert_eq!(resolve_link("gamma", &ids, &by_lower, &by_norm).as_deref(), Some("gamma"));
+        // Case-folded hit on a conflict group: "Alpha" < "alpha" (ASCII).
+        assert_eq!(resolve_link("ALPHA", &ids, &by_lower, &by_norm).as_deref(), Some("Alpha"));
+        // Space-normalized hit: "beta one" → "beta-one", group has
+        // "Beta One" (norms to "beta-one") vs "beta-one"; "Beta One" is
+        // smaller ('B' 0x42 < 'b' 0x62).
+        assert_eq!(resolve_link("beta one", &ids, &by_lower, &by_norm).as_deref(), Some("Beta One"));
+        // Miss.
+        assert_eq!(resolve_link("missing", &ids, &by_lower, &by_norm), None);
     }
 
     // ---- graph snapshot cache (P0) --------------------------------------
@@ -3901,7 +4131,10 @@ mod tests {
         let root = test_project_dir();
         write_graph_fixture(&root);
         let path = root.to_string_lossy().to_string();
-        let first = build_graph_cached(&path).unwrap();
+        // ttl=0 disables the trust window so every call re-verifies the
+        // fingerprint — the invalidation semantics under test.
+        let get = || build_graph_cached_with_ttl(&path, Duration::ZERO).unwrap();
+        let first = get();
 
         // Edit: new content (and mtime) — next call must rebuild and
         // reflect the change.
@@ -3910,21 +4143,39 @@ mod tests {
             "type: hardware\n\n# GPU 集群\n[[检索]] [[transformer]]\n",
         )
         .unwrap();
-        let second = build_graph_cached(&path).unwrap();
+        let second = get();
         assert!(!Arc::ptr_eq(&first, &second));
         let gpu = second.nodes.iter().find(|n| n.id == "gpu-cluster").unwrap();
         assert_eq!(gpu.label, "GPU 集群");
 
         // Add: a new file joins the graph.
         fs::write(root.join("wiki").join("新增.md"), "type: concept\n").unwrap();
-        let third = build_graph_cached(&path).unwrap();
+        let third = get();
         assert!(!Arc::ptr_eq(&second, &third));
         assert!(third.nodes.iter().any(|n| n.id == "新增"));
 
         // Remove: the file leaves the graph.
         fs::remove_file(root.join("wiki").join("新增.md")).unwrap();
-        let fourth = build_graph_cached(&path).unwrap();
+        let fourth = get();
         assert!(!fourth.nodes.iter().any(|n| n.id == "新增"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_cache_trusts_fresh_fingerprint_within_ttl() {
+        let root = test_project_dir();
+        write_graph_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        let first = build_graph_cached(&path).unwrap();
+        // Within the TTL the entry is trusted without a metadata walk, so
+        // even a disk change stays invisible until the window lapses.
+        fs::write(root.join("wiki").join("late.md"), "type: note\n").unwrap();
+        let second = build_graph_cached(&path).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        // With the window disabled the same change is picked up at once.
+        let third = build_graph_cached_with_ttl(&path, Duration::ZERO).unwrap();
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert!(third.nodes.iter().any(|n| n.id == "late"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4010,8 +4261,9 @@ mod tests {
         fs::write(wiki.join("检索.md"), "type: workflow\n").unwrap();
 
         let path = root.to_string_lossy().to_string();
-        let (nodes, edges) = build_graph(&path).unwrap();
-        let full = filter_graph(nodes.clone(), edges.clone(), None, None, 0, 1000);
+        let (nodes, raw_edges) = build_graph(&path).unwrap();
+        let edges = own_edges(&nodes, raw_edges);
+        let full = filter_graph(&nodes, &edges, None, None, 0, 1000);
         assert_eq!(full.total, 151);
         assert_eq!(full.edges.len(), 300);
 
@@ -4021,17 +4273,17 @@ mod tests {
         let mut got_edges: Vec<(String, String)> = Vec::new();
         let mut offset = 0;
         loop {
-            let r = filter_graph(nodes.clone(), edges.clone(), None, None, offset, 40);
-            got_ids.extend(r.nodes.iter().map(|n| n.id.clone()));
+            let r = filter_graph(&nodes, &edges, None, None, offset, 40);
+            got_ids.extend(r.nodes.as_slice().iter().map(|n| n.id.clone()));
             got_edges.extend(r.edges.iter().map(|e| (e.source.clone(), e.target.clone())));
-            let consumed = offset + r.nodes.len();
+            let consumed = offset + r.nodes.as_slice().len();
             assert!(consumed <= r.total, "pagination ran past total");
             if consumed == r.total {
                 break;
             }
             offset = consumed;
         }
-        assert_eq!(got_ids, full.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>());
+        assert_eq!(got_ids, full.nodes.as_slice().iter().map(|n| n.id.clone()).collect::<Vec<_>>());
         assert_eq!(got_edges.len(), 300);
         let unique: BTreeSet<&(String, String)> = got_edges.iter().collect();
         assert_eq!(unique.len(), got_edges.len(), "paged edges must not repeat");
