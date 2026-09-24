@@ -4,7 +4,7 @@ use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2386,30 +2386,160 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
         .unwrap_or(200)
         .clamp(1, 1000);
 
-    match build_graph(&project.path) {
-        Ok((mut nodes, edges)) => {
-            if let Some(ref q) = q {
-                nodes.retain(|n| {
-                    n.id.to_lowercase().contains(q) || n.label.to_lowercase().contains(q)
-                });
-            }
-            if let Some(ref node_type) = node_type {
-                nodes.retain(|n| n.node_type == *node_type);
-            }
-            nodes.truncate(limit);
-            let ids: BTreeSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
-            let edges: Vec<ApiGraphEdge> = edges
-                .into_iter()
-                .filter(|e| ids.contains(&e.source) && ids.contains(&e.target))
-                .collect();
-            ok(json!({ "ok": true, "projectId": project.id, "nodes": nodes, "edges": edges }))
+    match build_graph_cached(&project.path) {
+        Ok(snapshot) => {
+            let filtered = filter_graph(
+                snapshot.nodes.clone(),
+                snapshot.edges.clone(),
+                q.as_deref(),
+                node_type.as_deref(),
+                limit,
+            );
+            ok(json!({
+                "ok": true,
+                "projectId": project.id,
+                "nodes": filtered.nodes,
+                "edges": filtered.edges
+            }))
         }
         Err(e) => err(500, e),
     }
 }
 
+struct GraphQueryResult {
+    nodes: Vec<ApiGraphNode>,
+    edges: Vec<ApiGraphEdge>,
+}
+
+/// v0.6.11 graph query semantics, extracted verbatim from `handle_graph` so
+/// it is unit-testable: `q` (pre-lowercased) matches id/label substring,
+/// `node_type` (pre-lowercased) matches equality, nodes truncate to `limit`,
+/// then edges keep only those with both endpoints among the returned nodes.
+fn filter_graph(
+    mut nodes: Vec<ApiGraphNode>,
+    edges: Vec<ApiGraphEdge>,
+    q: Option<&str>,
+    node_type: Option<&str>,
+    limit: usize,
+) -> GraphQueryResult {
+    if let Some(q) = q {
+        nodes.retain(|n| n.id.to_lowercase().contains(q) || n.label.to_lowercase().contains(q));
+    }
+    if let Some(node_type) = node_type {
+        nodes.retain(|n| n.node_type == node_type);
+    }
+    nodes.truncate(limit);
+    let ids: BTreeSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let edges: Vec<ApiGraphEdge> = edges
+        .into_iter()
+        .filter(|e| ids.contains(&e.source) && ids.contains(&e.target))
+        .collect();
+    GraphQueryResult { nodes, edges }
+}
+
+// ---- graph snapshot cache -------------------------------------------
+//
+// build_graph re-reads and re-parses every wiki .md file on each request
+// (~50s for 6k files), so every /graph call pays the full cost regardless
+// of query parameters. The cache keeps one built snapshot per project,
+// keyed by an order-independent metadata fingerprint of the wiki tree
+// (path + mtime + size of every .md file, no contents read, <100ms for
+// 6k files). A fingerprint mismatch simply triggers a rebuild on the next
+// request — the graph never goes stale, at worst one rebuild is repeated.
+
+struct GraphSnapshot {
+    nodes: Vec<ApiGraphNode>,
+    edges: Vec<ApiGraphEdge>,
+}
+
+struct GraphCacheEntry {
+    fingerprint: u64,
+    snapshot: Arc<GraphSnapshot>,
+}
+
+static GRAPH_CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, GraphCacheEntry>>> =
+    OnceLock::new();
+static GRAPH_BUILD_LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn wiki_root_of(project_path: &str) -> PathBuf {
+    Path::new(project_path).join("wiki")
+}
+
+fn graph_fingerprint(wiki_root: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut acc: u64 = 0;
+    for entry in WalkDir::new(wiki_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
+        {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let mut hasher = DefaultHasher::new();
+        entry.path().to_string_lossy().hash(&mut hasher);
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        mtime.hash(&mut hasher);
+        meta.len().hash(&mut hasher);
+        // Sum of per-file hashes: commutative, so WalkDir iteration order
+        // (which the filesystem may vary) never changes the fingerprint.
+        acc = acc.wrapping_add(hasher.finish());
+    }
+    acc
+}
+
+fn build_graph_cached(project_path: &str) -> Result<Arc<GraphSnapshot>, String> {
+    let fingerprint = graph_fingerprint(&wiki_root_of(project_path));
+
+    let cache = GRAPH_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(entries) = cache.lock() {
+        if let Some(entry) = entries.get(Path::new(project_path)) {
+            if entry.fingerprint == fingerprint {
+                return Ok(entry.snapshot.clone());
+            }
+        }
+    }
+
+    // Miss. Take a per-project build lock so concurrent misses for the same
+    // project don't each pay the full rebuild; the follower re-checks the
+    // cache after the winner finishes.
+    let build_locks = GRAPH_BUILD_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let build_lock = {
+        let mut locks = build_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(PathBuf::from(project_path))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Ok(entries) = cache.lock() {
+        if let Some(entry) = entries.get(Path::new(project_path)) {
+            if entry.fingerprint == fingerprint {
+                return Ok(entry.snapshot.clone());
+            }
+        }
+    }
+
+    let (nodes, edges) = build_graph(project_path)?;
+    let snapshot = Arc::new(GraphSnapshot { nodes, edges });
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(
+            PathBuf::from(project_path),
+            GraphCacheEntry { fingerprint, snapshot: snapshot.clone() },
+        );
+    }
+    Ok(snapshot)
+}
+
 fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
-    let wiki_root = Path::new(project_path).join("wiki");
+    let wiki_root = wiki_root_of(project_path);
     let mut raw: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
     for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
         if !entry.file_type().is_file()
@@ -3468,5 +3598,237 @@ mod tests {
         assert_eq!(config.model, "live-model");
         assert_eq!(config.api_key, "live-secret");
         assert_eq!(config.custom_endpoint, "https://live.example/v1");
+    }
+
+    // ---- /graph baseline (v0.6.11) -------------------------------------
+    //
+    // Golden serialization of the fixture below (nodes JSON + edges JSON),
+    // pinned by graph_fixture_snapshot_is_byte_stable.
+
+    const GRAPH_FIXTURE_SNAPSHOT: &str = "[{\"id\":\"attention\",\"label\":\"attention\",\"nodeType\":\"note\",\"path\":\"wiki/sub/attention.md\",\"linkCount\":3},{\"id\":\"gpu-cluster\",\"label\":\"gpu cluster\",\"nodeType\":\"hardware\",\"path\":\"wiki/gpu-cluster.md\",\"linkCount\":1},{\"id\":\"transformer\",\"label\":\"Transformer 模型\",\"nodeType\":\"other\",\"path\":\"wiki/transformer.md\",\"linkCount\":1},{\"id\":\"检索\",\"label\":\"检索\",\"nodeType\":\"workflow\",\"path\":\"wiki/检索.md\",\"linkCount\":2}]\n[{\"source\":\"attention\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"gpu-cluster\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"query-hub\",\"target\":\"attention\",\"weight\":1.0},{\"source\":\"transformer\",\"target\":\"attention\",\"weight\":1.0}]";
+
+    //
+    // These tests pin the exact build_graph/filter_graph behavior that the
+    // 2026-09-24 performance work (graph cache, parallel parse, pagination)
+    // must preserve byte-for-byte wherever the plan's correctness gate
+    // applies. Fixture notes:
+    //   - `sub/attention.md` shadows root `attention.md` via BTreeMap insert
+    //     order (WalkDir yields parents before children), pinning the
+    //     last-write-wins duplicate-stem semantics.
+    //   - `query-hub.md` has type `query`, so it is dropped from nodes but
+    //     its links still produce edges (edges are built before the filter).
+    //   - `[[Attention 机制]]` resolves to nothing (no such id even after
+    //     case/space normalization), pinning the dropped-link path.
+    //   - `[[Transformer]]` resolves case-insensitively to id `transformer`.
+
+    fn write_graph_fixture(root: &Path) {
+        let wiki = root.join("wiki");
+        fs::write(
+            wiki.join("attention.md"),
+            "---\ntitle: \"Attention 机制\"\ntype: concept\n---\n# fallback\nSee [[Transformer]] and [[self|Self Loop]] and [[attention]].\n",
+        )
+        .unwrap();
+        fs::create_dir_all(wiki.join("sub")).unwrap();
+        fs::write(
+            wiki.join("sub").join("attention.md"),
+            "type: note\n\ndup [[检索]]\n",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("transformer.md"),
+            "# Transformer 模型\n\nBased on [[attention]].\n",
+        )
+        .unwrap();
+        fs::write(wiki.join("query-hub.md"), "type: query\n\n[[attention]]\n").unwrap();
+        fs::write(
+            wiki.join("检索.md"),
+            "---\ntype: workflow\n---\n相关 [[Attention 机制]]。\n",
+        )
+        .unwrap();
+        fs::write(wiki.join("gpu-cluster.md"), "type: hardware\n\n[[检索]]\n").unwrap();
+        fs::write(wiki.join("ignore.txt"), "type: other\n[[attention]]\n").unwrap();
+    }
+
+    fn graph_fixture(root: &Path) -> (Vec<ApiGraphNode>, Vec<ApiGraphEdge>) {
+        write_graph_fixture(root);
+        build_graph(&root.to_string_lossy()).expect("build_graph")
+    }
+
+    #[test]
+    fn graph_fixture_structure_matches_v0_6_11_baseline() {
+        let root = test_project_dir();
+        let (nodes, edges) = graph_fixture(&root);
+
+        let node = |id: &str| {
+            nodes
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap_or_else(|| panic!("missing node {id}"))
+        };
+        // BTreeMap byte order: ascii ids first (attention, gpu-cluster,
+        // transformer), CJK last (检索). query-type nodes are dropped.
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["attention", "gpu-cluster", "transformer", "检索"]);
+
+        let attention = node("attention");
+        // Root attention.md is shadowed by sub/attention.md: title falls back
+        // to the file stem and the path points into the subdir.
+        assert_eq!(attention.label, "attention");
+        assert_eq!(attention.node_type, "note");
+        assert_eq!(attention.path, "wiki/sub/attention.md");
+        assert_eq!(attention.link_count, 3);
+
+        assert_eq!(node("gpu-cluster").label, "gpu cluster"); // '-' -> ' '
+        assert_eq!(node("gpu-cluster").node_type, "hardware");
+        assert_eq!(node("gpu-cluster").link_count, 1);
+        assert_eq!(node("transformer").label, "Transformer 模型");
+        assert_eq!(node("transformer").node_type, "other");
+        assert_eq!(node("transformer").link_count, 1);
+        assert_eq!(node("检索").node_type, "workflow");
+        assert_eq!(node("检索").link_count, 2);
+        assert!(nodes.iter().all(|n| n.id != "query-hub"));
+
+        let edge_pairs: Vec<(&str, &str)> =
+            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        assert_eq!(
+            edge_pairs,
+            vec![
+                ("attention", "检索"),
+                ("gpu-cluster", "检索"),
+                ("query-hub", "attention"),
+                ("transformer", "attention"),
+            ]
+        );
+        assert!(edges.iter().all(|e| e.weight == 1.0));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_fixture_snapshot_is_byte_stable() {
+        let root = test_project_dir();
+        let (nodes, edges) = graph_fixture(&root);
+        let serialized = format!(
+            "{}\n{}",
+            serde_json::to_string(&nodes).unwrap(),
+            serde_json::to_string(&edges).unwrap()
+        );
+        if serialized != GRAPH_FIXTURE_SNAPSHOT {
+            // Print the actual serialization so regenerating the golden
+            // constant after an intentional semantic change is a copy-paste.
+            panic!("snapshot drift:\n--- expected ---\n{GRAPH_FIXTURE_SNAPSHOT}\n--- actual ---\n{serialized}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_query_filter_and_edge_join_baseline() {
+        let root = test_project_dir();
+        let (nodes, edges) = graph_fixture(&root);
+
+        // nodeType filter keeps only matching nodes; edges then require BOTH
+        // endpoints among returned nodes, so a single-node result loses every
+        // edge (the truncation-drops-edges symptom, pinned as current law).
+        let r = filter_graph(nodes.clone(), edges.clone(), None, Some("note"), 200);
+        assert_eq!(r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
+        assert!(r.edges.is_empty());
+
+        // q matches id (attention contains "att") — same single-node shape.
+        let r = filter_graph(nodes.clone(), edges.clone(), Some("att"), None, 200);
+        assert_eq!(r.nodes.len(), 1);
+        assert_eq!(r.nodes[0].id, "attention");
+        assert!(r.edges.is_empty());
+
+        // q matches label ("gpu cluster" contains "cluster").
+        let r = filter_graph(nodes.clone(), edges.clone(), Some("cluster"), None, 200);
+        assert_eq!(r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["gpu-cluster"]);
+
+        // limit=3 truncates away 检索: both 检索-edges vanish, query-hub edge
+        // was already gone (query nodes are filtered), transformer edge kept.
+        let r = filter_graph(nodes.clone(), edges.clone(), None, None, 3);
+        assert_eq!(
+            r.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["attention", "gpu-cluster", "transformer"]
+        );
+        let pairs: Vec<(&str, &str)> =
+            r.edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        assert_eq!(pairs, vec![("transformer", "attention")]);
+
+        // limit >= total keeps every node; edges still require both
+        // endpoints among returned nodes, so the query-hub edge is dropped
+        // here (its source node was already filtered out by build_graph).
+        let r = filter_graph(nodes, edges, None, None, 200);
+        assert_eq!(r.nodes.len(), 4);
+        assert_eq!(r.edges.len(), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- graph snapshot cache (P0) --------------------------------------
+
+    #[test]
+    fn graph_cache_second_call_hits_same_snapshot() {
+        let root = test_project_dir();
+        write_graph_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        let first = build_graph_cached(&path).unwrap();
+        let second = build_graph_cached(&path).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "second call must hit the cache");
+        assert_eq!(first.nodes.len(), 4);
+        assert_eq!(first.edges.len(), 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_cache_invalidates_on_edit_add_and_remove() {
+        let root = test_project_dir();
+        write_graph_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        let first = build_graph_cached(&path).unwrap();
+
+        // Edit: new content (and mtime) — next call must rebuild and
+        // reflect the change.
+        fs::write(
+            root.join("wiki").join("gpu-cluster.md"),
+            "type: hardware\n\n# GPU 集群\n[[检索]] [[transformer]]\n",
+        )
+        .unwrap();
+        let second = build_graph_cached(&path).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        let gpu = second.nodes.iter().find(|n| n.id == "gpu-cluster").unwrap();
+        assert_eq!(gpu.label, "GPU 集群");
+
+        // Add: a new file joins the graph.
+        fs::write(root.join("wiki").join("新增.md"), "type: concept\n").unwrap();
+        let third = build_graph_cached(&path).unwrap();
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert!(third.nodes.iter().any(|n| n.id == "新增"));
+
+        // Remove: the file leaves the graph.
+        fs::remove_file(root.join("wiki").join("新增.md")).unwrap();
+        let fourth = build_graph_cached(&path).unwrap();
+        assert!(!fourth.nodes.iter().any(|n| n.id == "新增"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_cache_concurrent_calls_agree_on_one_snapshot() {
+        // 8 threads racing on the same project: single-flight must hand
+        // every caller the identical snapshot (deterministic because the
+        // fingerprint never changes during the race, so post-lock
+        // double-checks all hit the winner's entry).
+        let root = test_project_dir();
+        write_graph_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                thread::spawn(move || build_graph_cached(&p).unwrap())
+            })
+            .collect();
+        let snaps: Vec<Arc<GraphSnapshot>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for s in &snaps[1..] {
+            assert!(Arc::ptr_eq(&snaps[0], s));
+        }
+        let _ = fs::remove_dir_all(root);
     }
 }
