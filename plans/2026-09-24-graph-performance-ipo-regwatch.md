@@ -5,6 +5,24 @@
 > `handle_graph` / `build_graph` 逐字符一致，仅行号偏移）
 > 本文只保留与 ipo-regwatch 相关的问题、取证与方案。
 
+## 0. 实施状态（2026-09-24 当日完成，待部署验证）
+
+| 项 | 状态 | commit |
+|---|---|---|
+| P0 图缓存（mtime 指纹 a 方案 + single-flight） | ✅ 已落地 | `e8ffd98`（含 v0.6.11 golden 基线单测与 filter_graph 抽取） |
+| P1 rayon 并行解析 | ✅ 已落地 | `f066d37`（与 golden 逐字节一致 + 150 页环 fixture 确定性测试） |
+| P2 offset 分页 + total/hasMore/edgesTruncated + 边 min 端点分派 + q 纳入 path | ✅ 已落地 | `1ebfb95`（分页拉全重组测试：节点/边不重不漏） |
+| P3 启动预热 | ⏸ 未做（方案本就标可选；缓存结构天然支持未来预热） | — |
+
+- 本机回归：`cargo test --lib` 384 过 / 7 失败——**7 个为 v0.6.11 基线预存失败**
+  （`commands::file_history::*` 6 个 + `commands::fs::tests::allow_absolute_write_paths`，
+  Windows 本机环境性失败，stash 验证与本次改动无关），无新增失败
+- 契约兼容性：单页全量响应除新增元数据字段外与 v0.6.11 逐字节一致；
+  分页/过滤行为变化见 §4 P2（症状 6 修复 = 有意变更）
+- **待部署侧验证**（数据在 ipo-regwatch 机器，本机无准则库/案例库）：
+  性能门三项（缓存命中 <10ms / 冷重算 <30s / 同参数二次 <10ms）、
+  `probe_graph_partitions.py` 分区数字、`smoke_wiki` 50 项
+
 ---
 
 ## 1. 消费方场景
