@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Manager};
@@ -2540,32 +2541,41 @@ fn build_graph_cached(project_path: &str) -> Result<Arc<GraphSnapshot>, String> 
 
 fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
     let wiki_root = wiki_root_of(project_path);
+    // Collect the file list first (deterministic WalkDir order), then parse
+    // files in parallel — the CPU-heavy part (read + title/type/wikilink
+    // extraction) has no cross-file dependencies. Parsed results are folded
+    // back into the BTreeMap in the original order so duplicate stems keep
+    // the exact last-write-wins semantics of the sequential version.
+    let files: Vec<PathBuf> = WalkDir::new(&wiki_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|s| s.to_str()) == Some("md")
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    let parsed: Vec<Option<(String, String, String, String, Vec<String>)>> = files
+        .par_iter()
+        .map(|path| {
+            let content = fs::read_to_string(path).ok()?;
+            let id = path.file_stem()?.to_str()?.to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let title = commands::search::extract_title(
+                &content,
+                path.file_name()?.to_string_lossy().as_ref(),
+            );
+            let node_type = extract_type(&content);
+            let rel_path = relative_to_project(project_path, path);
+            let links = extract_wikilinks(&content);
+            Some((id, title, node_type, rel_path, links))
+        })
+        .collect();
     let mut raw: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
-    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
-        {
-            continue;
-        }
-        let content = match fs::read_to_string(entry.path()) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        let id = entry
-            .path()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        if id.is_empty() {
-            continue;
-        }
-        let title =
-            commands::search::extract_title(&content, entry.file_name().to_string_lossy().as_ref());
-        let node_type = extract_type(&content);
-        let path = relative_to_project(project_path, entry.path());
-        let links = extract_wikilinks(&content);
-        raw.insert(id, (title, node_type, path, links));
+    for (id, title, node_type, rel_path, links) in parsed.into_iter().flatten() {
+        raw.insert(id, (title, node_type, rel_path, links));
     }
     let ids: BTreeSet<String> = raw.keys().cloned().collect();
     let mut link_count: BTreeMap<String, usize> = raw.keys().map(|id| (id.clone(), 0)).collect();
@@ -3612,9 +3622,12 @@ mod tests {
     // 2026-09-24 performance work (graph cache, parallel parse, pagination)
     // must preserve byte-for-byte wherever the plan's correctness gate
     // applies. Fixture notes:
-    //   - `sub/attention.md` shadows root `attention.md` via BTreeMap insert
-    //     order (WalkDir yields parents before children), pinning the
-    //     last-write-wins duplicate-stem semantics.
+    //   - `sub/attention.md` shadows root `attention.md`: WalkDir walks
+    //     depth-first in name order, 'sub' sorts after 'attention.md', so
+    //     the subdir copy is inserted last and wins the BTreeMap — pinning
+    //     last-write-wins duplicate-stem semantics. (Direction depends on
+    //     name order; see graph_parallel_parse_is_deterministic_on_larger_fixture
+    //     for the opposite case.)
     //   - `query-hub.md` has type `query`, so it is dropped from nodes but
     //     its links still produce edges (edges are built before the filter).
     //   - `[[Attention 机制]]` resolves to nothing (no such id even after
@@ -3829,6 +3842,50 @@ mod tests {
         for s in &snaps[1..] {
             assert!(Arc::ptr_eq(&snaps[0], s));
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- parallel parsing (P1) -----------------------------------------
+
+    #[test]
+    fn graph_parallel_parse_is_deterministic_on_larger_fixture() {
+        let root = test_project_dir();
+        let wiki = root.join("wiki");
+        fs::create_dir_all(wiki.join("dup")).unwrap();
+        // A 150-page ring of cross-links plus a CJK node every page links to.
+        for i in 0..150 {
+            let next = if i + 1 < 150 { i + 1 } else { 0 };
+            fs::write(
+                wiki.join(format!("page-{i:03}.md")),
+                format!("---\ntype: note\n---\n# Page {i}\n\n[[page-{next:03}]] [[检索]]\n"),
+            )
+            .unwrap();
+        }
+        fs::write(wiki.join("检索.md"), "type: workflow\n").unwrap();
+        // Duplicate stem. WalkDir walks depth-first in name order, and
+        // `dup` ('d') sorts before `page-*` ('p'), so the root copy is
+        // yielded LAST and must win — mirroring the sequential version.
+        fs::write(wiki.join("dup").join("page-007.md"), "type: shadow\n").unwrap();
+
+        let path = root.to_string_lossy().to_string();
+        let (nodes1, edges1) = build_graph(&path).unwrap();
+        let (nodes2, edges2) = build_graph(&path).unwrap();
+        assert_eq!(
+            serde_json::to_string(&nodes1).unwrap(),
+            serde_json::to_string(&nodes2).unwrap(),
+            "parallel parse must be deterministic"
+        );
+        assert_eq!(
+            serde_json::to_string(&edges1).unwrap(),
+            serde_json::to_string(&edges2).unwrap()
+        );
+        // 150 ring pages + 检索; page-007 keeps a single node, root copy wins.
+        assert_eq!(nodes1.len(), 151);
+        let winner = nodes1.iter().find(|n| n.id == "page-007").unwrap();
+        assert_eq!(winner.node_type, "note");
+        assert_eq!(winner.path, "wiki/page-007.md");
+        // Ring edges (150) + per-page links to 检索 (150), all deduped.
+        assert_eq!(edges1.len(), 300);
         let _ = fs::remove_dir_all(root);
     }
 }
