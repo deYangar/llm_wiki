@@ -662,6 +662,7 @@ fn write_wiki_page_with_activity(
     content: &str,
     allow_overwrite: bool,
 ) -> Result<WikiWriteOutput, String> {
+    let content = ensure_frontmatter_opening(content);
     if content.len() > MAX_WRITE_PAGE_BYTES {
         return Err("wiki.write_page content is too large".to_string());
     }
@@ -687,11 +688,11 @@ fn write_wiki_page_with_activity(
     let existed_before = path.is_file();
     let previous_content = workspace_rollback_snapshot(&path);
     crate::commands::file_history::record_file_version(&path, "baseline", "before.wiki.write_page");
-    fs::write(&path, content).map_err(|err| format!("Failed to write wiki page: {err}"))?;
+    fs::write(&path, &content).map_err(|err| format!("Failed to write wiki page: {err}"))?;
     crate::commands::file_history::record_file_version(&path, "agent", "wiki.write_page");
     Ok(WikiWriteOutput {
         reference: AgentReference {
-            title: extract_markdown_title(content).unwrap_or_else(|| {
+            title: extract_markdown_title(&content).unwrap_or_else(|| {
                 Path::new(&rel)
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -700,7 +701,7 @@ fn write_wiki_page_with_activity(
             }),
             path: rel.clone(),
             kind: "wiki".to_string(),
-            snippet: Some(trim_text(&collapse_markdown_preview(content), 500))
+            snippet: Some(trim_text(&collapse_markdown_preview(&content), 500))
                 .filter(|value| !value.trim().is_empty()),
             score: None,
             knowledge_context: None,
@@ -708,6 +709,52 @@ fn write_wiki_page_with_activity(
         existed_before,
         previous_content,
     })
+}
+
+/// Seal a frontmatter block whose opening `---` delimiter was dropped.
+///
+/// LLM-authored pages occasionally emit `type: case` on the first line with a
+/// closing `---` but no opening one (measured 33/390 case pages, 8.5%). Every
+/// consumer (search, graph, embedding, import pipeline) then treats the whole
+/// page as metadata-free. Detection mirrors the Python-side
+/// `looks_undelimited_frontmatter` (first line is a `key:` shape, closing `---`
+/// within 40 lines) so both sides agree on what "broken" means; the fix is to
+/// prepend the missing delimiter — never to rewrite content.
+fn ensure_frontmatter_opening(content: &str) -> String {
+    if content.starts_with("---\n") || content == "---" {
+        return content.to_string();
+    }
+    let mut lines = content.lines();
+    let Some(first) = lines.next() else {
+        return content.to_string();
+    };
+    let trimmed = first.trim();
+    let is_key_line = match trimmed.split_once(':') {
+        Some((key, _)) => {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        }
+        None => false,
+    };
+    if !is_key_line {
+        return content.to_string();
+    }
+    let has_closing = content
+        .lines()
+        .skip(1)
+        .take(40)
+        .any(|line| line.trim() == "---");
+    if has_closing {
+        format!("---\n{content}")
+    } else {
+        content.to_string()
+    }
 }
 
 fn write_workspace_file(
@@ -3189,6 +3236,49 @@ mod tests {
             .await
             .unwrap_err()
             .contains("not available"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_frontmatter_opening_seals_dropped_delimiter() {
+        // 实测病态（33/390 案例页）：首行直接是键值，闭合 `---` 在块尾。
+        let broken = "type: case\ntitle: \"X（2025）\"\nyear: 2025\n---\n# X\n\nBody\n";
+        let sealed = ensure_frontmatter_opening(broken);
+        assert!(sealed.starts_with("---\ntype: case"));
+        assert_eq!(sealed.lines().count(), broken.lines().count() + 1);
+
+        // 已封口的 frontmatter 原样通过（不重复插入）
+        let intact = "---\ntype: case\n---\n# X\n";
+        assert_eq!(ensure_frontmatter_opening(intact), intact);
+
+        // 普通正文（首行是标题）不动 —— 宁可漏判，不可把正文当元数据
+        let body = "# Title\n\nSome prose about 收入确认。\n";
+        assert_eq!(ensure_frontmatter_opening(body), body);
+
+        // 有 key 形态首行但 40 行内无闭合 `---`：不封（可能是普通 `键: 值` 列表文）
+        let no_close = "note: this is just prose without a closing delimiter\n".repeat(50);
+        assert_eq!(ensure_frontmatter_opening(&no_close), no_close);
+
+        // 40 行界外才有闭合：不封
+        let far_close = format!("type: case\n{}\n---\n", "line\n".repeat(45));
+        assert_eq!(ensure_frontmatter_opening(&far_close), far_close);
+    }
+
+    #[test]
+    fn write_wiki_page_seals_undelimited_frontmatter_on_disk() {
+        let root = std::env::temp_dir().join(format!("llm-wiki-agent-seal-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("wiki/cases")).unwrap();
+
+        let broken = "type: case\ntitle: \"X\"\n---\n# X\n";
+        write_wiki_page_with_activity(
+            root.to_str().unwrap(),
+            "wiki/cases/x.md",
+            broken,
+            false,
+        )
+        .unwrap();
+        let written = fs::read_to_string(root.join("wiki/cases/x.md")).unwrap();
+        assert!(written.starts_with("---\ntype: case"));
         let _ = fs::remove_dir_all(root);
     }
 
