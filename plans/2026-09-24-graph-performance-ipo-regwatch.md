@@ -136,8 +136,10 @@ title/type/wikilink 解析并行（CPU 密集部分天然可并行，文件间�
 
 ## 7. 与消费方的联动（ipo-regwatch 侧）
 
-| 底座改动 | ipo-regwatch 侧跟进 |
-|---|---|
-| P0/P1 落地 | `wiki_instances.yaml` 的 graph 预算可收紧；S2 图谱路是否重开重跑 A/B（脚本 `storage/tmp/graph_ab_probe.py` 可复现） |
-| P2 落地 | `GraphSlice.truncated_suspect` 判据改为读 `total`；枚举通道可评估切回 /graph 分页 |
-| 边修复（症状 6） | 图谱边数据恢复后，重测边稀疏性再评估图遍历价值 |
+| 底座改动 | ipo-regwatch 侧跟进 | 执行状态（2026-09-25） |
+|---|---|---|
+| P0/P1 落地 | `wiki_instances.yaml` 的 graph 预算可收紧；S2 图谱路是否重开重跑 A/B（脚本 `storage/tmp/graph_ab_probe.py` 可复现） | ✅ 预算 200→90 / 180→30 / graph_ttl 600→60；**S2 图谱路已重开**（A/B：图谱扩展毫秒级、top30 新增 2/7/6/0/7 条 issue 页、排序扰动 0，2026-09-24 关闭定案的前提「96 倍延迟」已被本改造消除）。开关 `fuse.thresholds.use_graph` |
+| P2 落地 | `GraphSlice.truncated_suspect` 判据改为读 `total`；枚举通道可评估切回 /graph 分页 | ✅ 判据已改（`total` 实测语义 = 过滤后总数；有 total 精确判定、缺失回退保守判据）。「枚举切回 /graph 分页」暂不做：枚举主通道 index.md 毫秒级且 /graph 分页仅 17 页可拉全，无收益；客户端暂不消费 offset（无消费方不接） |
+| 边修复（症状 6） | 图谱边数据恢复后，重测边稀疏性再评估图遍历价值 | ✅ 复核：`nodeType=case` 分区 390 节点/4 边与旧基线一致 —— 边稀疏是数据本身稀疏（case 页间双链少），非截断丢边；图遍历价值待后续评估 |
+
+记录见 ipoanswer `docs/工作方案与拍板-20260924.md` §五。
