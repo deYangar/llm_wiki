@@ -25,6 +25,10 @@ const API_PREFIX: &str = "/api/v1";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_BODY_BYTES: usize = 40 * 1024 * 1024;
 const MAX_FILE_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
+/// Largest image the /media endpoint will serve. The biggest observed file
+/// in the corpus is under 5MB; 32MB is an 8x margin without letting a
+/// pathological file pin response memory.
+const MAX_MEDIA_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 2_000;
 const HARD_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_REVIEWS: usize = 200;
@@ -268,20 +272,45 @@ fn process_request(app: AppHandle, mut request: tiny_http::Request) {
 }
 
 fn respond_api(request: tiny_http::Request, response: ApiResponse, origin: Option<&str>) {
-    if let Some(raw) = response.raw {
-        let mut resp = Response::from_data(raw).with_status_code(StatusCode(response.status));
-        if let Ok(header) =
-            Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-        {
-            resp = resp.with_header(header);
-        }
-        for header in cors_headers(origin) {
-            resp.add_header(header);
-        }
-        let _ = request.respond(resp);
+    if response.raw.is_some() {
+        let _ = request.respond(raw_response(response, origin));
         return;
     }
     respond_json(request, response.status, response.body, origin);
+}
+
+/// Assembles the tiny_http Response for raw (non-JSON) ApiResponse payloads.
+/// Split from respond_api so tests can assert the final header set: the CORS
+/// layer carries a blanket Content-Type: application/json and tiny_http's
+/// add_header overwrites same-name headers, so the endpoint's own headers
+/// must be applied after the CORS headers or /media's image/* would be
+/// clobbered back to application/json.
+fn raw_response(
+    response: ApiResponse,
+    origin: Option<&str>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let ApiResponse {
+        status,
+        raw,
+        content_type,
+        cache_control,
+        ..
+    } = response;
+    let mut resp =
+        Response::from_data(raw.unwrap_or_default()).with_status_code(StatusCode(status));
+    for header in cors_headers(origin) {
+        resp.add_header(header);
+    }
+    let content_type = content_type.unwrap_or("application/json");
+    if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
+        resp = resp.with_header(header);
+    }
+    if let Some(cache_control) = cache_control {
+        if let Ok(header) = Header::from_bytes(&b"Cache-Control"[..], cache_control.as_bytes()) {
+            resp = resp.with_header(header);
+        }
+    }
+    resp
 }
 
 struct ApiResponse {
@@ -291,10 +320,23 @@ struct ApiResponse {
     /// multi-megabyte payloads (e.g. /graph) skip building a serde_json
     /// Value tree and serialize straight to bytes.
     raw: Option<Vec<u8>>,
+    /// Content-Type for `raw` responses; None defaults to application/json.
+    /// /media is the only image/* producer.
+    content_type: Option<&'static str>,
+    /// Cache-Control for `raw` responses; None sends no cache header. Media
+    /// is immutable import output, so it gets one shared-cache day — longer
+    /// caching belongs to the consuming platform, which owns auth.
+    cache_control: Option<&'static str>,
 }
 
 fn ok(body: Value) -> ApiResponse {
-    ApiResponse { status: 200, body, raw: None }
+    ApiResponse {
+        status: 200,
+        body,
+        raw: None,
+        content_type: None,
+        cache_control: None,
+    }
 }
 
 fn err(status: u16, message: impl Into<String>) -> ApiResponse {
@@ -302,6 +344,8 @@ fn err(status: u16, message: impl Into<String>) -> ApiResponse {
         status,
         body: json!({ "ok": false, "error": message.into() }),
         raw: None,
+        content_type: None,
+        cache_control: None,
     }
 }
 
@@ -379,6 +423,7 @@ fn handle_request(
         }
         (&Method::Post, ["projects", project_id, "search"]) => handle_search(app, project_id, body),
         (&Method::Get, ["projects", project_id, "graph"]) => handle_graph(app, project_id, query),
+        (&Method::Get, ["projects", project_id, "media"]) => handle_media(app, project_id, query),
         (&Method::Post, ["projects", project_id, "sources", "rescan"]) => {
             handle_rescan(app, project_id)
         }
@@ -980,6 +1025,83 @@ fn handle_file_content(app: &AppHandle, project_id: &str, query: &str) -> ApiRes
             "content": content,
         })),
         Err(_) => err(415, "File is not valid UTF-8 text"),
+    }
+}
+
+fn handle_media(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    media_response(&project.path, query)
+}
+
+/// GET /projects/{id}/media?path=wiki/media/<doc-dir>/img-N.png — serves
+/// image bytes verbatim (no range, no transcoding; media is read-only
+/// import output). Split from `handle_media` so tests can drive the whole
+/// validation chain against a temp project without an AppHandle.
+fn media_response(project_path: &str, query: &str) -> ApiResponse {
+    let params = parse_query(query);
+    let Some(rel) = params.get("path") else {
+        return err(400, "Missing path query parameter");
+    };
+    // Reuses the is_public_project_rel 403 body: every media path is also
+    // a wiki/ path, so rejecting non-media prefixes with the same error
+    // adds nothing for a prober to distinguish endpoints by.
+    if !is_public_project_rel(rel) || !is_media_rel(rel) {
+        return err(403, "Path is not exposed by the local API");
+    }
+    let Some(content_type) = media_content_type(rel) else {
+        return err(415, "Only image files can be served via this endpoint");
+    };
+    let path = match safe_join(project_path, rel) {
+        Ok(path) => path,
+        Err(e) => return err(400, e),
+    };
+    let meta = match fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) => return err(404, format!("File not found: {e}")),
+    };
+    if meta.len() > MAX_MEDIA_BYTES {
+        return err(413, "File is too large to serve via API");
+    }
+    match fs::read(&path) {
+        Ok(bytes) => ApiResponse {
+            status: 200,
+            body: Value::Null,
+            raw: Some(bytes),
+            content_type: Some(content_type),
+            cache_control: Some("public, max-age=86400"),
+        },
+        Err(e) => err(500, format!("Failed to read media file: {e}")),
+    }
+}
+
+/// Pages reference images only as `../media/<doc-dir>/img-N.png`, and
+/// nothing else under the public tree is binary, so the media endpoint
+/// tightens is_public_project_rel to this prefix.
+fn is_media_rel(rel: &str) -> bool {
+    normalize_path(rel)
+        .trim_start_matches('/')
+        .to_lowercase()
+        .starts_with("wiki/media/")
+}
+
+/// The extension allowlist doubles as the Content-Type map. svg is absent
+/// on purpose: it can embed scripts, the corpus contains none, and this
+/// endpoint does not open that door.
+fn media_content_type(rel: &str) -> Option<&'static str> {
+    let rel = normalize_path(rel).to_lowercase();
+    let ext = Path::new(&rel)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match ext {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
     }
 }
 
@@ -2436,7 +2558,13 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
                 edges: &filtered.edges,
             };
             match serde_json::to_vec(&payload) {
-                Ok(bytes) => ApiResponse { status: 200, body: Value::Null, raw: Some(bytes) },
+                Ok(bytes) => ApiResponse {
+                    status: 200,
+                    body: Value::Null,
+                    raw: Some(bytes),
+                    content_type: None,
+                    cache_control: None,
+                },
                 Err(e) => err(500, format!("graph serialization failed: {e}")),
             }
         }
@@ -3023,6 +3151,176 @@ mod tests {
         assert!(is_public_project_rel("Raw/Sources/source.md"));
         assert!(!is_public_project_rel(".llm-wiki/file-change-queue.json"));
         assert!(!is_public_project_rel("wiki/.draft.md"));
+    }
+
+    /// 1x1 PNG. The endpoint serves bytes by extension, not by sniffing,
+    /// so fixtures only need stable bytes with the right extension.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, //
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, //
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, //
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, //
+        0x00, 0x00, 0x00, 0x09, 0x49, 0x44, 0x41, 0x54, //
+        0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, //
+        0x0D, 0x0A, 0x2D, 0xB4, //
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    /// Minimal JPEG-shaped bytes (SOI + JFIF APP0 + EOI).
+    const TINY_JPG: &[u8] = &[
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+
+    fn write_media_fixture(root: &Path, name: &str, bytes: &[u8]) -> String {
+        let dir = root.join("wiki").join("media").join("doc");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(name), bytes).unwrap();
+        format!("wiki/media/doc/{name}")
+    }
+
+    #[test]
+    fn media_serves_png_bytes_verbatim() {
+        let root = test_project_dir();
+        let root_str = root.to_string_lossy();
+        let rel = write_media_fixture(&root, "img-1.png", TINY_PNG);
+        for query in [
+            format!("path={rel}"),
+            "path=wiki%2Fmedia%2Fdoc%2Fimg-1.png".to_string(),
+        ] {
+            let response = media_response(&root_str, &query);
+            assert_eq!(response.status, 200, "query: {query}");
+            assert_eq!(response.raw.as_deref(), Some(TINY_PNG));
+            assert_eq!(response.content_type, Some("image/png"));
+            assert_eq!(response.cache_control, Some("public, max-age=86400"));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_serves_jpg_as_image_jpeg() {
+        let root = test_project_dir();
+        let rel = write_media_fixture(&root, "img-2.jpg", TINY_JPG);
+        let response = media_response(&root.to_string_lossy(), &format!("path={rel}"));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.raw.as_deref(), Some(TINY_JPG));
+        assert_eq!(response.content_type, Some("image/jpeg"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raw_response_content_type_survives_cors_blanket_header() {
+        // Regression (2026-10-02 live deployment): local_cors_headers carries a
+        // blanket Content-Type: application/json and tiny_http's add_header
+        // overwrites same-name headers — if the CORS headers are applied after
+        // the endpoint's own, /media's image/* comes out as application/json
+        // on the wire while unit tests (which stop at media_response) stay
+        // green. Function-level tests must not be the only guard here.
+        let response = ApiResponse {
+            status: 200,
+            body: Value::Null,
+            raw: Some(TINY_PNG.to_vec()),
+            content_type: Some("image/png"),
+            cache_control: Some("public, max-age=86400"),
+        };
+        let resp = raw_response(response, None);
+        let header = |name: &'static str| {
+            resp.headers()
+                .iter()
+                .find(|h| h.field.equiv(name))
+                .map(|h| h.value.as_str().to_string())
+        };
+        assert_eq!(header("Content-Type").as_deref(), Some("image/png"));
+        assert_eq!(
+            header("Cache-Control").as_deref(),
+            Some("public, max-age=86400")
+        );
+        // CORS headers still ride along on raw responses.
+        assert!(header("Access-Control-Allow-Methods").is_some());
+        assert!(header("Access-Control-Allow-Headers").is_some());
+    }
+
+    #[test]
+    fn raw_response_without_content_type_defaults_to_json() {
+        let response = ApiResponse {
+            status: 200,
+            body: Value::Null,
+            raw: Some(br#"{"ok":true}"#.to_vec()),
+            content_type: None,
+            cache_control: None,
+        };
+        let resp = raw_response(response, None);
+        let ct = resp
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Content-Type"))
+            .map(|h| h.value.as_str())
+            .unwrap();
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn media_rejects_escape_and_non_media_prefixes() {
+        let root = test_project_dir();
+        let root_str = root.to_string_lossy();
+        // Traversal segments fail the whitelist (dot-prefixed parts) before
+        // safe_join is even reached; everything outside wiki/media/ shares
+        // the same 403 as the public-path check.
+        for bad in [
+            "../secret.png",
+            "wiki/media/../../secret.png",
+            "media/x.png",
+            "wiki/sources/x.md",
+            "raw/media/x.png",
+        ] {
+            let response = media_response(&root_str, &format!("path={bad}"));
+            assert_eq!(response.status, 403, "path: {bad}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_rejects_text_extension_under_media() {
+        let root = test_project_dir();
+        let rel = write_media_fixture(&root, "notes.txt", b"not an image");
+        let response = media_response(&root.to_string_lossy(), &format!("path={rel}"));
+        assert_eq!(response.status, 415);
+        assert_eq!(response.body["error"], "Only image files can be served via this endpoint");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_missing_file_is_404() {
+        let root = test_project_dir();
+        let response = media_response(&root.to_string_lossy(), "path=wiki/media/doc/absent.png");
+        assert_eq!(response.status, 404);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_requires_path_parameter() {
+        let root = test_project_dir();
+        let response = media_response(&root.to_string_lossy(), "");
+        assert_eq!(response.status, 400);
+        assert_eq!(response.body["error"], "Missing path query parameter");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_prefix_allowlist_and_content_type_map() {
+        assert!(is_media_rel("wiki/media/a/img-1.png"));
+        assert!(is_media_rel("Wiki/Media/a/IMG-1.PNG"));
+        assert!(!is_media_rel("wiki/media"));
+        assert!(!is_media_rel("wiki/media/"));
+        assert!(!is_media_rel("wiki/sources/a.md"));
+        assert!(!is_media_rel("raw/media/x.png"));
+        assert_eq!(media_content_type("wiki/media/a/img.png"), Some("image/png"));
+        assert_eq!(media_content_type("wiki/media/a/img.JPG"), Some("image/jpeg"));
+        assert_eq!(media_content_type("wiki/media/a/img.jpeg"), Some("image/jpeg"));
+        assert_eq!(media_content_type("wiki/media/a/img.gif"), Some("image/gif"));
+        assert_eq!(media_content_type("wiki/media/a/img.webp"), Some("image/webp"));
+        assert_eq!(media_content_type("wiki/media/a/img.svg"), None);
+        assert_eq!(media_content_type("wiki/media/a/img.txt"), None);
+        assert_eq!(media_content_type("wiki/media/a/noext"), None);
     }
 
     #[test]
