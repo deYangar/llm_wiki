@@ -24,6 +24,9 @@ const PORT: u16 = 19828;
 const API_PREFIX: &str = "/api/v1";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_BODY_BYTES: usize = 40 * 1024 * 1024;
+// JSON may encode one input byte as a six-byte `\u00XX` escape. Keep the
+// transport boundary above the authoritative 2 MiB decoded-content limit.
+const MAX_PAGE_WRITE_BODY_BYTES: usize = 6 * 2 * 1024 * 1024 + 16 * 1024;
 const MAX_FILE_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 /// Largest image the /media endpoint will serve. The biggest observed file
 /// in the corpus is under 5MB; 32MB is an 8x margin without letting a
@@ -430,6 +433,9 @@ fn handle_request(
         (&Method::Post, ["projects", project_id, "pages", "embed"]) => {
             handle_embed_page(app, project_id, body)
         }
+        (&Method::Post, ["projects", project_id, "pages", "write"]) => {
+            handle_write_page(app, project_id, body)
+        }
         (&Method::Post, ["projects", project_id, "chat"]) => handle_chat(app, project_id, body),
         (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
             handle_cancel_chat(app, project_id, session_id)
@@ -481,7 +487,11 @@ fn is_token_required_request(method: &Method, path: &str) -> bool {
     let Some(parts) = api_path_parts(path) else {
         return false;
     };
-    method == &Method::Post && matches!(parts.as_slice(), ["projects", _, "pages", "embed"])
+    method == &Method::Post
+        && matches!(
+            parts.as_slice(),
+            ["projects", _, "pages", "embed"] | ["projects", _, "pages", "write"]
+        )
 }
 
 fn chat_project_id<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
@@ -537,15 +547,13 @@ fn wants_streaming_chat(
 fn body_limit_for_request(method: &Method, url: &str) -> usize {
     let (path, _) = split_url(url);
     let parts = api_path_parts(&path);
-    if method == &Method::Post
-        && parts
-            .as_deref()
-            .map(|parts| matches!(parts, ["projects", _, "chat"]))
-            .unwrap_or(false)
-    {
-        MAX_CHAT_BODY_BYTES
-    } else {
-        MAX_BODY_BYTES
+    if method != &Method::Post {
+        return MAX_BODY_BYTES;
+    }
+    match parts.as_deref() {
+        Some(["projects", _, "chat"]) => MAX_CHAT_BODY_BYTES,
+        Some(["projects", _, "pages", "write"]) => MAX_PAGE_WRITE_BODY_BYTES,
+        _ => MAX_BODY_BYTES,
     }
 }
 
@@ -1911,6 +1919,55 @@ struct EmbedPageRequest {
     force: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WritePageRequest {
+    path: String,
+    content: String,
+    #[serde(default)]
+    allow_overwrite: bool,
+}
+
+fn handle_write_page(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let req: WritePageRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    if req.path.trim().is_empty() {
+        return err(400, "path is required");
+    }
+    match agent::tools::write_wiki_page_verified(
+        &project.path,
+        &req.path,
+        &req.content,
+        req.allow_overwrite,
+    ) {
+        Ok(result) => ok(json!({
+            "ok": true,
+            "projectId": project.id,
+            "result": result,
+        })),
+        Err(error) => {
+            let lower = error.to_ascii_lowercase();
+            let status = if lower.contains("without allowoverwrite") {
+                409
+            } else if lower.contains("path")
+                || lower.contains("markdown file")
+                || lower.contains("too large")
+            {
+                400
+            } else {
+                500
+            };
+            err(status, error)
+        }
+    }
+}
+
 struct PageEmbedSlot;
 
 impl Drop for PageEmbedSlot {
@@ -1964,7 +2021,6 @@ fn handle_embed_page(app: &AppHandle, project_id: &str, body: &str) -> ApiRespon
                 commands::page_embedding::PageEmbeddingErrorKind::NotFound => 404,
                 commands::page_embedding::PageEmbeddingErrorKind::Provider => 502,
                 commands::page_embedding::PageEmbeddingErrorKind::Storage => 500,
-                commands::page_embedding::PageEmbeddingErrorKind::Conflict => 409,
                 commands::page_embedding::PageEmbeddingErrorKind::Timeout => 504,
             };
             err(status, error.message)
@@ -2035,6 +2091,9 @@ fn prepare_chat(
     let project = resolve_project(app, project_id).map_err(|e| err(404, e))?;
     let mut req: agent::AgentChatRequest =
         serde_json::from_str(body).map_err(|e| err(400, format!("Invalid JSON: {e}")))?;
+    // This is an internal desktop preflight escape hatch for CLI-backed chat.
+    // The public API must retain its actionable generator-configuration error.
+    req.allow_empty_retrieval = false;
     if req.message.trim().is_empty() {
         return Err(err(400, "message is required"));
     }
@@ -2550,6 +2609,7 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
                 ok: true,
                 project_id: &project.id,
                 total: filtered.total,
+                total_count: filtered.total,
                 offset,
                 limit,
                 has_more,
@@ -2578,6 +2638,10 @@ struct GraphApiResponse<'a> {
     ok: bool,
     project_id: &'a str,
     total: usize,
+    /// Alias of `total` carried under the upstream v0.6.12 field name so the
+    /// bundled MCP client reads the real pre-slice count instead of falling
+    /// back to the page length.
+    total_count: usize,
     offset: usize,
     limit: usize,
     has_more: bool,
@@ -2924,7 +2988,7 @@ fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdg
             );
             let node_type = extract_type(&content);
             let rel_path = relative_to_project(project_path, path);
-            let links = extract_wikilinks(&content);
+            let links = commands::search::extract_graph_links(&content);
             Some((id, title, node_type, rel_path, links))
         })
         .collect();
@@ -3001,24 +3065,6 @@ fn extract_type(content: &str) -> String {
     "other".to_string()
 }
 
-fn extract_wikilinks(content: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = content;
-    while let Some(start) = rest.find("[[") {
-        rest = &rest[start + 2..];
-        let Some(end) = rest.find("]]") else {
-            break;
-        };
-        let inner = &rest[..end];
-        let target = inner.split('|').next().unwrap_or("").trim();
-        if !target.is_empty() {
-            out.push(target.to_string());
-        }
-        rest = &rest[end + 2..];
-    }
-    out
-}
-
 fn resolve_link(
     raw: &str,
     ids: &BTreeSet<String>,
@@ -3051,6 +3097,7 @@ fn handle_rescan(app: &AppHandle, project_id: &str) -> ApiResponse {
         project.id.clone(),
         project.path.clone(),
         source_watch_config,
+        None,
     ) {
         Ok(result) => ok(json!({ "ok": true, "projectId": project.id, "result": result })),
         Err(e) => err(500, e),
