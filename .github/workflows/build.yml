@@ -108,16 +108,39 @@ jobs:
           npm --prefix mcp-server ci
           npm run mcp:build
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+      # tauri-bundler treats an APPLE_CERTIFICATE env var that merely
+      # exists as "import this certificate", so empty secrets make the
+      # macOS bundle step die in `security import`. Only export the
+      # signing variables when a certificate is actually configured;
+      # otherwise the bundler falls back to ad-hoc signing.
+      - name: Resolve macOS signing secrets
+        if: startsWith(matrix.platform, 'macos-')
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            {
+              echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+              echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+          else
+            echo "No Apple signing secrets configured; building ad-hoc signed bundle."
+          fi
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           # Tag-triggered runs publish a real GitHub Release.
           # Manual (workflow_dispatch) runs leave tagName/releaseName
