@@ -2050,6 +2050,29 @@ pub async fn get_file_size(path: String) -> Result<u64, String> {
     .map_err(|e| format!("get_file_size blocking task join error: {e}"))?
 }
 
+/// Return the page count of a PDF. Used by the frontend to decide whether
+/// cloud MinerU parsing must be split into `page_ranges` segments (the cloud
+/// API rejects documents above 200 pages with -60006).
+#[tauri::command]
+pub async fn pdf_page_count(path: String) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("pdf_page_count", || {
+            use pdfium_render::prelude::*;
+            let _guard = lock_pdfium();
+            let pdfium = pdfium()?;
+            let doc = pdfium.load_pdf_from_file(&path, None).map_err(|e| match e {
+                PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError) => {
+                    format!("PDF is password-protected and cannot be read: '{path}'")
+                }
+                _ => format!("Failed to open PDF '{path}': {e}"),
+            })?;
+            Ok(doc.pages().len() as u32)
+        })
+    })
+    .await
+    .map_err(|e| format!("pdf_page_count blocking task join error: {e}"))?
+}
+
 /// Compute MD5 hash of a file. Returns the hex-encoded hash string.
 #[tauri::command]
 pub async fn get_file_md5(path: String) -> Result<String, String> {

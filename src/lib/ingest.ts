@@ -713,6 +713,74 @@ async function appendIngestWarningLog(
   }
 }
 
+/**
+ * The built-in PDF extractor (extract_pdf_markdown) always starts its output
+ * with a `## Page 1` section header; MinerU Markdown never does. When a PDF's
+ * `.cache` text already exists this signature tells us which extractor
+ * produced it, so a failed MinerU attempt does not mislabel a previously
+ * cached good parse as a downgrade.
+ */
+export function pdfCacheParserSourceFromHead(cacheHead: string): "pdfium" | "mineru" | null {
+  const head = cacheHead.slice(0, 64).replace(/^\uFEFF/, "").replace(/\r/g, "")
+  if (head.startsWith("## Page 1")) return "pdfium"
+  if (head.trim().length > 0) return "mineru"
+  return null
+}
+
+async function detectPdfCacheParserSource(
+  cachePath: string,
+  fallback: string,
+): Promise<string> {
+  const cached = await tryReadFile(cachePath)
+  const detected = pdfCacheParserSourceFromHead(cached)
+  return detected ?? fallback
+}
+
+/**
+ * Ensure the source-summary page's frontmatter records `parser: <source>`,
+ * replacing any previous value. Pure frontmatter surgery — content below the
+ * closing `---` is never touched.
+ */
+export function annotateSourceSummaryParserFrontmatter(
+  content: string,
+  parser: string,
+): string {
+  const normalized = content.replace(/^\uFEFF/, "")
+  if (!normalized.startsWith("---")) {
+    return normalized
+  }
+  const end = normalized.indexOf("\n---", 3)
+  if (end < 0) return normalized
+  const head = normalized.slice(0, end)
+  const rest = normalized.slice(end + 1) // keep the closing '---' line's tail
+  const parserLine = `parser: ${JSON.stringify(parser)}`
+  if (/^parser:.*$/m.test(head)) {
+    return `${head.replace(/^parser:.*$/m, parserLine)}\n${rest}`
+  }
+  return `${head.trimEnd()}\n${parserLine}\n${rest}`
+}
+
+async function annotateSourceSummaryParser(
+  projectPath: string,
+  sourceSummaryPath: string,
+  parser: string,
+): Promise<void> {
+  try {
+    const fullPath = `${projectPath}/${sourceSummaryPath}`
+    const existing = await tryReadFile(fullPath)
+    if (!existing.trim()) return
+    const next = annotateSourceSummaryParserFrontmatter(existing, parser)
+    if (next !== existing) {
+      await writeFile(fullPath, next)
+    }
+  } catch (err) {
+    console.warn(
+      `[ingest] Failed to annotate parser source on "${sourceSummaryPath}":`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
 async function autoIngestImpl(
   projectPath: string,
   sourcePath: string,
@@ -748,11 +816,17 @@ async function autoIngestImpl(
   const mineruCfg = useWikiStore.getState().mineruConfig
   let mineruSucceeded = false
   let mineruSavedImages: SavedImage[] = []
+  // Which extractor actually produced the text this ingest will learn from.
+  // Recorded on the source-summary page (frontmatter `parser:`) and, on any
+  // fallback to the built-in extractor, in .llm-wiki/ingest-warnings.log —
+  // a silent quality downgrade must never look like a clean parse again.
+  let pdfParserSource: string | null = null
+  const pdfParserWarnings: string[] = []
   const mineruConfigured = mineruCfg.backend === "local" || Boolean(mineruCfg.token)
+  const cacheDir = sp.substring(0, sp.lastIndexOf("/"))
+  const cachePath = `${cacheDir}/.cache/${fileName}.txt`
   if (isPdf && mineruCfg.enabled && mineruConfigured) {
     try {
-      const cacheDir = sp.substring(0, sp.lastIndexOf("/"))
-      const cachePath = `${cacheDir}/.cache/${fileName}.txt`
       activity.updateItem(activityId, { detail: "MinerU: parsing PDF..." })
       console.log(`[ingest:mineru] submitting "${fileName}" to MinerU API`)
       const mineruResult = await parseWithMineruResult(mineruCfg, sp, undefined, (msg) => {
@@ -769,6 +843,7 @@ async function autoIngestImpl(
         rememberImageExtractionByKey(extractionKey, Promise.resolve(mineruSavedImages))
       }
       mineruSucceeded = true
+      pdfParserSource = mineruCfg.backend === "local" ? "mineru-local" : "mineru"
       console.log(
         `[ingest:mineru] cached MinerU output for "${fileName}" (${mineruResult.markdown.length} chars, images=${mineruSavedImages.length})`,
       )
@@ -779,10 +854,29 @@ async function autoIngestImpl(
       activity.updateItem(activityId, {
         detail: `MinerU failed, falling back to built-in PDF extraction: ${msg}`,
       })
+      pdfParserWarnings.push(
+        `MinerU parsing failed; the source was ingested from built-in PDF text extraction instead (layout, tables and scanned pages will be degraded or missing): ${msg}`,
+      )
+      // The failed parse may still leave an earlier good MinerU cache in
+      // place — only claim a downgrade when the cached text really is the
+      // built-in extractor's output.
+      pdfParserSource = await detectPdfCacheParserSource(cachePath, "pdfium-fallback")
     }
     if (mineruSucceeded && !signal?.aborted) {
       activity.updateItem(activityId, { detail: "Reading source..." })
     }
+  } else if (isPdf) {
+    // MinerU disabled or unconfigured: the built-in extractor is used by
+    // design, but the source page must still say so honestly.
+    pdfParserSource = await detectPdfCacheParserSource(cachePath, "pdfium")
+    if (mineruCfg.enabled && !mineruConfigured) {
+      pdfParserWarnings.push(
+        "MinerU is enabled but no API token (or local backend) is configured; the source was ingested from built-in PDF text extraction (quality degraded).",
+      )
+    }
+  }
+  if (pdfParserWarnings.length > 0) {
+    await appendIngestWarningLog(pp, sourceIdentity, pdfParserWarnings)
   }
 
   const [sourceContent, schema, purpose, index, overview] = await Promise.all([
@@ -1453,6 +1547,13 @@ async function autoIngestImpl(
     } catch {
       // non-critical
     }
+  }
+
+  // Record on the source-summary page which extractor produced the text the
+  // wiki was built from (MinerU vs built-in fallback) — see the MinerU
+  // preprocessing block above for why this must be explicit.
+  if (isPdf && pdfParserSource && !signal?.aborted) {
+    await annotateSourceSummaryParser(pp, sourceSummaryPath, pdfParserSource)
   }
 
   // ── Step 3.5: Append extracted images to the source-summary page ─
@@ -3756,6 +3857,19 @@ async function executeIngestWritesImpl(
     getStore().addMessage("system", `Files written to wiki:\n${fileList}`)
   } else {
     getStore().addMessage("system", "No files were written. The LLM response did not contain valid FILE blocks.")
+  }
+
+  // Interactive ingest writes the source summary too — annotate which
+  // extractor produced the cached text it learned from (same contract as
+  // autoIngest). `startIngest` never runs MinerU itself, so the `.cache`
+  // signature is the source of truth here.
+  if (ingestSource && activeSourceSummaryPath) {
+    const isPdfSource = ingestSource.toLowerCase().endsWith(".pdf")
+    if (isPdfSource) {
+      const cachePath = `${ingestSource.substring(0, ingestSource.lastIndexOf("/"))}/.cache/${getFileName(ingestSource)}.txt`
+      const detected = await detectPdfCacheParserSource(cachePath, "pdfium")
+      await annotateSourceSummaryParser(pp, activeSourceSummaryPath, detected)
+    }
   }
 
   // Image cascade: surface any embedded images on the source-summary

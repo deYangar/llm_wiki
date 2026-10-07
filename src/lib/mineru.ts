@@ -1,6 +1,6 @@
 import JSZip from "jszip"
 import type { MineruConfig } from "@/stores/wiki-store"
-import { createDirectory, getFileSize, readFileAsBase64, writeFileBase64 } from "@/commands/fs"
+import { createDirectory, getFileSize, getPdfPageCount, readFileAsBase64, writeFileBase64 } from "@/commands/fs"
 import { getHttpFetch } from "@/lib/tauri-fetch"
 import { getFileName, normalizePath } from "@/lib/path-utils"
 import type { SavedImage } from "@/lib/extract-source-images"
@@ -11,6 +11,9 @@ const POLL_INTERVAL_MS = 3_000
 const POLL_TIMEOUT_MS = 300_000 // 5 minutes
 const LOCAL_POLL_TIMEOUT_MS = 3_600_000 // Official mineru-api tasks can include model cold starts.
 const MAX_ACCURATE_PARSE_BYTES = 200 * 1024 * 1024
+// The cloud API rejects documents above 200 pages (-60006). Larger PDFs are
+// split into `page_ranges` segments and the resulting Markdown is joined.
+export const MAX_CLOUD_PAGES_PER_TASK = 200
 const MINERU_IMAGE_EXTS = new Set([
   "png",
   "jpg",
@@ -71,6 +74,12 @@ interface UploadUrlResponse {
 interface MineruAssetOptions {
   projectPath: string
   sourceSummarySlug: string
+  /**
+   * Sub-directory inserted into `media/<slug>/mineru/<prefix>/…` so that
+   * page-range segments of one document never overwrite each other's
+   * identically-named zip assets (e.g. `images/1.jpg` in every segment).
+   */
+  assetPathPrefix?: string
 }
 
 interface MineruExtractedMarkdown {
@@ -269,13 +278,14 @@ function isMineruImagePath(path: string): boolean {
   return MINERU_IMAGE_EXTS.has(ext)
 }
 
-function mineruAssetRelPath(sourceSummarySlug: string, zipPath: string): string {
+function mineruAssetRelPath(sourceSummarySlug: string, zipPath: string, prefix?: string): string {
   const safeParts = normalizeMineruZipPath(zipPath)
     .split("/")
     .map(safeMineruAssetSegment)
     .filter(Boolean)
   const safePath = safeParts.length > 0 ? safeParts.join("/") : "image.png"
-  return `media/${sourceSummarySlug}/mineru/${safePath}`
+  const safePrefix = prefix ? `${safeMineruAssetSegment(prefix)}/` : ""
+  return `media/${sourceSummarySlug}/mineru/${safePrefix}${safePath}`
 }
 
 function isExternalOrDataUrl(url: string): boolean {
@@ -449,18 +459,21 @@ async function uploadFileForTask(
   fileBase64: string,
   modelVersion: string,
   signal?: AbortSignal,
+  pageRanges?: string,
 ): Promise<{ batchId: string; uploadUrl: string }> {
   const httpFetch = await getHttpFetch()
   const headers = await mineruHeaders(token)
   throwIfAborted(signal)
 
   // Step 1: Get upload URL
+  const fileEntry: Record<string, string> = { name: fileName, data_id: fileName }
+  if (pageRanges) fileEntry.page_ranges = pageRanges
   const res = await httpFetch(`${API_BASE}/file-urls/batch`, {
     method: "POST",
     headers,
     signal,
     body: JSON.stringify({
-      files: [{ name: fileName, data_id: fileName }],
+      files: [fileEntry],
       model_version: modelVersion,
     }),
   })
@@ -573,7 +586,9 @@ async function saveMineruZipImages(
   signal?: AbortSignal,
 ): Promise<{ pathMap: Map<string, string>; savedImages: SavedImage[] }> {
   const pp = normalizePath(options.projectPath)
-  const rootDir = `${pp}/wiki/media/${options.sourceSummarySlug}/mineru`
+  const rootDir = options.assetPathPrefix
+    ? `${pp}/wiki/media/${options.sourceSummarySlug}/mineru/${safeMineruAssetSegment(options.assetPathPrefix)}`
+    : `${pp}/wiki/media/${options.sourceSummarySlug}/mineru`
   const pathMap = new Map<string, string>()
   const savedImages: SavedImage[] = []
   const imageEntries: Array<[string, JSZip.JSZipObject]> = []
@@ -593,7 +608,7 @@ async function saveMineruZipImages(
   await createDirectory(rootDir)
   for (const [zipPath, file] of imageEntries) {
     throwIfAborted(signal)
-    const relPath = mineruAssetRelPath(options.sourceSummarySlug, zipPath)
+    const relPath = mineruAssetRelPath(options.sourceSummarySlug, zipPath, options.assetPathPrefix)
     const absPath = `${pp}/wiki/${relPath}`
     const bytes = await file.async("uint8array")
     await writeFileBase64(absPath, bytesToBase64(bytes))
@@ -852,6 +867,66 @@ async function parseWithLocalMineru(
   throw new Error("Local MinerU parsing timed out")
 }
 
+/**
+ * Split `total` pages into `page_ranges` strings ("1-200", "201-400", …)
+ * accepted by the cloud batch API, so a document above the per-task page
+ * limit can be parsed segment by segment instead of being rejected (-60006).
+ */
+export function splitPageRanges(total: number, maxPerPage = MAX_CLOUD_PAGES_PER_TASK): string[] {
+  if (!Number.isFinite(total) || total <= 0 || maxPerPage <= 0) return []
+  const ranges: string[] = []
+  for (let start = 1; start <= total; start += maxPerPage) {
+    const end = Math.min(start + maxPerPage - 1, total)
+    ranges.push(`${start}-${end}`)
+  }
+  return ranges
+}
+
+/**
+ * Parse one PDF through the cloud API as multiple `page_ranges` segments and
+ * join the Markdown. Each segment gets its own media sub-directory
+ * (`mineru/seg-1/…`) so identically-named zip assets cannot collide.
+ */
+async function parseCloudMineruSegmented(
+  config: MineruConfig,
+  sourcePath: string,
+  ranges: readonly string[],
+  onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
+  assetOptions?: MineruAssetOptions,
+): Promise<MineruExtractedMarkdown> {
+  const fileName = sourcePath.split("/").pop() ?? "document.pdf"
+  throwIfAborted(signal)
+  const { base64 } = await readFileAsBase64(sourcePath)
+
+  const markdowns: string[] = []
+  const savedImages: SavedImage[] = []
+  for (let i = 0; i < ranges.length; i++) {
+    const range = ranges[i]
+    throwIfAborted(signal)
+    onProgress?.(`MinerU: segment ${i + 1}/${ranges.length} (pages ${range})...`)
+    const { batchId } = await uploadFileForTask(
+      config.token,
+      fileName,
+      base64,
+      config.modelVersion,
+      signal,
+      range,
+    )
+    const zipUrl = await pollBatchTask(config.token, batchId, signal)
+    const segment = await downloadAndExtractMarkdown(zipUrl, signal, assetOptions
+      ? { ...assetOptions, assetPathPrefix: `seg-${i + 1}` }
+      : undefined)
+    markdowns.push(segment.markdown)
+    savedImages.push(...segment.savedImages)
+  }
+
+  return {
+    markdown: markdowns.filter((part) => part.trim()).join("\n\n"),
+    savedImages,
+  }
+}
+
 // ── Public API ──
 
 /**
@@ -901,6 +976,25 @@ export async function parseWithMineruResult(
   if (!config.token) throw new Error("MinerU API token not configured")
   if (config.modelVersion !== "pipeline" && config.modelVersion !== "vlm") {
     throw new Error("MinerU PDF parsing supports only pipeline or vlm model versions")
+  }
+
+  // Documents above the cloud page limit are transparently split into
+  // page-range segments; submitting them whole would fail with -60006 and
+  // (pre-fix) silently degrade the source to built-in PDF text extraction.
+  let pageCount: number | null = null
+  try {
+    pageCount = await getPdfPageCount(sourcePath)
+  } catch (err) {
+    if (signal?.aborted) throw err
+    // Unreadable page count (e.g. password-protected PDF): let the single
+    // task path surface the real API error instead of guessing here.
+  }
+  if (pageCount !== null && pageCount > MAX_CLOUD_PAGES_PER_TASK) {
+    const ranges = splitPageRanges(pageCount)
+    onProgress?.(`MinerU: ${pageCount} pages exceeds the ${MAX_CLOUD_PAGES_PER_TASK}-page limit; splitting into ${ranges.length} segments...`)
+    const result = await parseCloudMineruSegmented(config, sourcePath, ranges, onProgress, signal, assetOptions)
+    onProgress?.("Done")
+    return result
   }
 
   let zipUrl: string

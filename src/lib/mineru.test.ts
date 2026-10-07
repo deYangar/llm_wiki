@@ -10,18 +10,20 @@ vi.mock("@/lib/tauri-fetch", () => ({
 const fsMocks = vi.hoisted(() => ({
   createDirectory: vi.fn<() => Promise<void>>(),
   getFileSize: vi.fn<() => Promise<number>>(),
+  getPdfPageCount: vi.fn<() => Promise<number>>(),
   readFileAsBase64: vi.fn<() => Promise<{ base64: string; mimeType: string }>>(),
-  writeFileBase64: vi.fn<() => Promise<void>>(),
+  writeFileBase64: vi.fn<(path: string, base64: string) => Promise<void>>(),
 }))
 
 vi.mock("@/commands/fs", () => ({
   createDirectory: fsMocks.createDirectory,
   getFileSize: fsMocks.getFileSize,
+  getPdfPageCount: fsMocks.getPdfPageCount,
   readFileAsBase64: fsMocks.readFileAsBase64,
   writeFileBase64: fsMocks.writeFileBase64,
 }))
 
-import { __mineruTest, parseWithMineru, parseWithMineruResult, testMineruConnection } from "./mineru"
+import { __mineruTest, parseWithMineru, parseWithMineruResult, splitPageRanges, testMineruConnection } from "./mineru"
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), {
@@ -48,10 +50,12 @@ beforeEach(() => {
   mockHttpFetch.mockReset()
   fsMocks.createDirectory.mockReset()
   fsMocks.getFileSize.mockReset()
+  fsMocks.getPdfPageCount.mockReset()
   fsMocks.readFileAsBase64.mockReset()
   fsMocks.writeFileBase64.mockReset()
   fsMocks.createDirectory.mockResolvedValue(undefined)
   fsMocks.getFileSize.mockResolvedValue(1024)
+  fsMocks.getPdfPageCount.mockResolvedValue(10)
   fsMocks.readFileAsBase64.mockResolvedValue({
     base64: btoa("pdf bytes"),
     mimeType: "application/pdf",
@@ -868,5 +872,157 @@ describe("testMineruConnection", () => {
     }))
 
     await expect(testMineruConnection("bad-token")).rejects.toThrow("invalid")
+  })
+})
+
+describe("cloud page-range segmentation", () => {
+  const cloudConfig = {
+    enabled: true,
+    backend: "cloud" as const,
+    token: "cloud-token",
+    modelVersion: "vlm" as const,
+  }
+
+  it("splitPageRanges splits totals into per-task page windows", () => {
+    expect(splitPageRanges(200)).toEqual(["1-200"])
+    expect(splitPageRanges(201)).toEqual(["1-200", "201-201"])
+    expect(splitPageRanges(402)).toEqual(["1-200", "201-400", "401-402"])
+    expect(splitPageRanges(0)).toEqual([])
+    expect(splitPageRanges(-5)).toEqual([])
+    expect(Number.isNaN(splitPageRanges(Number.NaN).length)).toBe(false)
+  })
+
+  it("submits one segmented task per page window and joins the markdown", async () => {
+    fsMocks.getPdfPageCount.mockResolvedValue(402)
+    mockHttpFetch
+      // segment 1: batch submit → upload → poll → zip
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { batch_id: "batch-1", file_urls: ["https://upload/1"] },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/1" }] },
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Segment 1" }))
+      // segment 2
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { batch_id: "batch-2", file_urls: ["https://upload/2"] },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/2" }] },
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Segment 2" }))
+      // segment 3
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { batch_id: "batch-3", file_urls: ["https://upload/3"] },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/3" }] },
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Segment 3" }))
+
+    await expect(parseWithMineru(cloudConfig, "/docs/big.pdf"))
+      .resolves.toBe("# Segment 1\n\n# Segment 2\n\n# Segment 3")
+
+    const submitBodies = mockHttpFetch.mock.calls
+      .filter((call) => String(call[0]).endsWith("/file-urls/batch"))
+      .map((call) => JSON.parse(String(call[1]?.body)))
+    expect(submitBodies).toHaveLength(3)
+    expect(submitBodies.map((body: { files: Array<{ page_ranges?: string }> }) => body.files[0].page_ranges))
+      .toEqual(["1-200", "201-400", "401-402"])
+  })
+
+  it("keeps single-task flow with no page_ranges when within the limit", async () => {
+    fsMocks.getPdfPageCount.mockResolvedValue(200)
+    mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { batch_id: "batch-1", file_urls: ["https://upload/1"] },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/1" }] },
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Whole document" }))
+
+    await expect(parseWithMineru(cloudConfig, "/docs/ok.pdf"))
+      .resolves.toBe("# Whole document")
+
+    const submit = mockHttpFetch.mock.calls
+      .filter((call) => String(call[0]).endsWith("/file-urls/batch"))
+      .map((call) => JSON.parse(String(call[1]?.body)))[0]
+    expect(submit.files[0].page_ranges).toBeUndefined()
+  })
+
+  it("isolates segment images into per-segment media directories", async () => {
+    fsMocks.getPdfPageCount.mockResolvedValue(250)
+    const zipOne = await zipResponse({
+      "full.md": "![img](images/1.jpg)",
+      "images/1.jpg": "seg1-bytes",
+    })
+    const zipTwo = await zipResponse({
+      "full.md": "![img](images/1.jpg)",
+      "images/1.jpg": "seg2-bytes",
+    })
+    mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { batch_id: "batch-1", file_urls: ["https://upload/1"] },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/1" }] },
+      }))
+      .mockResolvedValueOnce(zipOne)
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { batch_id: "batch-2", file_urls: ["https://upload/2"] },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/2" }] },
+      }))
+      .mockResolvedValueOnce(zipTwo)
+
+    const result = await parseWithMineruResult(cloudConfig, "/docs/scan.pdf", undefined, undefined, undefined, {
+      projectPath: "/proj",
+      sourceSummarySlug: "slug",
+    })
+
+    expect(result.markdown).toContain("media/slug/mineru/seg-1/images/1.jpg")
+    expect(result.markdown).toContain("media/slug/mineru/seg-2/images/1.jpg")
+    expect(result.savedImages).toHaveLength(2)
+    const writtenPaths = fsMocks.writeFileBase64.mock.calls.map((call) => String(call[0]))
+    expect(writtenPaths).toContain("/proj/wiki/media/slug/mineru/seg-1/images/1.jpg")
+    expect(writtenPaths).toContain("/proj/wiki/media/slug/mineru/seg-2/images/1.jpg")
+  })
+
+  it("falls back to the single-task path when the page count cannot be read", async () => {
+    fsMocks.getPdfPageCount.mockRejectedValue(new Error("PDF is password-protected"))
+    mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { batch_id: "batch-1", file_urls: ["https://upload/1"] },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/1" }] },
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Passthrough" }))
+
+    await expect(parseWithMineru(cloudConfig, "/docs/locked.pdf"))
+      .resolves.toBe("# Passthrough")
   })
 })

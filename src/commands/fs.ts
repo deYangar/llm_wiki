@@ -137,6 +137,10 @@ export async function getFileSize(path: string): Promise<number> {
   return invoke<number>("get_file_size", { path })
 }
 
+export async function getPdfPageCount(path: string): Promise<number> {
+  return invoke<number>("pdf_page_count", { path })
+}
+
 export async function getFileMd5(path: string): Promise<string> {
   return invoke<string>("get_file_md5", { path })
 }

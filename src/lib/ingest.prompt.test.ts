@@ -11,6 +11,8 @@ import {
   computeIngestSourceBudget,
   formatIngestWarningLogEntry,
   splitSourceIntoSemanticChunks,
+  annotateSourceSummaryParserFrontmatter,
+  pdfCacheParserSourceFromHead,
 } from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
 
@@ -323,5 +325,38 @@ describe("long-source ingest planning", () => {
     expect(chunks.some((chunk) => chunk.headingPath.includes("Section Two"))).toBe(true)
     expect(chunks[1].overlapBefore.length).toBeGreaterThan(0)
     expect(chunks[1].main.startsWith(chunks[0].main.slice(-200))).toBe(false)
+  })
+})
+
+describe("pdf parser source annotations", () => {
+  it("pdfCacheParserSourceFromHead detects the built-in extractor signature", () => {
+    expect(pdfCacheParserSourceFromHead("## Page 1\n\n7-2-1\n")).toBe("pdfium")
+    expect(pdfCacheParserSourceFromHead("\uFEFF## Page 1")).toBe("pdfium")
+    expect(pdfCacheParserSourceFromHead("# 苏州信诺维医药科技股份有限公司\n")).toBe("mineru")
+    expect(pdfCacheParserSourceFromHead("   \n")).toBeNull()
+    expect(pdfCacheParserSourceFromHead("")).toBeNull()
+  })
+
+  it("annotateSourceSummaryParserFrontmatter inserts a parser key into existing frontmatter", () => {
+    const page = "---\ntype: source\ntitle: \"x\"\n---\n\n# Body\n"
+    const annotated = annotateSourceSummaryParserFrontmatter(page, "mineru")
+    expect(annotated).toBe("---\ntype: source\ntitle: \"x\"\nparser: \"mineru\"\n---\n\n# Body\n")
+  })
+
+  it("annotateSourceSummaryParserFrontmatter replaces a previous parser value", () => {
+    const page = "---\ntype: source\nparser: \"pdfium\"\n---\nbody\n"
+    expect(annotateSourceSummaryParserFrontmatter(page, "mineru"))
+      .toBe("---\ntype: source\nparser: \"mineru\"\n---\nbody\n")
+  })
+
+  it("annotateSourceSummaryParserFrontmatter leaves pages without frontmatter untouched", () => {
+    const page = "# No frontmatter here\n"
+    expect(annotateSourceSummaryParserFrontmatter(page, "mineru")).toBe(page)
+  })
+
+  it("annotateSourceSummaryParserFrontmatter quotes parser values containing dashes", () => {
+    const page = "---\ntype: source\n---\nbody\n"
+    expect(annotateSourceSummaryParserFrontmatter(page, "pdfium-fallback"))
+      .toBe("---\ntype: source\nparser: \"pdfium-fallback\"\n---\nbody\n")
   })
 })
