@@ -28,6 +28,20 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.13",
+    date: "2026-10-08",
+    highlights: {
+      en: [
+        "Added a controlled GET /media API endpoint that serves knowledge-base image attachments to local API consumers with CORS support.",
+        "Carries the upstream v0.6.12 changes on top of the local knowledge-graph performance optimizations.",
+      ],
+      zh: [
+        "新增受控的 GET /media API 端点，支持跨域向本地 API 消费方提供知识库图片附件。",
+        "在本地图谱性能优化之上合并上游 v0.6.12 全部变更。",
+      ],
+    },
+  },
+  {
     version: "0.6.12",
     date: "2026-09-27",
     highlights: {

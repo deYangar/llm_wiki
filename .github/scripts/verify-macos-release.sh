@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Strict Developer ID verification only applies to builds signed with a
+# real certificate. Builds without Apple signing secrets are ad-hoc
+# signed: codesign accepts them, but spctl/stapler never will. Detect
+# the keychain state directly so signing is verified strictly when a
+# Developer ID certificate exists and skipped with an explicit marker
+# when it does not.
+if ! security find-identity -v -p codesigning 2>/dev/null | grep -q 'Developer ID Application:'; then
+  echo "No Developer ID Application identity in keychain; skipping strict verification for ad-hoc signed build."
+  exit 0
+fi
+
 target_root="${1:-src-tauri/target}"
 
 app_path="$(find "$target_root" -path '*/release/bundle/macos/*.app' -type d -print -quit)"
