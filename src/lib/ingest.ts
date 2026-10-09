@@ -12,7 +12,7 @@ import {
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig, ReasoningConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
-import { parseWithMineruResult } from "@/lib/mineru"
+import { classifyMineruFailure, parseWithMineruResult } from "@/lib/mineru"
 import { useChatStore } from "@/stores/chat-store"
 import { useActivityStore } from "@/stores/activity-store"
 import { useReviewStore, type ReviewItem } from "@/stores/review-store"
@@ -60,8 +60,10 @@ const INGEST_GENERATION_TOKENS_128K = 16_384
 const INGEST_GENERATION_TOKENS_256K = 24_576
 const INGEST_GENERATION_TOKENS_512K = 32_768
 const INGEST_ANALYSIS_TOKENS_MIN = 4_096
-const INGEST_ANALYSIS_TOKENS_MAX = 8_192
-const CONSERVATIVE_CHARS_PER_OUTPUT_TOKEN = 4
+const INGEST_ANALYSIS_TOKENS_MAX = 16_384
+/** CJK-heavy analysis output needs roughly half the chars-per-token the
+ *  English-tuned constant assumes; see computeIngestAnalysisMaxTokens. */
+const INGEST_ANALYSIS_CHARS_PER_OUTPUT_TOKEN = 2.5
 const REVIEW_STAGE_MIN_SIGNAL_CHARS = 10_000
 const REVIEW_STAGE_MIN_FILE_BLOCKS = 4
 const AGGREGATE_WIKI_PATHS = ["wiki/index.md", "wiki/overview.md", "wiki/log.md"] as const
@@ -110,6 +112,64 @@ function ingestAnalysisRequest(config: LlmConfig): {
           ? reasoning.budgetTokens ?? 0
           : 0
   return { maxTokens: contentTokens + reasoningTokens, reasoning }
+}
+
+/**
+ * Structured ingest calls run against OUR max_tokens budget, not the model's
+ * full capability. When the provider ends the stream at that ceiling
+ * (finish_reason=length), the analysis is not "bad" — it was cut by our own
+ * wire limit, and a checkpoint retry with the same limit would loop forever.
+ * Instead, hand the partial text back and ask the model to resume exactly
+ * where it stopped, up to `maxContinuations` times, before giving up.
+ */
+export async function streamChatWithContinuation(
+  llmConfig: LlmConfig,
+  systemPrompt: string,
+  userPrompt: string,
+  overrides: { temperature: number; reasoning: ReasoningConfig; max_tokens: number },
+  onError: (err: Error) => void,
+  signal?: AbortSignal,
+  maxContinuations = 2,
+): Promise<{ text: string; truncated: boolean }> {
+  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
+  ]
+  let text = ""
+  let truncated = false
+  let continuations = 0
+
+  while (true) {
+    let round = ""
+    let roundTruncated = false
+    await streamChat(
+      llmConfig,
+      continuations === 0
+        ? messages
+        : [
+            ...messages,
+            { role: "assistant", content: text },
+            {
+              role: "user",
+              content:
+                "Your previous message was cut off by an output limit. Continue EXACTLY from where it stopped — do not repeat any earlier text, headings, or table rows; resume mid-sentence if that is where it stopped. Stop as soon as the requested sections are complete.",
+            },
+          ],
+      {
+        onToken: (token) => { round += token },
+        onDone: (completion) => { roundTruncated = completion?.truncated === true },
+        onError,
+      },
+      signal,
+      overrides,
+    )
+    text += round
+    truncated = roundTruncated
+    if (!roundTruncated || continuations >= maxContinuations) break
+    continuations++
+  }
+
+  return { text, truncated }
 }
 
 const ingestImageExtractionPromises = new Map<string, Promise<SavedImage[]>>()
@@ -826,42 +886,109 @@ async function autoIngestImpl(
   const cacheDir = sp.substring(0, sp.lastIndexOf("/"))
   const cachePath = `${cacheDir}/.cache/${fileName}.txt`
   if (isPdf && mineruCfg.enabled && mineruConfigured) {
-    try {
-      activity.updateItem(activityId, { detail: "MinerU: parsing PDF..." })
-      console.log(`[ingest:mineru] submitting "${fileName}" to MinerU API`)
-      const mineruResult = await parseWithMineruResult(mineruCfg, sp, undefined, (msg) => {
-        activity.updateItem(activityId, { detail: `MinerU: ${msg}` })
-      }, signal, {
-        projectPath: pp,
-        sourceSummarySlug,
-      })
-      await createDirectory(`${cacheDir}/.cache`)
-      await writeFile(cachePath, mineruResult.markdown)
-      mineruSavedImages = mineruResult.savedImages
-      if (mineruSavedImages.length > 0) {
-        const extractionKey = await imageExtractionKey(pp, sp, sourceSummarySlug)
-        rememberImageExtractionByKey(extractionKey, Promise.resolve(mineruSavedImages))
+    // Fallback ladder: primary backend → (cloud only) one classified retry →
+    // the other local deployment if configured → built-in pdfium. Every hop
+    // is surfaced (activity detail + ingest-warnings.log + `parser:` tag).
+    const primaryBackend = mineruCfg.backend === "local" ? "local" : "cloud"
+    const localFallbackConfigured = Boolean(mineruCfg.localEndpoint?.trim())
+    let parseFailure: unknown = null
+
+    const attemptMineruParse = async (backend: "cloud" | "local"): Promise<boolean> => {
+      const cfg = backend === mineruCfg.backend ? mineruCfg : { ...mineruCfg, backend }
+      const label = backend === "local" ? "MinerU (local)" : "MinerU"
+      try {
+        activity.updateItem(activityId, { detail: `${label}: parsing PDF...` })
+        console.log(`[ingest:mineru] submitting "${fileName}" to ${label} API`)
+        const mineruResult = await parseWithMineruResult(cfg, sp, undefined, (msg) => {
+          activity.updateItem(activityId, { detail: `${label}: ${msg}` })
+        }, signal, {
+          projectPath: pp,
+          sourceSummarySlug,
+        })
+        await createDirectory(`${cacheDir}/.cache`)
+        await writeFile(cachePath, mineruResult.markdown)
+        mineruSavedImages = mineruResult.savedImages
+        if (mineruSavedImages.length > 0) {
+          const extractionKey = await imageExtractionKey(pp, sp, sourceSummarySlug)
+          rememberImageExtractionByKey(extractionKey, Promise.resolve(mineruSavedImages))
+        }
+        mineruSucceeded = true
+        pdfParserSource =
+          backend === "local"
+            ? primaryBackend === "local" ? "mineru-local" : "mineru-local-fallback"
+            : "mineru"
+        console.log(
+          `[ingest:mineru] cached ${label}${mineruResult.protocol ? ` (${mineruResult.protocol})` : ""} output for "${fileName}" (${mineruResult.markdown.length} chars, images=${mineruSavedImages.length})`,
+        )
+        return true
+      } catch (err) {
+        throwIfIngestAborted(signal, activityId)
+        parseFailure = err
+        return false
       }
-      mineruSucceeded = true
-      pdfParserSource = mineruCfg.backend === "local" ? "mineru-local" : "mineru"
-      console.log(
-        `[ingest:mineru] cached MinerU output for "${fileName}" (${mineruResult.markdown.length} chars, images=${mineruSavedImages.length})`,
+    }
+
+    let primaryOk = await attemptMineruParse(primaryBackend)
+
+    if (!primaryOk && primaryBackend === "cloud") {
+      const reason = parseFailure instanceof Error ? parseFailure.message : String(parseFailure)
+      if (classifyMineruFailure(parseFailure) === "transient") {
+        // One same-backend retry for unpredictable failures (network blips,
+        // 5xx, sampling hiccups). Permanent errors (bad token, quota,
+        // rejected parameters) fail identically on retry.
+        console.warn(`[ingest:mineru] cloud attempt failed (${reason}); retrying once`)
+        activity.updateItem(activityId, {
+          detail: `MinerU cloud failed, retrying once: ${trimInlineStatus(reason)}`,
+        })
+        primaryOk = await attemptMineruParse("cloud")
+      } else {
+        console.warn(`[ingest:mineru] cloud attempt failed permanently: ${reason}`)
+      }
+
+      if (!primaryOk && localFallbackConfigured) {
+        const cloudReason = trimInlineStatus(
+          parseFailure instanceof Error ? parseFailure.message : String(parseFailure),
+        )
+        console.warn(`[ingest:mineru] degrading cloud→local after: ${cloudReason}`)
+        activity.updateItem(activityId, {
+          detail: `MinerU cloud failed; degrading to the local service: ${cloudReason}`,
+        })
+        const localOk = await attemptMineruParse("local")
+        if (localOk) {
+          pdfParserWarnings.push(
+            `MinerU cloud parsing failed (${cloudReason}); the source was recovered by the LOCAL MinerU service instead. Cloud-only artifacts may differ; verify quality if the failure repeats.`,
+          )
+        }
+      }
+    } else if (!primaryOk && primaryBackend === "local") {
+      const reason = trimInlineStatus(
+        parseFailure instanceof Error ? parseFailure.message : String(parseFailure),
       )
-    } catch (err) {
-      throwIfIngestAborted(signal, activityId)
-      const msg = trimInlineStatus(err instanceof Error ? err.message : String(err))
+      console.warn(`[ingest:mineru] local attempt failed: ${reason}`)
+    }
+
+    if (!primaryOk && !mineruSucceeded) {
+      const msg = trimInlineStatus(
+        parseFailure instanceof Error ? parseFailure.message : String(parseFailure),
+      )
       console.warn(`[ingest:mineru] MinerU parsing failed, falling back to pdfium: ${msg}`)
       activity.updateItem(activityId, {
         detail: `MinerU failed, falling back to built-in PDF extraction: ${msg}`,
       })
+      const ladderNote = primaryBackend === "cloud" && localFallbackConfigured
+        ? " Both the cloud API and the local service were attempted."
+        : primaryBackend === "cloud"
+          ? " The local fallback service was not configured (Settings → MinerU → local endpoint)."
+          : ""
       pdfParserWarnings.push(
-        `MinerU parsing failed; the source was ingested from built-in PDF text extraction instead (layout, tables and scanned pages will be degraded or missing): ${msg}`,
+        `MinerU parsing failed; the source was ingested from built-in PDF text extraction instead (layout, tables and scanned pages will be degraded or missing): ${msg}.${ladderNote}`,
       )
       // The failed parse may still leave an earlier good MinerU cache in
       // place — only claim a downgrade when the cached text really is the
       // built-in extractor's output.
       pdfParserSource = await detectPdfCacheParserSource(cachePath, "pdfium-fallback")
     }
+
     if (mineruSucceeded && !signal?.aborted) {
       activity.updateItem(activityId, { detail: "Reading source..." })
     }
@@ -1176,27 +1303,22 @@ async function autoIngestImpl(
   let analysis = precomputedAnalysis
 
   if (!analysis) {
-    let analysisTruncated = false
     const analysisRequest = ingestAnalysisRequest(llmConfig)
-    await streamChat(
+    const result = await streamChatWithContinuation(
       llmConfig,
-      [
-        { role: "system", content: buildAnalysisPrompt(purpose, index, sourceContext, schema) },
-        { role: "user", content: `Analyze this source document:\n\n**File:** ${sourceIdentity}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${sourceContext}` },
-      ],
-      {
-        onToken: (token) => { analysis += token },
-        onDone: (completion) => { analysisTruncated = completion?.truncated === true },
-        onError: (err) => {
-          activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
-        },
+      buildAnalysisPrompt(purpose, index, sourceContext, schema),
+      `Analyze this source document:\n\n**File:** ${sourceIdentity}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${sourceContext}`,
+      { temperature: 0.1, reasoning: analysisRequest.reasoning, max_tokens: analysisRequest.maxTokens },
+      (err) => {
+        activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
       },
       signal,
-      { temperature: 0.1, reasoning: analysisRequest.reasoning, max_tokens: analysisRequest.maxTokens },
     )
-    if (analysisTruncated) {
+    analysis = `${analysis ?? ""}${result.text}`
+    if (result.truncated) {
       const message =
-        `Analysis was truncated after reaching the ${analysisRequest.maxTokens.toLocaleString()} token output limit. ` +
+        `Analysis was truncated after reaching the ${analysisRequest.maxTokens.toLocaleString()} token output limit ` +
+        "(including automatic continuation attempts). " +
         "Wiki pages were not generated from the incomplete analysis. Split the source or use a model with a larger output limit."
       activity.updateItem(activityId, { status: "error", detail: message })
       throw new NonRetryableIngestError(message)
@@ -1569,6 +1691,13 @@ async function autoIngestImpl(
       savedImages,
       getLanguagePromptName(getOutputLanguage(sourceContent)),
     )
+    // MinerU owns image duty for this source now: page scans left behind by
+    // an earlier degraded parse are superseded. Sweep them (reference-checked)
+    // so a re-import of a scanned document reclaims the hundreds of MB the
+    // fallback run parked under media/.
+    if (isPdf && skipNativePdfImageExtraction) {
+      await cleanupSupersededPageScans(pp, sourceSummarySlug, savedImages)
+    }
   }
 
   if (writtenPaths.length > 0) {
@@ -2856,8 +2985,12 @@ export function computeIngestGenerationMaxTokens(maxContextSize: number | undefi
 
 export function computeIngestAnalysisMaxTokens(maxContextSize: number | undefined): number {
   const { responseReserve } = computeContextBudget(maxContextSize)
+  // The generic 4-chars/token divisor is an English heuristic. Ingest
+  // analyses are dominated by CJK prose and markdown tables (~1.5-2 chars
+  // per token), where it under-budgets by 2x+ and the stream dies at
+  // finish_reason=length while the pipeline tolerates 40K chars of analysis.
   const reservedOutputTokens = Math.floor(
-    responseReserve / CONSERVATIVE_CHARS_PER_OUTPUT_TOKEN,
+    responseReserve / INGEST_ANALYSIS_CHARS_PER_OUTPUT_TOKEN,
   )
   return clampNumber(
     reservedOutputTokens,
@@ -3160,6 +3293,7 @@ export function buildChunkAnalysisSystemPrompt(
     "Do not output chain-of-thought, hidden reasoning, or a thinking transcript.",
     "Analyze only the current MAIN CHUNK. Use overlap and digest for context only.",
     "Keep stable names consistent with the existing wiki and prior digest.",
+    "Output budget: keep the Chunk Analysis section under roughly 8,000 characters and the Updated Global Digest under roughly 2,500 characters. Densify instead of padding — a truncated response cannot be used.",
     "",
     languageRule(sourceContent),
     "",
@@ -3265,41 +3399,31 @@ async function analyzeLongSourceInChunks(
       detail: `Analyzing long source chunk ${chunk.index}/${chunk.total}...`,
     })
 
-    let raw = ""
     let hadError = false
-    let analysisTruncated = false
-    await streamChat(
+    const chunkResult = await streamChatWithContinuation(
       llmConfig,
-      [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: buildChunkAnalysisUserPrompt(
-            sourceIdentity,
-            folderContext,
-            chunk,
-            trimLongText(globalDigest, LONG_SOURCE_DIGEST_MAX),
-          ),
-        },
-      ],
-      {
-        onToken: (token) => { raw += token },
-        onDone: (completion) => { analysisTruncated = completion?.truncated === true },
-        onError: (err) => {
-          hadError = true
-          activity.updateItem(activityId, { status: "error", detail: `Chunk analysis failed: ${err.message}` })
-        },
+      systemPrompt,
+      buildChunkAnalysisUserPrompt(
+        sourceIdentity,
+        folderContext,
+        chunk,
+        trimLongText(globalDigest, LONG_SOURCE_DIGEST_MAX),
+      ),
+      { temperature: 0.1, reasoning: analysisRequest.reasoning, max_tokens: analysisRequest.maxTokens },
+      (err) => {
+        hadError = true
+        activity.updateItem(activityId, { status: "error", detail: `Chunk analysis failed: ${err.message}` })
       },
       signal,
-      { temperature: 0.1, reasoning: analysisRequest.reasoning, max_tokens: analysisRequest.maxTokens },
     )
+    const raw = chunkResult.text
 
     throwIfIngestAborted(signal, activityId)
     if (hadError) throw new Error("Chunk analysis stream failed")
-    if (analysisTruncated) {
+    if (chunkResult.truncated) {
       const message =
         `Chunk ${chunk.index}/${chunk.total} analysis was truncated after reaching the ` +
-        `${analysisRequest.maxTokens.toLocaleString()} token output limit; the saved checkpoint will be retried`
+        `${analysisRequest.maxTokens.toLocaleString()} token output limit (including continuation attempts); the saved checkpoint will be retried`
       activity.updateItem(activityId, { status: "error", detail: message })
       throw new Error(message)
     }
@@ -3490,7 +3614,7 @@ async function injectImagesIntoSourceSummary(
   pp: string,
   sourceIdentity: string,
   sourceSummarySlug: string,
-  savedImages: { relPath: string; page: number | null; sha256?: string }[],
+  savedImages: { relPath: string; page: number | null; sha256?: string; kind?: "embedded" | "page-scan" }[],
   outputLanguage?: string,
 ): Promise<void> {
   if (savedImages.length === 0) return
@@ -3553,6 +3677,77 @@ async function injectImagesIntoSourceSummary(
   } catch (err) {
     console.warn(
       `[ingest:images] failed to append images to ${sourceSummaryPath}:`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+/**
+ * When a successful MinerU (re)parse takes over image duty for a PDF, the
+ * page-scan PNGs left by an earlier degraded run (`img-N.png`, the Rust
+ * extractor's naming pattern) are dead weight — hundreds of MB for a scanned
+ * inquiry letter. Delete the ones this ingest no longer lists AND no other
+ * wiki page references. Only touches `img-N.*` files inside this source's
+ * own media directory; MinerU assets and other slugs are never considered.
+ */
+async function cleanupSupersededPageScans(
+  pp: string,
+  sourceSummarySlug: string,
+  currentImages: SavedImage[],
+): Promise<void> {
+  try {
+    const mediaDir = `${pp}/wiki/media/${sourceSummarySlug}`
+    const nodes = await listDirectory(mediaDir, false)
+    const kept = new Set(currentImages.map((img) => img.absPath))
+    const candidates = nodes
+      .filter((n) => !n.is_dir && /^img-\d+\.(png|jpg|jpeg)$/i.test(n.name))
+      .map((n) => n.path || `${mediaDir}/${n.name}`)
+      .filter((abs) => !kept.has(abs))
+    if (candidates.length === 0) return
+
+    // Reference sweep across every wiki markdown page: a generated entity
+    // page may inline-reference a page scan by filename. Skip any candidate
+    // whose filename appears anywhere; deleting a referenced image would
+    // break the page render.
+    const wikiTree = await listDirectory(`${pp}/wiki`, false)
+    const mdPaths: string[] = []
+    const walk = (items: FileNode[]) => {
+      for (const node of items) {
+        if (node.is_dir) {
+          if (node.children) walk(node.children)
+        } else if (node.name.toLowerCase().endsWith(".md")) {
+          mdPaths.push(node.path)
+        }
+      }
+    }
+    walk(wikiTree)
+
+    const wanted = new Set(candidates.map((abs) => getFileName(abs)))
+    const referenced = new Set<string>()
+    for (const mdPath of mdPaths) {
+      if (referenced.size === wanted.size) break
+      const content = await tryReadFile(mdPath)
+      if (!content) continue
+      for (const name of wanted) {
+        if (!referenced.has(name) && content.includes(name)) referenced.add(name)
+      }
+    }
+
+    let removed = 0
+    for (const abs of candidates) {
+      if (referenced.has(getFileName(abs))) continue
+      await deleteFile(abs)
+      removed++
+    }
+    if (removed > 0) {
+      console.log(
+        `[ingest:images] removed ${removed} superseded page-scan image(s) under ${sourceSummarySlug}/media`,
+      )
+    }
+  } catch (err) {
+    // Cleanup is best-effort: a failure here must never fail the ingest.
+    console.warn(
+      `[ingest:images] page-scan cleanup failed for "${sourceSummarySlug}":`,
       err instanceof Error ? err.message : err,
     )
   }

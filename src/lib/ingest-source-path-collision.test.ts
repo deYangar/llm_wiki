@@ -147,6 +147,7 @@ vi.mock("./llm-client", () => ({
 vi.mock("./mineru", () => ({
   parseWithMineru: vi.fn(),
   parseWithMineruResult: vi.fn(),
+  classifyMineruFailure: vi.fn(() => "permanent"),
 }))
 
 import {

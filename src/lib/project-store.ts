@@ -213,6 +213,8 @@ function normalizeMineruConfig(config: MineruConfig): MineruConfig {
     localBackend: LOCAL_MINERU_BACKENDS.has(config.localBackend ?? "")
       ? config.localBackend
       : "hybrid-engine",
+    localTier:
+      config.localTier === "flash" || config.localTier === "basic" ? config.localTier : "standard",
     localEffort: config.localEffort === "high" ? "high" : "medium",
     localParseMethod:
       config.localParseMethod === "txt" || config.localParseMethod === "ocr"

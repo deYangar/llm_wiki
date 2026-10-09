@@ -4,7 +4,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import type { SettingsDraft, DraftSetter } from "../settings-types"
-import type { MineruLocalBackend, MineruModelVersion, MineruParseMethod } from "@/stores/wiki-store"
+import type { MineruLocalBackend, MineruLocalTier, MineruModelVersion, MineruParseMethod } from "@/stores/wiki-store"
 import { testMineruConnection } from "@/lib/mineru"
 
 interface Props {
@@ -151,7 +151,32 @@ export function MineruSection({ draft, setDraft }: Props) {
                 <p className="text-xs text-muted-foreground">
                   {t("settings.sections.mineru.localInfo", {
                     defaultValue:
-                      "Base URL of an official mineru-api or mineru-router service.",
+                      "Base URL of an official mineru-api or mineru-router service. MinerU 4.x api-server (V1) is detected automatically; it is also used as the cloud fallback target when cloud parsing fails.",
+                  })}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="mineru-local-tier">
+                  {t("settings.sections.mineru.v1Tier", {
+                    defaultValue: "V1 api-server tier",
+                  })}
+                </Label>
+                <select
+                  id="mineru-local-tier"
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  value={draft.mineruLocalTier}
+                  onChange={(e) =>
+                    setDraft("mineruLocalTier", e.target.value as MineruLocalTier)
+                  }
+                >
+                  <option value="flash">{t("settings.sections.mineru.tierFlash", { defaultValue: "Flash (fastest)" })}</option>
+                  <option value="basic">{t("settings.sections.mineru.tierBasic", { defaultValue: "Basic" })}</option>
+                  <option value="standard">{t("settings.sections.mineru.tierStandard", { defaultValue: "Standard (recommended)" })}</option>
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  {t("settings.sections.mineru.v1TierHint", {
+                    defaultValue:
+                      "Only used when the endpoint speaks the official V1 protocol (mineru-kit api-server).",
                   })}
                 </p>
               </div>

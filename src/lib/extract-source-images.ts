@@ -30,6 +30,11 @@ export interface SavedImage {
   /** Absolute filesystem path — used by `convertFileSrc` for preview. */
   absPath: string
   sha256: string
+  /** Rust-side classification: "page-scan" = full-page image on a page with
+   *  no text layer (scanned page — the image IS the page), "embedded" =
+   *  meaningful content (charts, photos, logos). Missing = legacy data
+   *  extracted before the field existed; treated as embedded. */
+  kind?: "embedded" | "page-scan"
 }
 
 /** File extensions we currently extract images from. Excludes XLS/XLSX
@@ -294,49 +299,77 @@ export function buildImageMarkdownSection(
 ): string {
   if (images.length === 0) return ""
 
-  const lines: string[] = ["", "", "## Embedded Images", ""]
-  // Group by page so the LLM can correlate "Figure 3 mentioned on
-  // page 5" with the right image. DOCX images have page=null; they
-  // get grouped under "Document":
-  const byPage = new Map<string, SavedImage[]>()
-  for (const img of images) {
-    const key = img.page == null ? "Document" : `Page ${img.page}`
-    const bucket = byPage.get(key)
-    if (bucket) bucket.push(img)
-    else byPage.set(key, [img])
-  }
+  // Page scans are the page itself (scanned document, no text layer), not
+  // content: listing hundreds of them as `### Page N` blocks buries the
+  // meaningful figures and bloats the page. They stay available for the
+  // vision pipeline and are folded into a single collapsed block with an
+  // explicit degraded-parse banner instead.
+  const pageScans = images.filter((img) => img.kind === "page-scan")
+  const embedded = images.filter((img) => img.kind !== "page-scan")
 
-  // Page-keyed order, with "Document" (DOCX) last when present.
-  const ordered = [...byPage.keys()].sort((a, b) => {
-    if (a === "Document") return 1
-    if (b === "Document") return -1
-    const numA = parseInt(a.replace(/\D/g, ""), 10) || 0
-    const numB = parseInt(b.replace(/\D/g, ""), 10) || 0
-    return numA - numB
-  })
-
-  // Sanitize a caption for safe inclusion as alt text — the same
-  // rules as the inline-rewrite path: no `]` (would close the alt
-  // bracket early), no embedded newlines (would break the markdown
-  // image syntax across lines).
   const sanitize = (s: string): string =>
     s.replace(/[\r\n]+/g, " ").replace(/]/g, ")").trim()
 
-  for (const key of ordered) {
-    lines.push(`### ${key}`, "")
-    for (const img of byPage.get(key) ?? []) {
-      // Caption lookup by SHA-256 — same key the caption pipeline
-      // uses to dedupe across documents. Falling back to empty alt
-      // text if no caption is available for this image (caption
-      // pipeline disabled / failed / didn't run yet on cache hit).
-      // Empty alt is still better than no image reference at all
-      // — the inline LLM-generated text might cite the image by
-      // page number anyway.
+  const lines: string[] = []
+
+  if (embedded.length > 0) {
+    lines.push("", "", "## Embedded Images", "")
+    // Group by page so the LLM can correlate "Figure 3 mentioned on
+    // page 5" with the right image. DOCX images have page=null; they
+    // get grouped under "Document":
+    const byPage = new Map<string, SavedImage[]>()
+    for (const img of embedded) {
+      const key = img.page == null ? "Document" : `Page ${img.page}`
+      const bucket = byPage.get(key)
+      if (bucket) bucket.push(img)
+      else byPage.set(key, [img])
+    }
+
+    // Page-keyed order, with "Document" (DOCX) last when present.
+    const ordered = [...byPage.keys()].sort((a, b) => {
+      if (a === "Document") return 1
+      if (b === "Document") return -1
+      const numA = parseInt(a.replace(/\D/g, ""), 10) || 0
+      const numB = parseInt(b.replace(/\D/g, ""), 10) || 0
+      return numA - numB
+    })
+
+    for (const key of ordered) {
+      lines.push(`### ${key}`, "")
+      for (const img of byPage.get(key) ?? []) {
+        // Caption lookup by SHA-256 — same key the caption pipeline
+        // uses to dedupe across documents. Falling back to empty alt
+        // text if no caption is available for this image (caption
+        // pipeline disabled / failed / didn't run yet on cache hit).
+        // Empty alt is still better than no image reference at all
+        // — the inline LLM-generated text might cite the image by
+        // page number anyway.
+        const caption = captionsBySha?.get(img.sha256)
+        const alt = caption ? sanitize(caption) : ""
+        lines.push(`![${alt}](${img.relPath})`)
+      }
+      lines.push("")
+    }
+  }
+
+  if (pageScans.length > 0) {
+    lines.push(
+      "",
+      "## Scanned Pages (degraded parse)",
+      "",
+      `> This source is a scanned document that was parsed without OCR: ${pageScans.length} full-page scan images are preserved under \`../media/\` for the vision pipeline. Re-import this file after fixing MinerU parsing to replace them with real OCR text.`,
+      "",
+      "<details>",
+      `<summary>${pageScans.length} page scans</summary>`,
+      "",
+    )
+    for (const img of pageScans) {
       const caption = captionsBySha?.get(img.sha256)
       const alt = caption ? sanitize(caption) : ""
       lines.push(`![${alt}](${img.relPath})`)
+      lines.push("")
     }
-    lines.push("")
+    lines.push("</details>", "")
   }
 
   return lines.join("\n")

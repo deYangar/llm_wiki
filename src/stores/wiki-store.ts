@@ -290,6 +290,8 @@ export type MineruLocalBackend =
   | "hybrid-http-client"
 export type MineruParseMethod = "auto" | "txt" | "ocr"
 export type MineruEffort = "medium" | "high"
+/** Capability tier for the official V1 local api-server (flash/basic/standard). */
+export type MineruLocalTier = "flash" | "basic" | "standard"
 
 export interface MineruConfig {
   enabled: boolean
@@ -300,6 +302,8 @@ export interface MineruConfig {
   /** Optional Bearer token used only for the self-hosted MinerU service. */
   localToken?: string
   localBackend?: MineruLocalBackend
+  /** V1 api-server tier. Ignored by the community /tasks wrapper. */
+  localTier?: MineruLocalTier
   localEffort?: MineruEffort
   localParseMethod?: MineruParseMethod
   localLanguage?: string
@@ -639,6 +643,7 @@ export const useWikiStore = create<WikiState>((set) => ({
     backend: "cloud",
     localEndpoint: "http://127.0.0.1:8000",
     localBackend: "hybrid-engine",
+    localTier: "standard",
     localEffort: "medium",
     localParseMethod: "auto",
     localLanguage: "ch",

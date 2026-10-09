@@ -13,7 +13,59 @@ const LOCAL_POLL_TIMEOUT_MS = 3_600_000 // Official mineru-api tasks can include
 const MAX_ACCURATE_PARSE_BYTES = 200 * 1024 * 1024
 // The cloud API rejects documents above 200 pages (-60006). Larger PDFs are
 // split into `page_ranges` segments and the resulting Markdown is joined.
-export const MAX_CLOUD_PAGES_PER_TASK = 200
+// Segments are capped at 100 pages — half the API maximum — because peak-hour
+// cloud queues regularly exceed a 200-page segment's polling window, and a
+// failed segment costs a full re-upload.
+export const MAX_CLOUD_PAGES_PER_TASK = 100
+
+/**
+ * Cloud polling window per document. Small documents keep the historical
+ * 5-minute window; larger ones scale with page count so peak-hour queueing
+ * (segment submitted, waiting for a worker) is not mistaken for a hang.
+ */
+export function cloudPollTimeoutMs(pageCount: number | null): number {
+  if (pageCount === null || pageCount <= 0) return POLL_TIMEOUT_MS
+  return Math.min(POLL_TIMEOUT_MS + pageCount * 5_000, 1_200_000)
+}
+
+/**
+ * Local V1 api-server polling window. CPU deployments parse at tens of
+ * seconds per page, so the window scales with page count; the floor covers
+ * model cold starts, the ceiling keeps a wedged job from blocking the
+ * ingest queue forever.
+ */
+export function localV1PollTimeoutMs(pageCount: number | null): number {
+  const pages = pageCount && pageCount > 0 ? pageCount : 0
+  return Math.min(600_000 + pages * 90_000, 6 * 3_600_000)
+}
+
+/** Distinguishes "poll window elapsed" from every other cloud failure so the
+ *  caller can extend polling of the *same* batch instead of re-uploading. */
+export class MineruPollTimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "MineruPollTimeoutError"
+  }
+}
+
+/**
+ * Whether a cloud MinerU failure is worth one same-backend retry. Permanent
+ * errors (bad credentials, quota exhausted, API parameter/limit rejections)
+ * fail identically on retry and should go straight to the fallback ladder.
+ */
+export function classifyMineruFailure(err: unknown): "transient" | "permanent" {
+  const message = err instanceof Error ? err.message : String(err)
+  if (/token is invalid|token has expired|daily parsing quota|larger than 200 MB|exceeds the 200 page limit|cannot exceed \d+ characters|not configured|supports only pipeline or vlm/i.test(message)) {
+    return "permanent"
+  }
+  // MineruApiErrorMessage formats known API codes as "MinerU <reason> (<msg>)"
+  // and unknown ones as "MinerU API error <code>"; parameter/validation codes
+  // share the -100xx family with the data_id length limit.
+  if (/MinerU API error -100\d\d/i.test(message)) return "permanent"
+  if (/HTTP 5\d\d|HTTP 429/i.test(message)) return "transient"
+  if (/timed out|error sending request|network|Failed to fetch/i.test(message)) return "transient"
+  return "transient"
+}
 const MINERU_IMAGE_EXTS = new Set([
   "png",
   "jpg",
@@ -85,6 +137,8 @@ interface MineruAssetOptions {
 interface MineruExtractedMarkdown {
   markdown: string
   savedImages: SavedImage[]
+  /** Local backend only: which service flavor produced this result. */
+  protocol?: LocalMineruProtocol
 }
 
 function localMineruApiBase(endpoint: string | undefined): string {
@@ -465,8 +519,19 @@ async function uploadFileForTask(
   const headers = await mineruHeaders(token)
   throwIfAborted(signal)
 
+  // The API caps `files[].data_id` at 128 characters and rejects the whole
+  // batch with -10002 when exceeded — long Chinese inquiry-letter filenames
+  // always trip this. Use a deterministic content-hash ID instead; keep the
+  // display `name` short too so servers that cap it as well stay happy.
+  const contentHash = await sha256OfBytes(decodeBase64ToBytes(fileBase64))
+  const rangeTag = pageRanges ? `-${pageRanges.replace(/[^0-9,-]/g, "").slice(0, 24)}` : ""
+  const dataId = `wiki-${contentHash.slice(0, 24)}${rangeTag}.pdf`
+  const displayName = fileName.length > 120
+    ? `${contentHash.slice(0, 8)}…${fileName.slice(-100)}`
+    : fileName
+
   // Step 1: Get upload URL
-  const fileEntry: Record<string, string> = { name: fileName, data_id: fileName }
+  const fileEntry: Record<string, string> = { name: displayName, data_id: dataId }
   if (pageRanges) fileEntry.page_ranges = pageRanges
   const res = await httpFetch(`${API_BASE}/file-urls/batch`, {
     method: "POST",
@@ -519,12 +584,17 @@ function waitForPollInterval(signal?: AbortSignal): Promise<void> {
   })
 }
 
-async function pollTask(token: string, taskId: string, signal?: AbortSignal): Promise<string> {
+async function pollTask(
+  token: string,
+  taskId: string,
+  signal?: AbortSignal,
+  timeoutMs: number = POLL_TIMEOUT_MS,
+): Promise<string> {
   const httpFetch = await getHttpFetch()
   const headers = await mineruHeaders(token)
   const start = Date.now()
 
-  while (Date.now() - start < POLL_TIMEOUT_MS) {
+  while (Date.now() - start < timeoutMs) {
     throwIfAborted(signal)
     const res = await httpFetch(`${API_BASE}/extract/task/${taskId}`, {
       headers,
@@ -544,19 +614,22 @@ async function pollTask(token: string, taskId: string, signal?: AbortSignal): Pr
     await waitForPollInterval(signal)
   }
 
-  throw new Error("MinerU parsing timed out after 5 minutes")
+  throw new MineruPollTimeoutError(
+    `MinerU parsing timed out after ${Math.round(timeoutMs / 60_000)} minutes`,
+  )
 }
 
 async function pollBatchTask(
   token: string,
   batchId: string,
   signal?: AbortSignal,
+  timeoutMs: number = POLL_TIMEOUT_MS,
 ): Promise<string> {
   const httpFetch = await getHttpFetch()
   const headers = await mineruHeaders(token)
   const start = Date.now()
 
-  while (Date.now() - start < POLL_TIMEOUT_MS) {
+  while (Date.now() - start < timeoutMs) {
     throwIfAborted(signal)
     const res = await httpFetch(
       `${API_BASE}/extract-results/batch/${batchId}`,
@@ -577,7 +650,9 @@ async function pollBatchTask(
     await waitForPollInterval(signal)
   }
 
-  throw new Error("MinerU parsing timed out after 5 minutes")
+  throw new MineruPollTimeoutError(
+    `MinerU batch polling timed out after ${Math.round(timeoutMs / 60_000)} minutes`,
+  )
 }
 
 async function saveMineruZipImages(
@@ -634,17 +709,13 @@ async function saveMineruZipImages(
   return { pathMap, savedImages }
 }
 
-async function downloadAndExtractMarkdown(
-  zipUrl: string,
+/** Shared MinerU-archive decoding for every transport (cloud URL, local V1
+ *  file store): pick full.md, normalize tables, persist images, rewrite refs. */
+async function extractMineruZipBuffer(
+  buffer: ArrayBuffer,
+  assetOptions: MineruAssetOptions | undefined,
   signal?: AbortSignal,
-  assetOptions?: MineruAssetOptions,
 ): Promise<MineruExtractedMarkdown> {
-  const httpFetch = await getHttpFetch()
-  throwIfAborted(signal)
-  const res = await httpFetch(zipUrl, { signal })
-  if (!res.ok) throw new Error(`MinerU zip download failed: HTTP ${res.status}`)
-
-  const buffer = await res.arrayBuffer()
   const zip = await JSZip.loadAsync(buffer)
 
   // Official MinerU result archives contain full.md. Prefer it; fall
@@ -672,8 +743,8 @@ async function downloadAndExtractMarkdown(
     const { pathMap, savedImages } = await saveMineruZipImages(zip, assetOptions, signal)
     return {
       markdown: pathMap.size > 0
-      ? rewriteMineruMarkdownImages(markdownWithTables, pathMap)
-      : markdownWithTables,
+        ? rewriteMineruMarkdownImages(markdownWithTables, pathMap)
+        : markdownWithTables,
       savedImages,
     }
   } catch (err) {
@@ -686,7 +757,303 @@ async function downloadAndExtractMarkdown(
   }
 }
 
+async function downloadAndExtractMarkdown(
+  zipUrl: string,
+  signal?: AbortSignal,
+  assetOptions?: MineruAssetOptions,
+): Promise<MineruExtractedMarkdown> {
+  const httpFetch = await getHttpFetch()
+  throwIfAborted(signal)
+  const res = await httpFetch(zipUrl, { signal })
+  if (!res.ok) throw new Error(`MinerU zip download failed: HTTP ${res.status}`)
+  return extractMineruZipBuffer(await res.arrayBuffer(), assetOptions, signal)
+}
+
 // ── Local backend ──
+
+/**
+ * Which local service flavor is behind `localEndpoint`:
+ *  - "v1":    official `mineru-kit api-server` (MinerU 4.x, FastAPI, /v1/*)
+ *  - "tasks": the third-party community mineru-api wrapper (POST /tasks)
+ * Probed once per endpoint and cached; a wrong guess only costs one 404.
+ */
+export type LocalMineruProtocol = "v1" | "tasks"
+
+const localProtocolCache = new Map<string, { protocol: LocalMineruProtocol; checkedAt: number }>()
+const LOCAL_PROTOCOL_CACHE_TTL_MS = 5 * 60_000
+
+export async function detectLocalMineruProtocol(
+  config: Pick<MineruConfig, "localEndpoint" | "localToken">,
+  signal?: AbortSignal,
+): Promise<LocalMineruProtocol> {
+  const base = localMineruApiBase(config.localEndpoint)
+  const cached = localProtocolCache.get(base)
+  if (cached && Date.now() - cached.checkedAt < LOCAL_PROTOCOL_CACHE_TTL_MS) {
+    return cached.protocol
+  }
+  const httpFetch = await getHttpFetch()
+  let protocol: LocalMineruProtocol = "tasks"
+  try {
+    const res = await httpFetch(
+      `${base}/v1/health`,
+      localMineruRequestInit(config.localToken, { signal }),
+    )
+    if (res.ok) {
+      const health = await res.json().catch(() => null) as { version?: unknown } | null
+      // Only the official V1 server answers /v1/health with a version payload.
+      if (health && typeof health === "object" && "version" in health) protocol = "v1"
+    }
+  } catch (err) {
+    if (signal?.aborted) throw err
+    // Unreachable endpoint: keep "tasks" so the parse attempt surfaces the
+    // connection error with the user-configured URL in it.
+  }
+  localProtocolCache.set(base, { protocol, checkedAt: Date.now() })
+  return protocol
+}
+
+/** V1 requests follow same-origin redirects (file content may hand out a
+ *  blob URL); the service is the user's own deployment, not a public gateway. */
+function localV1RequestInit(
+  token: string | undefined,
+  init: RequestInit = {},
+): RequestInit {
+  return {
+    ...init,
+    headers: {
+      ...(init.headers as Record<string, string> | undefined),
+      ...localMineruHeaders(token),
+    },
+  }
+}
+
+interface V1FileRef {
+  file_id: string
+  bytes?: number
+}
+
+interface V1UploadInit {
+  id?: string
+  upload_url?: string
+  upload_headers?: Record<string, string>
+  status?: string
+  file?: { id?: string }
+}
+
+type V1JobStatus =
+  | "queued"
+  | "pending"
+  | "running"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "canceled"
+  | string
+
+interface V1JobResponse {
+  job_id?: string
+  status: V1JobStatus
+  files?: Array<{
+    status?: string
+    error?: { message?: string } | null
+    output_files?: {
+      markdown?: V1FileRef | null
+      zip?: V1FileRef | null
+    } | null
+  }>
+  error?: { message?: string } | null
+}
+
+const V1_TERMINAL_STATES = new Set(["completed", "partial", "failed", "canceled"])
+
+/**
+ * Parse a document through the official `mineru-kit api-server` V1 protocol:
+ * uploads (with sha256 dedupe) → parse job → poll → download the self-
+ * contained zip artifact so images land in the same media pipeline as the
+ * cloud backend. Long CPU runs are expected: the polling window scales with
+ * page count (see `localV1PollTimeoutMs`).
+ */
+async function parseWithLocalMineruV1(
+  config: MineruConfig,
+  sourcePath: string,
+  fileName: string,
+  onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
+  assetOptions?: MineruAssetOptions,
+): Promise<MineruExtractedMarkdown> {
+  const httpFetch = await getHttpFetch()
+  const base = localMineruApiBase(config.localEndpoint)
+  const tier = (config.localTier as string) || "standard"
+
+  const healthRes = await httpFetch(
+    `${base}/v1/health`,
+    localV1RequestInit(config.localToken, { signal }),
+  )
+  if (!healthRes.ok) {
+    throw new Error(`Local MinerU (V1) service unavailable: HTTP ${healthRes.status}`)
+  }
+
+  const fileSize = await getFileSize(sourcePath)
+  if (fileSize > MAX_ACCURATE_PARSE_BYTES) {
+    throw new Error("MinerU accurate parsing supports files up to 200 MB")
+  }
+  throwIfAborted(signal)
+  const { base64 } = await readFileAsBase64(sourcePath)
+  const bytes = decodeBase64ToBytes(base64)
+  const contentSha = await sha256OfBytes(bytes)
+
+  // Upload with sha256 dedupe; the display name is capped the same way as
+  // the cloud path so long inquiry-letter filenames cannot break the server.
+  onProgress?.("Uploading to local MinerU (V1)...")
+  const displayName = fileName.length > 120 ? `${contentSha.slice(0, 8)}…${fileName.slice(-100)}` : fileName
+  const initRes = await httpFetch(
+    `${base}/v1/uploads`,
+    localV1RequestInit(config.localToken, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: displayName,
+        bytes: bytes.length,
+        mime_type: "application/pdf",
+        sha256sum: contentSha,
+      }),
+    }),
+  )
+  if (!initRes.ok) {
+    const text = await initRes.text().catch(() => "")
+    throw new Error(`Local MinerU (V1) upload init failed: HTTP ${initRes.status}: ${text}`)
+  }
+  const initiated = await initRes.json() as V1UploadInit
+
+  let fileId: string
+  if (initiated.status === "completed" && initiated.file?.id) {
+    fileId = initiated.file.id
+    onProgress?.("Upload deduplicated (sha256 hit)")
+  } else {
+    if (!initiated.id || !initiated.upload_url) {
+      throw new Error("Local MinerU (V1) did not return an upload URL")
+    }
+    let putUrl = initiated.upload_url
+    if (putUrl.startsWith("/")) putUrl = base + putUrl
+    const putRes = await httpFetch(
+      putUrl,
+      localV1RequestInit(config.localToken, {
+        method: "PUT",
+        signal,
+        headers: initiated.upload_headers ?? {},
+        body: bytesToUploadBody(bytes),
+      }),
+    )
+    if (!putRes.ok) {
+      throw new Error(`Local MinerU (V1) byte upload failed: HTTP ${putRes.status}`)
+    }
+    const completeRes = await httpFetch(
+      `${base}/v1/uploads/${encodeURIComponent(initiated.id)}/complete`,
+      localV1RequestInit(config.localToken, {
+        method: "POST",
+        signal,
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }),
+    )
+    if (!completeRes.ok) {
+      throw new Error(`Local MinerU (V1) upload complete failed: HTTP ${completeRes.status}`)
+    }
+    const completed = await completeRes.json() as V1UploadInit
+    fileId = completed.file?.id ?? ""
+    if (!fileId) throw new Error("Local MinerU (V1) completion returned no file id")
+  }
+
+  // Create the parse job; the zip artifact carries the image assets.
+  const jobCreateRes = await httpFetch(
+    `${base}/v1/parse/jobs`,
+    localV1RequestInit(config.localToken, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        files: [{ source: { type: "file_id", file_id: fileId } }],
+        tier,
+        output_formats: ["markdown", "zip"],
+      }),
+    }),
+  )
+  if (!jobCreateRes.ok) {
+    const text = await jobCreateRes.text().catch(() => "")
+    throw new Error(`Local MinerU (V1) job create failed: HTTP ${jobCreateRes.status}: ${text}`)
+  }
+  const job = await jobCreateRes.json() as V1JobResponse
+  const jobId = job.job_id ?? ""
+  if (!jobId) throw new Error("Local MinerU (V1) returned no job id")
+
+  onProgress?.(`Waiting for local MinerU (V1, tier=${tier})...`)
+  let pageCount: number | null = null
+  try {
+    pageCount = await getPdfPageCount(sourcePath)
+  } catch (err) {
+    if (signal?.aborted) throw err
+  }
+  const timeoutMs = localV1PollTimeoutMs(pageCount)
+  const start = Date.now()
+  let final: V1JobResponse | null = null
+  while (Date.now() - start < timeoutMs) {
+    throwIfAborted(signal)
+    const res = await httpFetch(
+      `${base}/v1/parse/jobs/${encodeURIComponent(jobId)}`,
+      localV1RequestInit(config.localToken, { signal }),
+    )
+    if (!res.ok) {
+      throw new Error(`Local MinerU (V1) job poll failed: HTTP ${res.status}`)
+    }
+    const current = await res.json() as V1JobResponse
+    if (V1_TERMINAL_STATES.has(current.status)) {
+      final = current
+      break
+    }
+    await waitForPollInterval(signal)
+  }
+  if (!final) {
+    throw new MineruPollTimeoutError(
+      `Local MinerU (V1) parsing timed out after ${Math.round(timeoutMs / 60_000)} minutes`,
+    )
+  }
+  if (final.status === "failed" || final.status === "canceled") {
+    const reason =
+      final.error?.message ?? final.files?.[0]?.error?.message ?? final.status
+    throw new Error(`Local MinerU (V1) parsing failed: ${reason}`)
+  }
+  if (final.status === "partial") {
+    console.warn(
+      "[MinerU:local-v1] job finished 'partial' — some pages failed; using the recovered output",
+    )
+  }
+
+  const outputs = final.files?.[0]?.output_files
+  if (!outputs) throw new Error("Local MinerU (V1) job completed without output files")
+  onProgress?.("Downloading parsed result...")
+  if (outputs.zip) {
+    const zipRes = await httpFetch(
+      `${base}/v1/files/${encodeURIComponent(outputs.zip.file_id)}/content`,
+      localV1RequestInit(config.localToken, { signal }),
+    )
+    if (!zipRes.ok) {
+      throw new Error(`Local MinerU (V1) zip download failed: HTTP ${zipRes.status}`)
+    }
+    return extractMineruZipBuffer(await zipRes.arrayBuffer(), assetOptions, signal)
+  }
+  if (outputs.markdown) {
+    const mdRes = await httpFetch(
+      `${base}/v1/files/${encodeURIComponent(outputs.markdown.file_id)}/content`,
+      localV1RequestInit(config.localToken, { signal }),
+    )
+    if (!mdRes.ok) {
+      throw new Error(`Local MinerU (V1) markdown download failed: HTTP ${mdRes.status}`)
+    }
+    return { markdown: convertHtmlTablesToMarkdown(await mdRes.text()), savedImages: [] }
+  }
+  throw new Error("Local MinerU (V1) job completed without markdown/zip output")
+}
 
 const MINERU_3_0_TO_3_2_BACKENDS: Partial<
   Record<NonNullable<MineruConfig["localBackend"]>, string>
@@ -706,11 +1073,11 @@ function localMineruBackendForVersion(
 }
 
 /**
- * Parse a document through the official `mineru-api` asynchronous protocol.
- * Files are submitted as multipart/form-data to `/tasks`; the task status and
- * result contracts mirror MinerU's own API client.
+ * Parse a document through the community third-party `mineru-api` wrapper
+ * (multipart POST /tasks protocol). Kept for existing setups; new official
+ * deployments speak V1 and are routed there by `parseWithLocalMineru`.
  */
-async function parseWithLocalMineru(
+async function parseWithLocalMineruTasks(
   config: MineruConfig,
   sourcePath: string,
   fileName: string,
@@ -868,6 +1235,28 @@ async function parseWithLocalMineru(
 }
 
 /**
+ * Local-backend entry point: probe the configured endpoint once and route to
+ * the matching protocol. Official MinerU 4.x deployments (`mineru-kit
+ * api-server`, including the CPU portable package's `launch.ps1 -Api` mode)
+ * answer /v1/health and get the V1 protocol; anything else falls back to the
+ * community /tasks wrapper.
+ */
+async function parseWithLocalMineru(
+  config: MineruConfig,
+  sourcePath: string,
+  fileName: string,
+  onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
+  assetOptions?: MineruAssetOptions,
+): Promise<MineruExtractedMarkdown> {
+  const protocol = await detectLocalMineruProtocol(config, signal)
+  const parsed = protocol === "v1"
+    ? await parseWithLocalMineruV1(config, sourcePath, fileName, onProgress, signal, assetOptions)
+    : await parseWithLocalMineruTasks(config, sourcePath, fileName, onProgress, signal, assetOptions)
+  return { ...parsed, protocol }
+}
+
+/**
  * Split `total` pages into `page_ranges` strings ("1-200", "201-400", …)
  * accepted by the cloud batch API, so a document above the per-task page
  * limit can be parsed segment by segment instead of being rejected (-60006).
@@ -880,6 +1269,41 @@ export function splitPageRanges(total: number, maxPerPage = MAX_CLOUD_PAGES_PER_
     ranges.push(`${start}-${end}`)
   }
   return ranges
+}
+
+/** Poll a batch task and, if the window elapses while the task is still
+ *  queued/running server-side, extend polling of the SAME batch once. The
+ *  alternative — re-upload — restarts queue position and burns daily quota. */
+async function pollBatchTaskWithExtension(
+  token: string,
+  batchId: string,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  onProgress?: (msg: string) => void,
+): Promise<string> {
+  try {
+    return await pollBatchTask(token, batchId, signal, timeoutMs)
+  } catch (err) {
+    if (!(err instanceof MineruPollTimeoutError)) throw err
+    onProgress?.("MinerU: still queued after the polling window; extending (same task, no re-upload)...")
+    return await pollBatchTask(token, batchId, signal, timeoutMs)
+  }
+}
+
+async function pollTaskWithExtension(
+  token: string,
+  taskId: string,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  onProgress?: (msg: string) => void,
+): Promise<string> {
+  try {
+    return await pollTask(token, taskId, signal, timeoutMs)
+  } catch (err) {
+    if (!(err instanceof MineruPollTimeoutError)) throw err
+    onProgress?.("MinerU: still queued after the polling window; extending (same task)...")
+    return await pollTask(token, taskId, signal, timeoutMs)
+  }
 }
 
 /**
@@ -905,6 +1329,8 @@ async function parseCloudMineruSegmented(
     const range = ranges[i]
     throwIfAborted(signal)
     onProgress?.(`MinerU: segment ${i + 1}/${ranges.length} (pages ${range})...`)
+    const segmentPageCount = Number(range.split("-")[1]) - Number(range.split("-")[0]) + 1
+
     const { batchId } = await uploadFileForTask(
       config.token,
       fileName,
@@ -913,7 +1339,13 @@ async function parseCloudMineruSegmented(
       signal,
       range,
     )
-    const zipUrl = await pollBatchTask(config.token, batchId, signal)
+    const zipUrl = await pollBatchTaskWithExtension(
+      config.token,
+      batchId,
+      signal,
+      cloudPollTimeoutMs(segmentPageCount),
+      onProgress,
+    )
     const segment = await downloadAndExtractMarkdown(zipUrl, signal, assetOptions
       ? { ...assetOptions, assetPathPrefix: `seg-${i + 1}` }
       : undefined)
@@ -1003,7 +1435,13 @@ export async function parseWithMineruResult(
     onProgress?.("Submitting URL to MinerU...")
     const taskId = await submitUrlTask(config.token, sourceUrl, config.modelVersion, signal)
     onProgress?.("Waiting for MinerU to finish...")
-    zipUrl = await pollTask(config.token, taskId, signal)
+    zipUrl = await pollTaskWithExtension(
+      config.token,
+      taskId,
+      signal,
+      cloudPollTimeoutMs(pageCount),
+      onProgress,
+    )
   } else {
     onProgress?.("Uploading file to MinerU...")
     throwIfAborted(signal)
@@ -1025,7 +1463,13 @@ export async function parseWithMineruResult(
       signal,
     )
     onProgress?.("Waiting for MinerU to finish...")
-    zipUrl = await pollBatchTask(config.token, batchId, signal)
+    zipUrl = await pollBatchTaskWithExtension(
+      config.token,
+      batchId,
+      signal,
+      cloudPollTimeoutMs(pageCount),
+      onProgress,
+    )
   }
 
   onProgress?.("Downloading parsed result...")
@@ -1048,8 +1492,20 @@ export async function testMineruConnection(
   const httpFetch = await getHttpFetch()
 
   if (config?.backend === "local") {
+    const base = localMineruApiBase(config.localEndpoint)
+    const protocol = await detectLocalMineruProtocol(config)
+    if (protocol === "v1") {
+      const res = await httpFetch(
+        `${base}/v1/health`,
+        localV1RequestInit(config.localToken),
+      )
+      if (!res.ok) {
+        throw new Error(`Local MinerU (V1) service unavailable: HTTP ${res.status}`)
+      }
+      return
+    }
     const res = await httpFetch(
-      `${localMineruApiBase(config.localEndpoint)}/health`,
+      `${base}/health`,
       localMineruRequestInit(config.localToken),
     )
     if (!res.ok) {
@@ -1083,6 +1539,12 @@ export async function testMineruConnection(
 
 // Test-only hooks for MinerU's browser/Tauri boundary helpers.
 export const __mineruTest = {
+  /** Prime the local-protocol cache so a test can pin the flavor without
+   *  the /v1/health probe consuming a queued mock response. */
+  primeLocalProtocolCache: (endpoint: string, protocol: LocalMineruProtocol) => {
+    localProtocolCache.set(localMineruApiBase(endpoint), { protocol, checkedAt: Date.now() })
+  },
+  clearLocalProtocolCache: () => localProtocolCache.clear(),
   downloadAndExtractMarkdown: async (
     zipUrl: string,
     signal?: AbortSignal,

@@ -23,7 +23,7 @@ vi.mock("@/commands/fs", () => ({
   writeFileBase64: fsMocks.writeFileBase64,
 }))
 
-import { __mineruTest, parseWithMineru, parseWithMineruResult, splitPageRanges, testMineruConnection } from "./mineru"
+import { __mineruTest, classifyMineruFailure, detectLocalMineruProtocol, parseWithMineru, parseWithMineruResult, splitPageRanges, testMineruConnection } from "./mineru"
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), {
@@ -48,6 +48,20 @@ async function zipResponse(files: Record<string, string>): Promise<Response> {
 
 beforeEach(() => {
   mockHttpFetch.mockReset()
+  // Pin the local-protocol cache to the community /tasks flavor for every
+  // endpoint used below, so the /v1/health probe never consumes a queued
+  // mock response. V1-protocol tests re-prime with "v1" explicitly.
+  __mineruTest.clearLocalProtocolCache()
+  __mineruTest.primeLocalProtocolCache("http://127.0.0.1:8000", "tasks")
+  __mineruTest.primeLocalProtocolCache("http://localhost:9000/custom/", "tasks")
+  // Default routing for any endpoint that still probes: unknown URLs fail
+  // loudly; queued mockResolvedValueOnce responses take precedence.
+  mockHttpFetch.mockImplementation(async (url: string) => {
+    if (url.endsWith("/v1/health")) {
+      return new Response("not found", { status: 404 })
+    }
+    throw new Error(`unexpected fetch: ${url}`)
+  })
   fsMocks.createDirectory.mockReset()
   fsMocks.getFileSize.mockReset()
   fsMocks.getPdfPageCount.mockReset()
@@ -884,16 +898,19 @@ describe("cloud page-range segmentation", () => {
   }
 
   it("splitPageRanges splits totals into per-task page windows", () => {
-    expect(splitPageRanges(200)).toEqual(["1-200"])
-    expect(splitPageRanges(201)).toEqual(["1-200", "201-201"])
-    expect(splitPageRanges(402)).toEqual(["1-200", "201-400", "401-402"])
+    // Segments are capped at 100 pages — half the API's 200-page ceiling —
+    // so peak-hour queueing cannot outgrow a segment's polling window.
+    expect(splitPageRanges(100)).toEqual(["1-100"])
+    expect(splitPageRanges(101)).toEqual(["1-100", "101-101"])
+    expect(splitPageRanges(202)).toEqual(["1-100", "101-200", "201-202"])
+    expect(splitPageRanges(402)).toEqual(["1-100", "101-200", "201-300", "301-400", "401-402"])
     expect(splitPageRanges(0)).toEqual([])
     expect(splitPageRanges(-5)).toEqual([])
     expect(Number.isNaN(splitPageRanges(Number.NaN).length)).toBe(false)
   })
 
   it("submits one segmented task per page window and joins the markdown", async () => {
-    fsMocks.getPdfPageCount.mockResolvedValue(402)
+    fsMocks.getPdfPageCount.mockResolvedValue(202)
     mockHttpFetch
       // segment 1: batch submit → upload → poll → zip
       .mockResolvedValueOnce(jsonResponse({
@@ -937,11 +954,11 @@ describe("cloud page-range segmentation", () => {
       .map((call) => JSON.parse(String(call[1]?.body)))
     expect(submitBodies).toHaveLength(3)
     expect(submitBodies.map((body: { files: Array<{ page_ranges?: string }> }) => body.files[0].page_ranges))
-      .toEqual(["1-200", "201-400", "401-402"])
+      .toEqual(["1-100", "101-200", "201-202"])
   })
 
   it("keeps single-task flow with no page_ranges when within the limit", async () => {
-    fsMocks.getPdfPageCount.mockResolvedValue(200)
+    fsMocks.getPdfPageCount.mockResolvedValue(100)
     mockHttpFetch
       .mockResolvedValueOnce(jsonResponse({
         code: 0,
@@ -964,7 +981,7 @@ describe("cloud page-range segmentation", () => {
   })
 
   it("isolates segment images into per-segment media directories", async () => {
-    fsMocks.getPdfPageCount.mockResolvedValue(250)
+    fsMocks.getPdfPageCount.mockResolvedValue(150)
     const zipOne = await zipResponse({
       "full.md": "![img](images/1.jpg)",
       "images/1.jpg": "seg1-bytes",
@@ -1024,5 +1041,165 @@ describe("cloud page-range segmentation", () => {
 
     await expect(parseWithMineru(cloudConfig, "/docs/locked.pdf"))
       .resolves.toBe("# Passthrough")
+  })
+})
+
+describe("cloud data_id cap (-10002 fix)", () => {
+  it("submits a short content-hash data_id and capped display name", async () => {
+    const longName = "6-3 华兴会计师事务所关于上海证券交易所《关于国旅文化投资集团股份有限公司发行股份及支付现金购买资产并募集配套资金暨关联交易申请的审核问询函》回复之核查意见.pdf"
+    mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        msg: "ok",
+        data: { batch_id: "batch-1", file_urls: ["https://upload"] },
+      }))
+      .mockResolvedValueOnce(new Response("", { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({
+        code: 0,
+        msg: "ok",
+        data: { batch_id: "batch-1", extract_result: [{ state: "done", full_zip_url: "https://zip" }] },
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "md" }))
+
+    await expect(parseWithMineru({
+      enabled: true,
+      token: "token",
+      modelVersion: "vlm",
+    }, `/docs/${longName}`)).resolves.toBe("md")
+
+    const submit = mockHttpFetch.mock.calls
+      .filter((call) => String(call[0]).endsWith("/file-urls/batch"))
+      .map((call) => JSON.parse(String(call[1]?.body)))[0]
+    const entry = submit.files[0]
+    expect(entry.data_id).toMatch(/^wiki-[0-9a-f]{24}\.pdf$/)
+    expect(entry.data_id.length).toBeLessThanOrEqual(128)
+    expect(entry.name.length).toBeLessThanOrEqual(120)
+  })
+})
+
+describe("classifyMineruFailure", () => {
+  it("treats credential, quota, and validation rejections as permanent", () => {
+    expect(classifyMineruFailure(new Error("MinerU token is invalid. Check the API token in Settings."))).toBe("permanent")
+    expect(classifyMineruFailure(new Error("MinerU token has expired. Create a new API token and update Settings."))).toBe("permanent")
+    expect(classifyMineruFailure(new Error("MinerU daily parsing quota has been reached."))).toBe("permanent")
+    expect(classifyMineruFailure(new Error("MinerU API error -10002: field \"files.data_id\" cannot exceed 128 characters"))).toBe("permanent")
+    expect(classifyMineruFailure(new Error("MinerU rejected the file because it is larger than 200 MB."))).toBe("permanent")
+    expect(classifyMineruFailure(new Error("MinerU API token not configured"))).toBe("permanent")
+  })
+
+  it("treats timeouts, 5xx, and network errors as transient", () => {
+    expect(classifyMineruFailure(new Error("MinerU parsing timed out after 5 minutes"))).toBe("transient")
+    expect(classifyMineruFailure(new Error("MinerU poll failed: HTTP 502"))).toBe("transient")
+    expect(classifyMineruFailure(new Error("MinerU poll failed: HTTP 429"))).toBe("transient")
+    expect(classifyMineruFailure(new Error("error sending request for url (https://mineru.net/)"))).toBe("transient")
+  })
+})
+
+describe("local V1 protocol (mineru-kit api-server)", () => {
+  const v1Config = {
+    enabled: true,
+    backend: "local" as const,
+    localEndpoint: "http://192.168.0.175:8000",
+    localToken: "",
+    localTier: "standard" as const,
+    token: "",
+    modelVersion: "vlm" as const,
+  }
+
+  it("detects the V1 flavor via /v1/health", async () => {
+    __mineruTest.clearLocalProtocolCache()
+    mockHttpFetch.mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.11" }))
+    await expect(detectLocalMineruProtocol(v1Config)).resolves.toBe("v1")
+    expect(String(mockHttpFetch.mock.calls[0]?.[0])).toBe("http://192.168.0.175:8000/v1/health")
+  })
+
+  it("falls back to the tasks flavor when /v1/health is absent", async () => {
+    __mineruTest.clearLocalProtocolCache()
+    mockHttpFetch.mockResolvedValueOnce(new Response("not found", { status: 404 }))
+    await expect(detectLocalMineruProtocol(v1Config)).resolves.toBe("tasks")
+  })
+
+  it("uploads, polls, and downloads the self-contained zip artifact", async () => {
+    __mineruTest.primeLocalProtocolCache(v1Config.localEndpoint, "v1")
+    mockHttpFetch
+      // health probe
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.11" }))
+      // upload init → full upload flow
+      .mockResolvedValueOnce(jsonResponse({
+        id: "upload-1",
+        upload_url: "/v1/uploads/upload-1/content",
+        upload_headers: {},
+        status: "pending",
+      }))
+      .mockResolvedValueOnce(new Response("", { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "completed", file: { id: "file-9" } }))
+      // job create
+      .mockResolvedValueOnce(jsonResponse({ job_id: "job-1", status: "queued" }))
+      // first poll: running; second poll: completed with zip + markdown refs
+      .mockResolvedValueOnce(jsonResponse({ job_id: "job-1", status: "running" }))
+      .mockResolvedValueOnce(jsonResponse({
+        job_id: "job-1",
+        status: "completed",
+        files: [{
+          status: "completed",
+          output_files: {
+            markdown: { file_id: "md-file" },
+            zip: { file_id: "zip-file" },
+          },
+        }],
+      }))
+      // zip download
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "# V1 result", "images/1.jpg": "bytes" }))
+
+    const result = await parseWithMineruResult(v1Config, "/docs/scan.pdf", undefined, undefined, undefined, {
+      projectPath: "/proj",
+      sourceSummarySlug: "slug",
+    })
+
+    expect(result.markdown).toContain("# V1 result")
+    expect(result.savedImages).toHaveLength(1)
+    expect(result.protocol).toBe("v1")
+
+    const jobCreate = mockHttpFetch.mock.calls
+      .filter((call) => String(call[0]).endsWith("/v1/parse/jobs"))
+      .map((call) => JSON.parse(String(call[1]?.body)))[0]
+    expect(jobCreate.tier).toBe("standard")
+    expect(jobCreate.output_formats).toContain("zip")
+    expect(jobCreate.files[0].source).toEqual({ type: "file_id", file_id: "file-9" })
+  })
+
+  it("honors the sha256 dedupe hit without uploading bytes", async () => {
+    __mineruTest.primeLocalProtocolCache(v1Config.localEndpoint, "v1")
+    mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.11" }))
+      .mockResolvedValueOnce(jsonResponse({ status: "completed", file: { id: "file-dedup" } }))
+      .mockResolvedValueOnce(jsonResponse({ job_id: "job-2", status: "queued" }))
+      .mockResolvedValueOnce(jsonResponse({
+        job_id: "job-2",
+        status: "completed",
+        files: [{ status: "completed", output_files: { markdown: { file_id: "md-only" } } }],
+      }))
+      .mockResolvedValueOnce(new Response("# Markdown only", { headers: { "Content-Type": "text/markdown" } }))
+
+    const result = await parseWithMineruResult(v1Config, "/docs/small.pdf")
+    expect(result.markdown).toBe("# Markdown only")
+    // no PUT byte upload happened: only 5 requests (health, init, job, poll, download)
+    expect(mockHttpFetch.mock.calls.filter((call) => call[1]?.method === "PUT")).toHaveLength(0)
+  })
+
+  it("surfaces job failures with the server message", async () => {
+    __mineruTest.primeLocalProtocolCache(v1Config.localEndpoint, "v1")
+    mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.11" }))
+      .mockResolvedValueOnce(jsonResponse({ status: "completed", file: { id: "f" } }))
+      .mockResolvedValueOnce(jsonResponse({ job_id: "job-3", status: "queued" }))
+      .mockResolvedValueOnce(jsonResponse({
+        job_id: "job-3",
+        status: "failed",
+        error: { message: "model load failed" },
+      }))
+
+    await expect(parseWithMineru(v1Config, "/docs/bad.pdf"))
+      .rejects.toThrow("Local MinerU (V1) parsing failed: model load failed")
   })
 })

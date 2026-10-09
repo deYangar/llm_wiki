@@ -288,9 +288,11 @@ describe("long-source ingest planning", () => {
     expect(computeIngestGenerationMaxTokens(256_000)).toBe(24_576)
     expect(computeIngestGenerationMaxTokens(1_000_000)).toBe(32_768)
     expect(computeIngestAnalysisMaxTokens(64_000)).toBe(4_096)
-    expect(computeIngestAnalysisMaxTokens(128_000)).toBe(4_800)
-    expect(computeIngestAnalysisMaxTokens(256_000)).toBe(8_192)
-    expect(computeIngestAnalysisMaxTokens(1_000_000)).toBe(8_192)
+    // CJK analyses need ~2.5 chars/token, not the English 4 — see
+    // INGEST_ANALYSIS_CHARS_PER_OUTPUT_TOKEN.
+    expect(computeIngestAnalysisMaxTokens(128_000)).toBe(7_680)
+    expect(computeIngestAnalysisMaxTokens(256_000)).toBe(15_360)
+    expect(computeIngestAnalysisMaxTokens(1_000_000)).toBe(16_384)
     expect(computeIngestReviewMaxTokens(1_000_000)).toBe(8_192)
   })
 

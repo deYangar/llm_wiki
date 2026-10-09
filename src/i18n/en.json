@@ -4,11 +4,24 @@
     "subtitle": "Build and maintain your personal knowledge base with LLMs"
   },
   "common": {
-    "retry": "Retry", "cancel": "Cancel", "ignore": "Ignore", "close": "Close", "ok": "OK", "confirm": "Confirm", "notice": "Notice",
-    "dismiss": "Dismiss", "loading": "Loading...", "optional": "optional"
+    "retry": "Retry",
+    "cancel": "Cancel",
+    "ignore": "Ignore",
+    "close": "Close",
+    "ok": "OK",
+    "confirm": "Confirm",
+    "notice": "Notice",
+    "dismiss": "Dismiss",
+    "loading": "Loading...",
+    "optional": "optional"
   },
-  "layout": { "showSidebar": "Show sidebar", "hideSidebar": "Hide sidebar" },
-  "errors": { "generic": "Something went wrong" },
+  "layout": {
+    "showSidebar": "Show sidebar",
+    "hideSidebar": "Hide sidebar"
+  },
+  "errors": {
+    "generic": "Something went wrong"
+  },
   "mermaid": {
     "renderFailed": "Mermaid diagram could not be rendered",
     "showDetails": "Show parser details",
@@ -49,10 +62,16 @@
     "allSources": "All sources",
     "noWikiPages": "No wiki pages yet. Import sources to get started.",
     "typeLabels": {
-      "overview": "Overview", "entity": "Entities", "concept": "Concepts",
-      "source": "Sources", "synthesis": "Synthesis", "finding": "Findings",
-      "thesis": "Theses", "methodology": "Methodologies",
-      "comparison": "Comparisons", "query": "Queries"
+      "overview": "Overview",
+      "entity": "Entities",
+      "concept": "Concepts",
+      "source": "Sources",
+      "synthesis": "Synthesis",
+      "finding": "Findings",
+      "thesis": "Theses",
+      "methodology": "Methodologies",
+      "comparison": "Comparisons",
+      "query": "Queries"
     }
   },
   "editor": {
@@ -94,7 +113,10 @@
       "createFailed": "The missing page could not be created.",
       "emptyDraftError": "The model returned an empty draft."
     },
-    "frontmatter": { "origin": "Origin", "more": "More" },
+    "frontmatter": {
+      "origin": "Origin",
+      "more": "More"
+    },
     "rawMarkdownEditor": "Raw Markdown editor"
   },
   "research": {
@@ -533,7 +555,7 @@
           "activeDefault": "Use active model",
           "hint": "Choose separate models for interactive chat and document ingest. The active model remains the fallback."
         },
-      "projectOverride": {
+        "projectOverride": {
           "enabled": "Use a project-specific model",
           "provider": "Project provider",
           "selectProvider": "Select a provider",
@@ -619,7 +641,6 @@
           "max": "Max",
           "custom": "Custom",
           "budgetTokens": "thinking budget tokens",
-
           "hint": "Controls reasoning for chat. Document ingest uses the separate setting below.",
           "ingestTitle": "Reasoning during ingest",
           "ingestHint": "Off is usually right: ingest asks for structured output and thinking costs time without helping. Raise it only if the model refuses to run with reasoning disabled."
@@ -1003,6 +1024,11 @@
         "backendHybridHttp": "Hybrid HTTP client",
         "backendVlmHttp": "VLM HTTP client",
         "effort": "Hybrid effort",
+        "v1Tier": "V1 api-server tier",
+        "v1TierHint": "Only used when the endpoint speaks the official V1 protocol (mineru-kit api-server).",
+        "tierFlash": "Flash (fastest)",
+        "tierBasic": "Basic",
+        "tierStandard": "Standard (recommended)",
         "effortMedium": "Medium (Faster)",
         "effortHigh": "High (Image analysis and maximum accuracy)",
         "ocrLanguage": "OCR language",
@@ -1079,12 +1105,25 @@
     "fileSync": "File Sync",
     "rescan": "Rescan",
     "rescanTitle": "Scan project files for external changes",
-    "changeKinds": { "created": "Created", "modified": "Modified", "deleted": "Deleted" },
+    "changeKinds": {
+      "created": "Created",
+      "modified": "Modified",
+      "deleted": "Deleted"
+    },
     "fileTypes": {
-      "entity": "Entity", "concept": "Concept", "source": "Source", "query": "Query",
-      "synthesis": "Synthesis", "comparison": "Comparison", "finding": "Finding",
-      "thesis": "Thesis", "methodology": "Methodology", "overview": "Overview",
-      "index": "Index", "log": "Log", "file": "File"
+      "entity": "Entity",
+      "concept": "Concept",
+      "source": "Source",
+      "query": "Query",
+      "synthesis": "Synthesis",
+      "comparison": "Comparison",
+      "finding": "Finding",
+      "thesis": "Thesis",
+      "methodology": "Methodology",
+      "overview": "Overview",
+      "index": "Index",
+      "log": "Log",
+      "file": "File"
     }
   },
   "fileTree": {

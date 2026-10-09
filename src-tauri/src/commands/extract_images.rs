@@ -96,6 +96,13 @@ pub struct ExtractedImage {
     /// `data_base64` decodes to). Used by the Phase 3 caption cache
     /// to dedupe identical images across files.
     pub sha256: String,
+    /// What this image is: "page-scan" for a full-page image on a page with
+    /// no meaningful text layer (a scanned page — the image IS the page, not
+    /// content), "embedded" for everything else (charts, photos, logos).
+    /// The frontend keeps page scans out of per-image wiki sections; they
+    /// only exist so a degraded (non-MinerU) ingest of a scanned PDF still
+    /// has pixels for the vision pipeline to read.
+    pub kind: String,
 }
 
 fn is_full_page_image_bounds(
@@ -372,10 +379,12 @@ pub fn extract_pdf_images(
                 Some(img) => img,
                 None => continue,
             };
+            // Computed even when full-page skipping is off: the page-scan
+            // kind tag below needs it.
+            let has_meaningful_text = *page_has_meaningful_text.get_or_insert_with(|| {
+                pdf_page_has_meaningful_text(&page, options.full_page_min_text_chars)
+            });
             let should_skip = if options.skip_full_page_images {
-                let has_meaningful_text = *page_has_meaningful_text.get_or_insert_with(|| {
-                    pdf_page_has_meaningful_text(&page, options.full_page_min_text_chars)
-                });
                 should_skip_full_page_pdf_image(
                     &object,
                     page.width().value,
@@ -429,6 +438,20 @@ pub fn extract_pdf_images(
             idx += 1;
             let data_base64 = B64.encode(&png_bytes);
             let sha256 = sha256_hex(&png_bytes);
+            // A full-page image on a textless page is a scanned page, not
+            // content: tag it so the frontend can group page scans apart
+            // from meaningful embedded figures.
+            let kind = if is_full_page_pdf_image_object(
+                &object,
+                page.width().value,
+                page.height().value,
+                options.full_page_coverage_ratio,
+            ) && !has_meaningful_text
+            {
+                "page-scan"
+            } else {
+                "embedded"
+            };
 
             out.push(ExtractedImage {
                 index: idx,
@@ -438,6 +461,7 @@ pub fn extract_pdf_images(
                 height,
                 data_base64,
                 sha256,
+                kind: kind.to_string(),
             });
 
             if out.len() >= options.max_images {
@@ -555,6 +579,7 @@ pub fn extract_office_images(
             height,
             data_base64,
             sha256,
+            kind: "embedded".to_string(),
         });
 
         if out.len() >= options.max_images {
