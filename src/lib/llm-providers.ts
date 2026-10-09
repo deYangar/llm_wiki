@@ -7,11 +7,15 @@ import {
 } from "@/lib/azure-openai"
 import {
   isAdaptiveAnthropicModel,
+  isArkEndpoint,
   isBigModelEndpoint,
   isGeminiThinkingLevelModel,
+  isGpt51OrLater,
+  isMiniMaxAnthropicEndpoint,
   isOpenRouterEndpoint,
   isLocalInferenceEndpoint,
   normalizeReasoningForProvider,
+  supportsMiniMaxThinkingOff,
 } from "@/lib/reasoning-capabilities"
 
 /**
@@ -354,6 +358,72 @@ function isDeepSeekEndpoint(config: LlmConfig): boolean {
   return /api\.deepseek\.(?:com|cn)(?:[:/]|$)/i.test(config.customEndpoint)
 }
 
+function isAnthropicOfficialHost(endpoint: string): boolean {
+  try {
+    return new URL(endpoint).hostname.toLowerCase() === "api.anthropic.com"
+  } catch {
+    return false
+  }
+}
+
+/**
+ * On the Anthropic Messages wire, "off" means `thinking` omitted —
+ * except on third-party gateways that follow the DeepSeek/GLM
+ * convention of `thinking: {"type": "disabled"}`. Anthropic itself
+ * validates `thinking.type` against {enabled, adaptive} and answers
+ * 400 for "disabled", while MiniMax M3 honors it (M2.x/M3.1-Flash
+ * never get the off toggle — see reasoning-capabilities).
+ */
+function anthropicWireOffDisablesThinking(config: LlmConfig): boolean {
+  if (config.provider === "anthropic") return false
+  if (config.provider === "minimax") return supportsMiniMaxThinkingOff(config.model)
+  if (config.provider === "custom" && (config.apiMode ?? "chat_completions") === "anthropic_messages") {
+    if (isAnthropicOfficialHost(config.customEndpoint)) return false
+    if (isMiniMaxAnthropicEndpoint(config.customEndpoint)) {
+      return supportsMiniMaxThinkingOff(config.model)
+    }
+    // Volcengine Ark Coding Plan (/api/coding) follows the same
+    // thinking.type switch as its OpenAI wire. glm-5-3-flash never
+    // reaches here — it gets no off toggle in capabilities.
+    if (isArkEndpoint(config.customEndpoint)) return true
+    return true
+  }
+  return false
+}
+
+/**
+ * Translate "off" onto an unrecognized custom OpenAI-compatible
+ * gateway. No single field covers the ecosystem, so send the two
+ * de-facto standards together — `thinking: {"type": "disabled"}`
+ * (DeepSeek/GLM/Kimi/MiMo/Doubao) and `enable_thinking: false`
+ * (Qwen/DashScope/SiliconFlow) — plus, on LAN endpoints where the
+ * user runs their own inference engine, `chat_template_kwargs` +
+ * `reasoning_effort:"none"` (llama.cpp/vLLM/SGLang and Ollama).
+ * Servers that don't know a field ignore it (standard OpenAI-compat
+ * behavior). First-party OpenAI/Azure/Google endpoints are the
+ * documented exceptions: they reject unknown fields with 400, so for
+ * them "off" stays a no-op unless the model is GPT-5.1+ where
+ * `reasoning_effort: "none"` is the official no-reasoning mode.
+ */
+function applyGenericThinkingDisable(config: LlmConfig, body: Record<string, unknown>): void {
+  const endpoint = config.customEndpoint
+  const strictHost =
+    isAzureOpenAiEndpoint(endpoint)
+    || /api\.openai\.com(?::|\/|$)/i.test(endpoint)
+    || /generativelanguage\.googleapis\.com(?::|\/|$)/i.test(endpoint)
+    || /aistudio\.googleapis\.com(?::|\/|$)/i.test(endpoint)
+  if (strictHost) {
+    if (isGpt51OrLater(config.model)) body.reasoning_effort = "none"
+    return
+  }
+  body.thinking = { type: "disabled" }
+  body.enable_thinking = false
+  if (isLocalOrPrivateHttpEndpoint(endpoint)) {
+    body.chat_template_kwargs = { enable_thinking: false }
+    body.reasoning_effort = "none"
+  }
+}
+
 function supportsDeepSeekThinkingParam(config: LlmConfig): boolean {
   return /deepseek[-_]?v4/i.test(config.model)
 }
@@ -521,6 +591,17 @@ function buildOpenAiCompatibleBody(
     return body
   }
 
+  if (config.provider === "custom" && isArkEndpoint(config.customEndpoint)) {
+    // Volcengine Ark (incl. Coding Plan): thinking.type=enabled is the
+    // documented DEFAULT for Doubao/DeepSeek/GLM thinking models, so
+    // "off" maps to the documented disabled value. glm-5-3-flash on Ark
+    // always thinks and never gets the off toggle.
+    if (reasoning.mode === "off") {
+      body.thinking = { type: "disabled" }
+    }
+    return body
+  }
+
   if (config.provider === "ollama") {
     // Ollama's OpenAI-compatible /v1/chat/completions maps reasoning
     // control onto `reasoning_effort` ("high"|"medium"|"low"|"none";
@@ -549,8 +630,20 @@ function buildOpenAiCompatibleBody(
     return body
   }
 
-  if (config.provider === "openai" && reasoning.mode !== "auto" && reasoning.mode !== "off") {
-    if (reasoning.mode === "low" || reasoning.mode === "medium" || reasoning.mode === "high") {
+  if (config.provider === "custom") {
+    // Generic gateway fallback (no known endpoint matched above).
+    if (reasoning.mode === "off") applyGenericThinkingDisable(config, body)
+    return body
+  }
+
+  if (config.provider === "openai" || config.provider === "azure") {
+    if (reasoning.mode === "off") {
+      // GPT-5.1+ accepts the official no-reasoning effort "none";
+      // earlier reasoning models (gpt-5, o-series) answer 400 for it
+      // and never get the off toggle, and non-reasoning models never
+      // think, so off legitimately sends nothing there.
+      if (isGpt51OrLater(config.model)) body.reasoning_effort = "none"
+    } else if (reasoning.mode === "low" || reasoning.mode === "medium" || reasoning.mode === "high") {
       body.reasoning_effort = reasoning.mode
     }
   }
@@ -654,7 +747,16 @@ function buildAnthropicBodyWithReasoning(
 ): Record<string, unknown> {
   const body = buildAnthropicBody(messages, overrides, streaming)
   const reasoning = effectiveReasoning(config, overrides)
-  if (reasoning.mode === "auto" || reasoning.mode === "off") return body
+  if (reasoning.mode === "auto") return body
+  if (reasoning.mode === "off") {
+    // On Anthropic's own wire, omitting `thinking` IS off. Third-party
+    // Messages gateways (MiniMax M3, Kimi, Doubao, ...) think by
+    // default and follow the DeepSeek disabled switch instead.
+    if (anthropicWireOffDisablesThinking(config)) {
+      body.thinking = { type: "disabled" }
+    }
+    return body
+  }
 
   if (isAdaptiveAnthropicModel(config)) {
     body.thinking = { type: "adaptive" }
@@ -716,6 +818,9 @@ function requiresBearerAuth(url: string): boolean {
     // on its /apps/anthropic gateway; behavior matches the other
     // Chinese Anthropic-wire proxies above.
     normalized.startsWith("https://coding.dashscope.aliyuncs.com/apps/anthropic") ||
+    // Volcengine Ark Coding Plan — documented Claude Code setup uses
+    // ANTHROPIC_AUTH_TOKEN (Bearer), same as the other coding plans.
+    /ark\.[a-z0-9-]+\.volces\.com\/api\/coding(?:\/|$)/i.test(normalized) ||
     // Xiaomi MiMo Token Plan Anthropic gateway authenticates with
     // Authorization Bearer, matching its OpenAI-compatible gateway.
     /(^https:\/\/|^)token-plan-cn\.xiaomimimo\.com\/anthropic(?:\/|$)/i.test(normalized) ||

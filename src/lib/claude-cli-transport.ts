@@ -15,6 +15,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import type { ChatMessage, RequestOverrides } from "./llm-providers"
+import { normalizeReasoningForProvider } from "./reasoning-capabilities"
 import type { StreamCallbacks } from "./llm-client"
 
 /**
@@ -177,6 +178,7 @@ type SpawnPayload = Record<string, unknown> & {
   model: string
   messages: ChatMessage[]
   isolateLocalConfig: boolean
+  disableThinking: boolean
   workingDirectory: string
 }
 
@@ -324,6 +326,12 @@ export async function streamClaudeCodeCli(
       model: config.model,
       messages,
       isolateLocalConfig: config.localCliIsolation === true,
+      // Reasoning "off" maps to MAX_THINKING_TOKENS=0 in the Rust
+      // spawner; other levels have no CLI equivalent.
+      disableThinking: normalizeReasoningForProvider(
+        config,
+        overrides?.reasoning ?? config.reasoning ?? { mode: "auto" },
+      ).mode === "off",
       workingDirectory,
     }
     await invoke("claude_cli_spawn", payload)

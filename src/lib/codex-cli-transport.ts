@@ -11,6 +11,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import type { ChatMessage, ContentBlock, RequestOverrides } from "./llm-providers"
+import { normalizeReasoningForProvider } from "./reasoning-capabilities"
 import type { StreamCallbacks } from "./llm-client"
 
 export function parseCodexCliLine(rawLine: string): string | null {
@@ -63,6 +64,7 @@ type SpawnPayload = Record<string, unknown> & {
   model: string
   prompt: string
   isolateLocalConfig: boolean
+  disableThinking: boolean
   timeoutMinutes?: number
   workingDirectory?: string
 }
@@ -84,6 +86,15 @@ export async function streamCodexCli(
       }
     }
   }
+
+  // The reasoning "off" toggle translates into the spawn args
+  // (model_reasoning_effort="none"); any other level has no codex
+  // equivalent, so only "off" changes the command line.
+  const reasoning = normalizeReasoningForProvider(
+    config,
+    overrides?.reasoning ?? config.reasoning ?? { mode: "auto" },
+  )
+  const disableThinking = reasoning.mode === "off"
 
   const streamId = crypto.randomUUID()
   let unlistenData: UnlistenFn | undefined
@@ -206,6 +217,7 @@ export async function streamCodexCli(
       model: config.model,
       prompt: buildPrompt(messages),
       isolateLocalConfig: config.localCliIsolation === true,
+      disableThinking,
       timeoutMinutes: config.codexCliTimeoutMinutes,
       workingDirectory,
     }

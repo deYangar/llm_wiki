@@ -14,10 +14,57 @@ function config(provider: LlmConfig["provider"], model: string): LlmConfig {
 }
 
 describe("reasoning capabilities", () => {
-  it("does not infer vendor-private controls from a custom gateway model name", () => {
+  it("offers the off toggle on generic custom gateways without inferring vendor-private knobs", () => {
     const cfg = config("custom", "Qwen3-thinking-only")
-    expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto"])
-    expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "auto" })
+    expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
+    expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
+    // Only generic disable fields go on the wire — the llama.cpp-private
+    // chat_template_kwargs stays reserved for local endpoints.
+    expect(resolveReasoningCapabilities(cfg).modes).not.toContain("low")
+  })
+
+  it("offers the off toggle on CLI providers (claude-code / codex-cli)", () => {
+    for (const provider of ["claude-code", "codex-cli"] as const) {
+      const cfg = config(provider, "claude-sonnet-4-6")
+      expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
+      expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
+    }
+  })
+
+  it("offers off only where MiniMax can actually disable thinking", () => {
+    expect(resolveReasoningCapabilities(config("minimax", "MiniMax-M3")).modes)
+      .toEqual(["auto", "off"])
+    // M2.x accepts the flag but keeps thinking on; M3.1-Flash 400s on it.
+    expect(resolveReasoningCapabilities(config("minimax", "MiniMax-M2.7")).modes)
+      .toEqual(["auto"])
+    expect(resolveReasoningCapabilities(config("minimax", "MiniMax-M3.1-Flash-Preview")).modes)
+      .toEqual(["auto"])
+  })
+
+  it("gates MiniMax custom-endpoint toggles by the same model rules", () => {
+    const base = { ...config("custom", "MiniMax-M3"), customEndpoint: "https://api.minimax.io/anthropic" }
+    expect(resolveReasoningCapabilities(base).modes).toEqual(["auto", "off"])
+    const m2 = { ...base, model: "MiniMax-M2.7" }
+    expect(resolveReasoningCapabilities(m2).modes).toEqual(["auto"])
+  })
+
+  it("offers the off toggle on Volcengine Ark endpoints except always-thinking GLM flash", () => {
+    const doubao = {
+      ...config("custom", "doubao-seed-2-1-pro-260915"),
+      customEndpoint: "https://ark.cn-beijing.volces.com/api/v3",
+    }
+    expect(resolveReasoningCapabilities(doubao).modes).toEqual(["auto", "off"])
+    const coding = {
+      ...doubao,
+      customEndpoint: "https://ark.cn-beijing.volces.com/api/coding",
+    }
+    expect(resolveReasoningCapabilities(coding).modes).toEqual(["auto", "off"])
+    // Ark's glm-5-3-flash "始终启用思考,不再支持禁用"
+    const glmFlash = {
+      ...doubao,
+      model: "glm-5-3-flash-260828",
+    }
+    expect(resolveReasoningCapabilities(glmFlash).modes).toEqual(["auto"])
   })
 
   it("offers OpenRouter's documented reasoning controls only on its endpoint", () => {
@@ -62,10 +109,20 @@ describe("reasoning capabilities", () => {
       .not.toContain("custom")
   })
 
-  it("limits OpenAI reasoning models to representable effort levels", () => {
-    expect(resolveReasoningCapabilities(config("openai", "gpt-5.4")).modes)
+  it("offers the off toggle on every OpenAI model, and effort levels only on reasoning models", () => {
+    // Non-reasoning models never think; off is a legitimate no-op that
+    // keeps saved/ingest "off" settings from being normalized away.
+    expect(resolveReasoningCapabilities(config("openai", "gpt-4o")).modes)
+      .toEqual(["auto", "off"])
+    // GPT-5.1+ accepts the official reasoning_effort "none".
+    expect(resolveReasoningCapabilities(config("openai", "gpt-5.1")).modes)
+      .toEqual(["auto", "off", "low", "medium", "high"])
+    // Pre-5.1 reasoning models (gpt-5, o-series) reject "none" with 400.
+    expect(resolveReasoningCapabilities(config("openai", "gpt-5")).modes)
       .toEqual(["auto", "low", "medium", "high"])
-    expect(normalizeReasoningForProvider(config("openai", "gpt-5.4"), { mode: "max" }))
+    expect(resolveReasoningCapabilities(config("openai", "o4")).modes)
+      .toEqual(["auto", "low", "medium", "high"])
+    expect(normalizeReasoningForProvider(config("openai", "gpt-5"), { mode: "max" }))
       .toEqual({ mode: "auto" })
   })
 

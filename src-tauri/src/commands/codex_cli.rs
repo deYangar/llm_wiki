@@ -141,6 +141,7 @@ pub async fn codex_cli_spawn(
     model: String,
     prompt: String,
     isolate_local_config: bool,
+    disable_thinking: Option<bool>,
     timeout_minutes: Option<u64>,
     working_directory: Option<String>,
 ) -> Result<(), String> {
@@ -157,7 +158,11 @@ pub async fn codex_cli_spawn(
     if let Some(path_env) = child_path_env().await {
         cmd.env("PATH", path_env);
     }
-    cmd.args(build_codex_cli_args(&model, isolate_local_config));
+    cmd.args(build_codex_cli_args(
+        &model,
+        isolate_local_config,
+        disable_thinking.unwrap_or(false),
+    ));
     cmd.current_dir(&working_directory);
 
     cmd.stdin(Stdio::piped())
@@ -296,7 +301,7 @@ fn codex_spawn_timeout_minutes(value: Option<u64>) -> u64 {
     )
 }
 
-fn build_codex_cli_args(model: &str, isolate_local_config: bool) -> Vec<String> {
+fn build_codex_cli_args(model: &str, isolate_local_config: bool, disable_thinking: bool) -> Vec<String> {
     let mut args = vec!["-a".to_string(), "never".to_string(), "exec".to_string()];
 
     if isolate_local_config {
@@ -304,6 +309,15 @@ fn build_codex_cli_args(model: &str, isolate_local_config: bool) -> Vec<String> 
             "--ignore-user-config".to_string(),
             "--ignore-rules".to_string(),
         ]);
+    }
+
+    if disable_thinking {
+        // GPT-5.1-era "no reasoning" mode. `ReasoningEffort` in codex-rs
+        // accepts `none` (protocol/src/openai_models.rs); models that
+        // predate it (gpt-5, o-series) are never offered the off toggle
+        // by the frontend, so they never spawn with this override.
+        args.push("-c".to_string());
+        args.push("model_reasoning_effort=\"none\"".to_string());
     }
 
     args.extend([
@@ -414,7 +428,7 @@ mod tests {
 
     #[test]
     fn codex_args_do_not_isolate_local_config_by_default() {
-        let args = build_codex_cli_args("gpt-5", false);
+        let args = build_codex_cli_args("gpt-5", false, false);
 
         assert!(args
             .windows(3)
@@ -423,11 +437,12 @@ mod tests {
         assert!(args.contains(&"gpt-5".to_string()));
         assert!(!args.contains(&"--ignore-user-config".to_string()));
         assert!(!args.contains(&"--ignore-rules".to_string()));
+        assert!(!args.contains(&"-c".to_string()));
     }
 
     #[test]
     fn codex_args_can_isolate_user_config_and_rules() {
-        let args = build_codex_cli_args("gpt-5", true);
+        let args = build_codex_cli_args("gpt-5", true, false);
         let exec_pos = args.iter().position(|arg| arg == "exec").expect("exec arg");
         let ignore_config_pos = args
             .iter()
@@ -440,6 +455,24 @@ mod tests {
 
         assert!(ignore_config_pos > exec_pos);
         assert!(ignore_rules_pos > exec_pos);
+    }
+
+    #[test]
+    fn codex_args_disable_thinking_maps_to_reasoning_effort_none() {
+        let args = build_codex_cli_args("gpt-5.1", false, true);
+        let c_pos = args
+            .iter()
+            .position(|arg| arg == "-c")
+            .expect("-c override arg");
+        assert_eq!(args[c_pos + 1], "model_reasoning_effort=\"none\"");
+
+        // The override must precede the prompt positional ("-") so the
+        // CLI still parses it as a flag, not as prompt text.
+        let dash_pos = args
+            .iter()
+            .position(|arg| arg == "-")
+            .expect("prompt positional arg");
+        assert!(c_pos < dash_pos);
     }
 
     struct TestDir(PathBuf);

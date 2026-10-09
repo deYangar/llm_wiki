@@ -744,11 +744,31 @@ describe("reasoning controls", () => {
     expect(body.messages).toEqual([{ role: "user", content: "Hi" }])
   })
 
-  it("does not infer Qwen private parameters on generic cloud custom endpoints", () => {
+  it("sends generic disable fields (not llama.cpp-private ones) on cloud custom gateways", () => {
     const cfg = mkConfig({
       provider: "custom",
       model: "Qwen3.5-122B",
       customEndpoint: "https://gateway.example/v1",
+      apiMode: "chat_completions",
+    })
+    const build = (overrides?: Parameters<ReturnType<typeof getProviderConfig>["buildBody"]>[1]) =>
+      getProviderConfig(cfg).buildBody([{ role: "user", content: "hi" }], overrides) as Record<string, unknown>
+
+    const off = build({ reasoning: { mode: "off" } })
+    expect(off.thinking).toEqual({ type: "disabled" })
+    expect(off.enable_thinking).toBe(false)
+    expect(off.chat_template_kwargs).toBeUndefined()
+    // auto keeps the model's own default; nothing is guessed on the wire
+    const auto = build({ reasoning: { mode: "auto" } })
+    expect(auto.thinking).toBeUndefined()
+    expect(auto.enable_thinking).toBeUndefined()
+  })
+
+  it("keeps off a no-op on strict first-party endpoints reached via custom, except GPT-5.1+", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "Qwen3.5-122B",
+      customEndpoint: "https://api.openai.com/v1",
       apiMode: "chat_completions",
     })
     const body = getProviderConfig(cfg).buildBody(
@@ -756,7 +776,137 @@ describe("reasoning controls", () => {
       { reasoning: { mode: "off" } },
     ) as Record<string, unknown>
 
-    expect(body.chat_template_kwargs).toBeUndefined()
+    expect(body.thinking).toBeUndefined()
+    expect(body.enable_thinking).toBeUndefined()
+    expect(body.reasoning_effort).toBeUndefined()
+
+    const gpt51 = mkConfig({
+      provider: "custom",
+      model: "gpt-5.1",
+      customEndpoint: "https://api.openai.com/v1",
+      apiMode: "chat_completions",
+    })
+    const gpt51Body = getProviderConfig(gpt51).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+    expect(gpt51Body.reasoning_effort).toBe("none")
+  })
+
+  it("adds engine-level disable fields for LAN custom endpoints", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "Qwen3.8-27B",
+      customEndpoint: "http://192.168.31.100:8000/v1",
+      apiMode: "chat_completions",
+    })
+    const body = getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+
+    expect(body.thinking).toEqual({ type: "disabled" })
+    expect(body.enable_thinking).toBe(false)
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false })
+    expect(body.reasoning_effort).toBe("none")
+  })
+
+  it("maps reasoning off to Volcengine Ark thinking.type=disabled on both wires", () => {
+    const chatCfg = mkConfig({
+      provider: "custom",
+      model: "doubao-seed-2-1-pro-260915",
+      customEndpoint: "https://ark.cn-beijing.volces.com/api/v3",
+      apiMode: "chat_completions",
+    })
+    const chatBody = getProviderConfig(chatCfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+    expect(chatBody.thinking).toEqual({ type: "disabled" })
+    expect(chatBody.enable_thinking).toBeUndefined()
+
+    const anthropicCfg = mkConfig({
+      provider: "custom",
+      model: "doubao-seed-2-1-pro-260915",
+      customEndpoint: "https://ark.cn-beijing.volces.com/api/coding",
+      apiMode: "anthropic_messages",
+    })
+    const provider = getProviderConfig(anthropicCfg)
+    const anthropicBody = provider.buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+    expect(anthropicBody.thinking).toEqual({ type: "disabled" })
+    // Coding Plan authenticates with Bearer, not x-api-key
+    expect(provider.headers.Authorization).toBe("Bearer sk-test")
+    expect(provider.headers["x-api-key"]).toBeUndefined()
+  })
+
+  it("maps reasoning off to MiniMax M3 thinking.type=disabled and omits it for Anthropic", () => {
+    const m3 = mkConfig({
+      provider: "minimax",
+      model: "MiniMax-M3",
+      customEndpoint: "https://api.minimax.io/anthropic",
+    })
+    const build = (overrides?: Parameters<ReturnType<typeof getProviderConfig>["buildBody"]>[1]) =>
+      getProviderConfig(m3).buildBody([{ role: "user", content: "hi" }], overrides) as Record<string, unknown>
+
+    expect(build({ reasoning: { mode: "off" } }).thinking).toEqual({ type: "disabled" })
+    expect(build({ reasoning: { mode: "auto" } }).thinking).toBeUndefined()
+    expect(build().thinking).toBeUndefined()
+
+    // Anthropic's own wire has no "disabled" enum value; omitting
+    // thinking IS off there, and sending it would 400.
+    const claude = mkConfig({ provider: "anthropic", model: "claude-sonnet-4-5" })
+    const claudeBody = getProviderConfig(claude).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+    expect(claudeBody.thinking).toBeUndefined()
+
+    // Third-party Anthropic-wire gateways (Kimi-style) follow the
+    // DeepSeek disabled switch.
+    const gateway = mkConfig({
+      provider: "custom",
+      model: "kimi-k2.6",
+      customEndpoint: "https://api.example-gw.com/anthropic",
+      apiMode: "anthropic_messages",
+    })
+    const gatewayBody = getProviderConfig(gateway).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+    expect(gatewayBody.thinking).toEqual({ type: "disabled" })
+  })
+
+  it("sends reasoning_effort=none for OpenAI GPT-5.1+ off and effort for Azure", () => {
+    const gpt51 = mkConfig({ provider: "openai", model: "gpt-5.1" })
+    const offBody = getProviderConfig(gpt51).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+    expect(offBody.reasoning_effort).toBe("none")
+
+    const gpt4o = mkConfig({ provider: "openai", model: "gpt-4o" })
+    const noopBody = getProviderConfig(gpt4o).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+    expect(noopBody.reasoning_effort).toBeUndefined()
+
+    // Azure reasoning models share the OpenAI effort field — the
+    // toggle existed in the UI but never reached the wire before.
+    const azure = mkConfig({
+      provider: "azure",
+      model: "gpt-5",
+      customEndpoint: "https://my-deploy.openai.azure.com",
+      azureModelFamily: "gpt5",
+    })
+    const azureBody = getProviderConfig(azure).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "low" } },
+    ) as Record<string, unknown>
+    expect(azureBody.reasoning_effort).toBe("low")
   })
 
   it("turns off thinking via chat_template_kwargs on local inference endpoints", () => {
