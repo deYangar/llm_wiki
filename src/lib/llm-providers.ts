@@ -7,8 +7,10 @@ import {
 } from "@/lib/azure-openai"
 import {
   isAdaptiveAnthropicModel,
+  isBigModelEndpoint,
   isGeminiThinkingLevelModel,
   isOpenRouterEndpoint,
+  isLocalInferenceEndpoint,
   normalizeReasoningForProvider,
 } from "@/lib/reasoning-capabilities"
 
@@ -365,10 +367,6 @@ function isXiaomiMimoEndpoint(config: LlmConfig): boolean {
   return /\.?xiaomimimo\.com(?::|\/|$)/i.test(config.customEndpoint)
 }
 
-function isBigModelEndpoint(config: LlmConfig): boolean {
-  return /(?:^|\/\/)open\.bigmodel\.cn(?:[:/]|$)/i.test(config.customEndpoint)
-}
-
 function isGlmVisionModel(model: string): boolean {
   const normalized = model.trim().toLowerCase()
   return /(?:^|[-_.])glm[-_.]5v[-_.]turbo(?:[-_.]|$)/i.test(normalized)
@@ -447,6 +445,27 @@ function adaptXiaomiMimoBody(
   }
 }
 
+/**
+ * Local llama.cpp-family servers (llama-server, LM Studio, vLLM) speak the
+ * Qwen3-style `chat_template_kwargs.enable_thinking` switch, and their
+ * Qwen3 GGUF templates think by default — burning the caller's whole
+ * `max_tokens` budget as `reasoning_content` before any visible content
+ * is produced. Loopback-only: a public custom endpoint is presumed to be
+ * an aggregator whose contract we must not guess at. Servers that don't
+ * recognize the field ignore it (standard OpenAI-compat behavior).
+ */
+function adaptLocalThinkingToggleBody(
+  config: LlmConfig,
+  body: Record<string, unknown>,
+  reasoning: ReasoningConfig,
+): void {
+  if (config.provider !== "custom") return
+  if (!isLocalInferenceEndpoint(config.customEndpoint)) return
+  if (reasoning.mode === "off") {
+    body.chat_template_kwargs = { enable_thinking: false }
+  }
+}
+
 function buildOpenAiCompatibleBody(
   config: LlmConfig,
   messages: ChatMessage[],
@@ -463,6 +482,7 @@ function buildOpenAiCompatibleBody(
   adaptOpenAiStrictCompletionBody(config, body)
   adaptKimiBody(config, body)
   adaptXiaomiMimoBody(config, body, reasoning)
+  adaptLocalThinkingToggleBody(config, body, reasoning)
 
   if (config.provider === "custom" && isOpenRouterEndpoint(config.customEndpoint)) {
     if (reasoning.mode === "custom" && reasoning.budgetTokens !== undefined) {
@@ -487,6 +507,16 @@ function buildOpenAiCompatibleBody(
           body.reasoning_effort = reasoning.mode
         }
       }
+    }
+    return body
+  }
+
+  if (config.provider === "custom" && isBigModelEndpoint(config.customEndpoint)) {
+    // Zhipu BigModel GLM-4.5+ exposes the same `thinking.type` switch as
+    // DeepSeek. GLM thinks by default, which spends the response budget
+    // on `reasoning_content`; "off" maps to the documented disabled value.
+    if (reasoning.mode === "off") {
+      body.thinking = { type: "disabled" }
     }
     return body
   }
@@ -751,7 +781,7 @@ function assertMiniMaxImageSupport(url: string, model: string, messages: ChatMes
 }
 
 function assertBigModelImageSupport(config: LlmConfig, messages: ChatMessage[]): void {
-  if (!isBigModelEndpoint(config) || !hasImageContent(messages) || isGlmVisionModel(config.model)) return
+  if (!isBigModelEndpoint(config.customEndpoint) || !hasImageContent(messages) || isGlmVisionModel(config.model)) return
   throw new Error(
     "Zhipu BigModel image input is supported only by GLM vision models. Switch to glm-5v-turbo, glm-4.6v, glm-4.5v, or glm-4v-plus.",
   )
@@ -760,7 +790,7 @@ function assertBigModelImageSupport(config: LlmConfig, messages: ChatMessage[]):
 export function supportsImageInput(config: LlmConfig): boolean {
   if (config.provider === "codex-cli") return false
   if (config.provider === "minimax") return isMiniMaxM3Model(config.model)
-  if (isBigModelEndpoint(config)) return isGlmVisionModel(config.model)
+  if (isBigModelEndpoint(config.customEndpoint)) return isGlmVisionModel(config.model)
   if ((config.provider === "custom") && (config.apiMode ?? "chat_completions") === "anthropic_messages") {
     const url = buildAnthropicUrl(config.customEndpoint)
     return !isOfficialMiniMaxAnthropicUrl(url) || isMiniMaxM3Model(config.model)

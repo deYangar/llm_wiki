@@ -744,11 +744,11 @@ describe("reasoning controls", () => {
     expect(body.messages).toEqual([{ role: "user", content: "Hi" }])
   })
 
-  it("does not infer Qwen private parameters on generic custom endpoints", () => {
+  it("does not infer Qwen private parameters on generic cloud custom endpoints", () => {
     const cfg = mkConfig({
       provider: "custom",
       model: "Qwen3.5-122B",
-      customEndpoint: "http://127.0.0.1:8000/v1",
+      customEndpoint: "https://gateway.example/v1",
       apiMode: "chat_completions",
     })
     const body = getProviderConfig(cfg).buildBody(
@@ -757,6 +757,39 @@ describe("reasoning controls", () => {
     ) as Record<string, unknown>
 
     expect(body.chat_template_kwargs).toBeUndefined()
+  })
+
+  it("turns off thinking via chat_template_kwargs on local inference endpoints", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
+      customEndpoint: "http://127.0.0.1:18200/v1",
+      apiMode: "chat_completions",
+    })
+    const build = (overrides?: Parameters<ReturnType<typeof getProviderConfig>["buildBody"]>[1]) =>
+      getProviderConfig(cfg).buildBody([{ role: "user", content: "hi" }], overrides) as Record<string, unknown>
+
+    expect(build({ reasoning: { mode: "off" } }).chat_template_kwargs).toEqual({
+      enable_thinking: false,
+    })
+    // auto keeps the model's own default; no guessing on the wire
+    expect(build({ reasoning: { mode: "auto" } }).chat_template_kwargs).toBeUndefined()
+    expect(build().chat_template_kwargs).toBeUndefined()
+  })
+
+  it("maps reasoning off to Zhipu BigModel thinking.type=disabled", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "GLM-5.3-Flash",
+      customEndpoint: "https://open.bigmodel.cn/api/paas/v4",
+      apiMode: "chat_completions",
+    })
+    const build = (overrides?: Parameters<ReturnType<typeof getProviderConfig>["buildBody"]>[1]) =>
+      getProviderConfig(cfg).buildBody([{ role: "user", content: "hi" }], overrides) as Record<string, unknown>
+
+    expect(build({ reasoning: { mode: "off" } }).thinking).toEqual({ type: "disabled" })
+    expect(build({ reasoning: { mode: "auto" } }).thinking).toBeUndefined()
+    expect(build().thinking).toBeUndefined()
   })
 
   it("strips temperature for Kimi/Moonshot OpenAI-compatible endpoints", () => {

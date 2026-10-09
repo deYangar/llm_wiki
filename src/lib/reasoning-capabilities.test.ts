@@ -31,6 +31,28 @@ describe("reasoning capabilities", () => {
     expect(normalizeReasoningForProvider(cfg, { mode: "low" })).toEqual({ mode: "low" })
   })
 
+  it("offers the thinking toggle on local inference endpoints (llama.cpp / vLLM / LM Studio)", () => {
+    for (const endpoint of ["http://127.0.0.1:18200/v1", "http://localhost:1234/v1", "http://[::1]:8080/v1"]) {
+      const cfg = {
+        ...config("custom", "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"),
+        customEndpoint: endpoint,
+      }
+      expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
+      expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
+    }
+  })
+
+  it("offers the thinking toggle on Zhipu BigModel first-party endpoints", () => {
+    for (const endpoint of ["https://open.bigmodel.cn/api/paas/v4", "https://api.z.ai/api/paas/v4"]) {
+      const cfg = {
+        ...config("custom", "GLM-5.3-Flash"),
+        customEndpoint: endpoint,
+      }
+      expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
+      expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
+    }
+  })
+
   it("does not offer off for thinking-required Gemini and Claude models", () => {
     expect(resolveReasoningCapabilities(config("google", "gemini-2.5-pro")).modes)
       .not.toContain("off")

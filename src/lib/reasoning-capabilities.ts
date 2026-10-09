@@ -64,6 +64,39 @@ export function isOpenRouterEndpoint(endpoint: string): boolean {
 }
 
 /**
+ * Loopback endpoints are the user's own inference server (llama.cpp
+ * llama-server, LM Studio, vLLM, ...), not a third-party aggregator, so
+ * sending llama.cpp-family thinking controls cannot break someone else's
+ * contract. Qwen3-style GGUF chat templates think by default and eat the
+ * whole `max_tokens` budget as `reasoning_content`; without this gate the
+ * UI offers only "auto" and the user has no way to turn thinking off.
+ */
+export function isLocalInferenceEndpoint(endpoint: string): boolean {
+  try {
+    const hostname = new URL(endpoint).hostname.toLowerCase()
+    return (
+      hostname === "127.0.0.1" ||
+      hostname === "localhost" ||
+      hostname === "::1" ||
+      hostname === "[::1]" ||
+      hostname === "0.0.0.0"
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Zhipu BigModel first-party endpoints (open.bigmodel.cn mainland,
+ * api.z.ai international). GLM-4.5+ models expose the documented
+ * `thinking: { type: "enabled" | "disabled" }` switch, so the toggle
+ * levels are safe to offer — unlike an unknown aggregator gateway.
+ */
+export function isBigModelEndpoint(endpoint: string): boolean {
+  return /(?:^|\/\/)(?:open\.bigmodel\.cn|api\.z\.ai)(?:[:/]|$)/i.test(endpoint)
+}
+
+/**
  * Resolve only capabilities that are part of the selected wire contract.
  * Generic custom gateways deliberately stay Auto-only: a vendor-looking
  * model name does not prove that an aggregator accepts that vendor's private
@@ -100,6 +133,8 @@ export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabi
     if (/xiaomimimo\.com(?:[:/]|$)/.test(endpoint)) {
       return capabilities(TOGGLE_LEVELS)
     }
+    if (isBigModelEndpoint(endpoint)) return capabilities(TOGGLE_LEVELS)
+    if (isLocalInferenceEndpoint(endpoint)) return capabilities(TOGGLE_LEVELS)
     // Anthropic-compatible custom endpoints are not necessarily Anthropic
     // itself (MiniMax, Kimi and enterprise proxies differ), so omission is the
     // only portable default. Users can select a first-party preset when they
