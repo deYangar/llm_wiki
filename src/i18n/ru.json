@@ -1018,6 +1018,7 @@
         "localToken": "Локальный API-ключ (необязательно)",
         "localTokenHint": "Отправляется только локальному сервису в заголовке Authorization: Bearer",
         "parsingBackend": "Бэкенд разбора",
+        "parsingBackendHint": "Only used by the community /tasks wrapper (third-party mineru-api). Official V1 api-server endpoints (mineru-kit, incl. the CPU portable package) ignore this and use the tier above instead.",
         "backendHybrid": "Гибридный движок (рекомендуется)",
         "backendPipeline": "Pipeline",
         "backendVlm": "Движок VLM",

@@ -1018,6 +1018,7 @@
         "localToken": "Chiave API locale (opzionale)",
         "localTokenHint": "Inviata solo al servizio self-hosted come header Authorization: Bearer",
         "parsingBackend": "Backend di analisi",
+        "parsingBackendHint": "Only used by the community /tasks wrapper (third-party mineru-api). Official V1 api-server endpoints (mineru-kit, incl. the CPU portable package) ignore this and use the tier above instead.",
         "backendHybrid": "Motore ibrido (consigliato)",
         "backendPipeline": "Pipeline",
         "backendVlm": "Motore VLM",

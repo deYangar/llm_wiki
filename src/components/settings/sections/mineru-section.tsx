@@ -248,6 +248,12 @@ export function MineruSection({ draft, setDraft }: Props) {
                   <option value="hybrid-http-client">{t("settings.sections.mineru.backendHybridHttp")}</option>
                   <option value="vlm-http-client">{t("settings.sections.mineru.backendVlmHttp")}</option>
                 </select>
+                <p className="text-xs text-muted-foreground">
+                  {t("settings.sections.mineru.parsingBackendHint", {
+                    defaultValue:
+                      "Only used by the community /tasks wrapper (third-party mineru-api). Official V1 api-server endpoints (mineru-kit, incl. the CPU portable package) ignore this and use the tier above instead.",
+                  })}
+                </p>
               </div>
 
               {draft.mineruLocalBackend.startsWith("hybrid-") && (

@@ -1018,6 +1018,7 @@
         "localToken": "本地 API Key（可选）",
         "localTokenHint": "仅发送到自托管服务，使用 Authorization: Bearer 请求头",
         "parsingBackend": "解析后端",
+        "parsingBackendHint": "仅社区版 /tasks 封装（第三方 mineru-api）使用此选项；官方 V1 api-server 端点（mineru-kit，含 CPU 便携包）会忽略它，改用上方的档位设置。",
         "backendHybrid": "Hybrid engine（推荐）",
         "backendPipeline": "Pipeline",
         "backendVlm": "VLM engine",
