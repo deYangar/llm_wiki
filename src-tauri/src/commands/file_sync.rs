@@ -191,7 +191,10 @@ struct FileSyncPayload {
     tasks: Vec<FileChangeTask>,
 }
 
-#[tauri::command]
+// Runs the startup rescan + queue processing off the main thread: this walks
+// the whole project tree and can take seconds on large libraries, which used
+// to freeze the UI for the duration of the command.
+#[tauri::command(async)]
 pub fn start_project_file_watcher(
     app: AppHandle,
     state: State<FileSyncState>,
@@ -331,7 +334,7 @@ pub fn stop_project_file_watcher(state: State<FileSyncState>) -> Result<(), Stri
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rescan_project_files(
     app: AppHandle,
     project_id: String,
@@ -391,7 +394,7 @@ pub fn get_file_change_queue(project_path: String) -> Result<FileChangeQueue, St
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn retry_file_change_task(
     app: AppHandle,
     project_id: String,
@@ -475,7 +478,7 @@ fn handle_changed_paths(
             continue;
         }
         if path.is_dir() {
-            for entry in WalkDir::new(&path).into_iter().filter_map(Result::ok) {
+            for entry in watch_walk(root, &path).filter_map(Result::ok) {
                 if entry.file_type().is_file() && !is_app_write_ignored(entry.path()) {
                     if let Some(rel) = relative_watch_path(
                         root,
@@ -591,7 +594,7 @@ fn collect_known_paths(
     rules: &SourceWatchRules,
 ) {
     if path.is_dir() {
-        for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
+        for entry in watch_walk(root, path).filter_map(Result::ok) {
             if entry.file_type().is_file() {
                 if let Some(rel) = relative_watch_path(
                     root,
@@ -657,7 +660,7 @@ fn enqueue_rescan_changes(
 ) -> Result<(), String> {
     let rules = SourceWatchRules::new(source_watch_config);
     let mut rels = BTreeSet::<String>::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in watch_walk(root, root).filter_map(Result::ok) {
         if entry.file_type().is_file() {
             if let Some(rel) = relative_watch_path(
                 root,
@@ -723,7 +726,7 @@ fn enqueue_rescan_changes_for_prefixes(
                 }
             }
         } else if path.exists() {
-            for entry in WalkDir::new(&path).into_iter().filter_map(Result::ok) {
+            for entry in watch_walk(root, &path).filter_map(Result::ok) {
                 if entry.file_type().is_file() {
                     if let Some(rel) = relative_watch_path(
                         root,
@@ -1126,6 +1129,27 @@ fn normalize_rel_path(path: &Path) -> Option<String> {
         }
     }
     Some(parts.join("/"))
+}
+
+// `should_watch_rel` already drops everything under `wiki/media/`, but the
+// scanner still paid a full directory traversal for those tens of thousands
+// of generated attachments on every watcher restart/rescan. Prune the subtree
+// before descending into it so the walk never enters it at all.
+fn watch_walk<'a>(
+    root: &'a Path,
+    dir: &Path,
+) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> + 'a {
+    WalkDir::new(dir)
+        .into_iter()
+        .filter_entry(move |entry| {
+            entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .and_then(normalize_rel_path)
+                .map(|rel| !rel.eq_ignore_ascii_case("wiki/media"))
+                .unwrap_or(true)
+        })
 }
 
 fn should_watch_rel(rel: &str, rules: &SourceWatchRules) -> bool {
@@ -1887,6 +1911,26 @@ mod tests {
             normalize_path_key(Path::new(r"C:\Proj\raw\sources\File.md")),
             normalize_path_key(Path::new(r"c:\proj\RAW\sources\file.md"))
         );
+    }
+
+    #[test]
+    fn startup_rescan_prunes_media_subtree() {
+        let root = temp_root("media-prune");
+        fs::create_dir_all(root.join("wiki/media/sub")).unwrap();
+        fs::create_dir_all(root.join("wiki/entities")).unwrap();
+        fs::write(root.join("wiki/media/top.png"), b"png").unwrap();
+        fs::write(root.join("wiki/media/sub/image.png"), b"png").unwrap();
+        fs::write(root.join("wiki/entities/topic.md"), b"# topic").unwrap();
+        let config = normalize_source_watch_config(None);
+
+        ensure_sync_dir(&root).unwrap();
+        enqueue_startup_rescan_changes(&root, "p1", &config).unwrap();
+
+        let queue = with_queue_lock(&root, || read_queue(&root)).unwrap();
+        let paths: Vec<&str> = queue.tasks.iter().map(|t| t.path.as_str()).collect();
+        assert_eq!(paths, vec!["wiki/entities/topic.md"]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

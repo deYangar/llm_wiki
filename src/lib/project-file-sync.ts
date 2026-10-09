@@ -33,6 +33,7 @@ import { getRecentProjects, loadSourceWatchConfig } from "@/lib/project-store"
 let unlistenQueue: UnlistenFn | null = null
 let unlistenChanged: UnlistenFn | null = null
 let startSeq = 0
+let activeProjectId: string | null = null
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let pendingRefreshPaths = new Set<string>()
 let pendingChangeTasks = new Map<string, FileChangeTask>()
@@ -48,9 +49,21 @@ export async function startProjectFileSync(
   project: WikiProject,
   sourceWatchConfig?: SourceWatchConfig,
 ): Promise<void> {
+  const nextConfig = normalizeSourceWatchConfig(sourceWatchConfig)
+  // Restarting means a full project rescan on the backend. Saving unrelated
+  // settings (theme, language, ...) reaches this call too, so skip the
+  // restart when the running watcher already uses this exact config.
+  if (
+    unlistenQueue !== null &&
+    activeProjectId === project.id &&
+    JSON.stringify(nextConfig) === JSON.stringify(activeSourceWatchConfig)
+  ) {
+    return
+  }
   await stopProjectFileSync()
   const seq = ++startSeq
-  activeSourceWatchConfig = normalizeSourceWatchConfig(sourceWatchConfig)
+  activeSourceWatchConfig = nextConfig
+  activeProjectId = project.id
   useFileSyncStore.getState().setRunning(true)
   useFileSyncStore.getState().setLastError(null)
 
@@ -104,6 +117,8 @@ export async function stopProjectFileSync(): Promise<void> {
   unlistenChanged?.()
   unlistenQueue = null
   unlistenChanged = null
+  activeProjectId = null
+  activeSourceWatchConfig = normalizeSourceWatchConfig()
   if (refreshTimer) {
     clearTimeout(refreshTimer)
     refreshTimer = null
