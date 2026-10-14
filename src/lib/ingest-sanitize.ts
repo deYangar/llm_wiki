@@ -55,7 +55,10 @@
  * which means re-ingesting an old file once cleans it up
  * permanently.
  */
-export function sanitizeIngestedFileContent(content: string): string {
+export function sanitizeIngestedFileContent(
+  content: string,
+  opts?: { keepBodyVerbatim?: boolean },
+): string {
   let cleaned = content
 
   // (1) Strip a code fence wrapping the whole document or just its
@@ -69,8 +72,8 @@ export function sanitizeIngestedFileContent(content: string): string {
   cleaned = stripOuterCodeFence(cleaned)
 
   // (2) Strip a stray `frontmatter:` line that prefixes the real
-  // `---` block. Some prompts seem to make the model interpret
-  // the request as "produce a YAML document with a `frontmatter`
+  // `---` block. Some prompts seem to make the model interpret the
+  // request as "produce a YAML document with a `frontmatter`
   // key" rather than "produce a markdown document with a
   // frontmatter block".
   cleaned = stripFrontmatterKeyPrefix(cleaned)
@@ -87,7 +90,12 @@ export function sanitizeIngestedFileContent(content: string): string {
 
   // (4) Normalize recurring malformed body links emitted by generation and
   // synthesis models. Frontmatter and code examples remain byte-identical.
-  cleaned = normalizeMalformedWikilinks(cleaned)
+  // qa-split pages pass keepBodyVerbatim: their body is a verbatim slice
+  // of the source document (零改写红线), so the rewrite step is skipped
+  // entirely — the write pipeline must not touch their body bytes.
+  if (!opts?.keepBodyVerbatim) {
+    cleaned = normalizeMalformedWikilinks(cleaned)
+  }
 
   return cleaned
 }

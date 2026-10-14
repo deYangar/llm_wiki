@@ -25,6 +25,17 @@ import {
 } from "@/lib/source-identity"
 import { parseSources, writeSources } from "@/lib/sources-merge"
 import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
+import {
+  buildQaSplitReportEntry,
+  buildQuestionFileBlocks,
+  classifyQaDocument,
+  extractPathMeta,
+  extractRoundMeta,
+  llmFallbackSplit,
+  splitQaDocument,
+  splitReplySections,
+  type LlmFallbackUsage,
+} from "@/lib/qa-split"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
 import { mergePageContent, type MergeFn } from "@/lib/page-merge"
 import { withProjectLock } from "@/lib/project-mutex"
@@ -928,7 +939,24 @@ async function autoIngestImpl(
       }
     }
 
-    let primaryOk = await attemptMineruParse(primaryBackend)
+    // Cache-reuse short-circuit (2026-10-12): a replayed/re-ingested PDF with
+    // an existing high-quality MinerU cache must NOT be re-submitted to the
+    // parser — a 173-page PDF re-queued for 14-19 minutes of cloud time per
+    // task in the small-batch replay, and a full-library replay would burn the
+    // cloud quota for zero output change (the cache is byte-identical after a
+    // re-parse). Only MinerU-grade caches short-circuit: a pdfium-degraded
+    // cache (issue806 legacy) still falls through to the ladder so a re-parse
+    // can repair it.
+    const cacheReuse =
+      (await detectPdfCacheParserSource(cachePath, "missing")) === "mineru"
+    if (cacheReuse) {
+      mineruSucceeded = true
+      pdfParserSource = "mineru-cached"
+      console.log(
+        `[ingest:mineru] reusing cached MinerU output for "${fileName}" (re-parse skipped)`,
+      )
+    }
+    let primaryOk = cacheReuse || (await attemptMineruParse(primaryBackend))
 
     if (!primaryOk && primaryBackend === "cloud") {
       const reason = parseFailure instanceof Error ? parseFailure.message : String(parseFailure)
@@ -1043,8 +1071,13 @@ async function autoIngestImpl(
   // re-running them costs only the extraction time and converges the
   // source-summary page on the current pipeline's contract regardless
   // of when the file was first ingested.
-  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent)
-  console.log(`[ingest:diag] cache check for "${sourceIdentity}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
+  // ── W7 qa-split 分类：问答函类走确定性逐题拆分通道，归纳式主路径不动 ──
+  // 题目完整性由规则保证，LLM 不再决定「哪些题值得入库」（2026-10-08
+  // 完整性审计：归纳管道把原文 7,896 题压到 2,606，33%）。
+  const qaKind = classifyQaDocument(sourceContent)
+  const ingestMode = qaKind ? "qa-split" : "summarize"
+  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent, ingestMode)
+  console.log(`[ingest:diag] cache check for "${sourceIdentity}" (mode=${ingestMode}):`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
     return runCommit(async () => {
       throwIfIngestAborted(signal, activityId)
@@ -1134,6 +1167,26 @@ async function autoIngestImpl(
         filesWritten: cachedFiles,
       })
       return cachedFiles
+    })
+  }
+
+  // ── W7 qa-split 分支：逐题拆分 → 逐字转录 question 页 ────────────
+  // 零 LLM 决策、零 LLM 生成；写盘复用 writeFileBlocks（sanitize/路由
+  // 校验/merge/原子写/版本记录），缓存走 mode=qa-split 独立命名空间。
+  if (qaKind) {
+    return ingestQaSplitDocument({
+      projectPath: pp,
+      sourceIdentity,
+      sourceSummarySlug,
+      sourceSummaryPath,
+      sourceContent,
+      fileName,
+      qaKind,
+      llmConfig,
+      signal,
+      activityId,
+      onFileWritten,
+      runCommit,
     })
   }
 
@@ -1778,7 +1831,7 @@ async function autoIngestImpl(
     hardFailures.length === 0 &&
     unrecoveredTruncatedPaths.length === 0
   ) {
-    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)
+    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, "summarize")
     await clearGenerationCheckpoint(generationProgressPath)
     if (longSourceCheckpointPath) {
       await clearLongSourceCheckpoint(longSourceCheckpointPath)
@@ -1826,6 +1879,393 @@ async function autoIngestImpl(
   })
 
   return writtenPaths
+  })
+}
+
+// ── W7 qa-split 逐题拆分通道 ─────────────────────────────────────
+//
+// 问答函类文档（问询函原件/回复函/落实函）不走归纳式 ingest：题目与回复
+// 原文逐字转录为 wiki/questions/ 的 question 页，题号=原文题号。完整性
+// 由确定性规则保证（四通道识别器与 2026-10-08 审计 v4 同源），LLM 不参与
+// 拆题；写盘/缓存/index/log 复用既有护栏，重跑幂等（同文档同题号覆盖）。
+
+interface QaSplitIngestArgs {
+  projectPath: string
+  sourceIdentity: string
+  sourceSummarySlug: string
+  sourceSummaryPath: string
+  sourceContent: string
+  fileName: string
+  qaKind: ReturnType<typeof classifyQaDocument>
+  llmConfig: LlmConfig
+  signal?: AbortSignal
+  activityId: string
+  onFileWritten?: (relativePath: string) => void
+  runCommit: IngestCommitRunner
+}
+
+async function appendQaSplitReport(
+  projectPath: string,
+  entry: ReturnType<typeof buildQaSplitReportEntry>,
+): Promise<void> {
+  try {
+    await createDirectory(`${projectPath}/.llm-wiki`)
+    const reportPath = `${projectPath}/.llm-wiki/qa-split-report.jsonl`
+    const existing = await tryReadFile(reportPath)
+    const next = `${existing.trimEnd()}${existing.trim() ? "\n" : ""}${JSON.stringify(entry)}\n`
+    await writeFile(reportPath, next)
+  } catch (err) {
+    console.warn(
+      `[ingest:qa-split] Failed to append qa-split report for "${entry.source}":`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+/**
+ * F2（2026-10-12 审查）：重拆孤儿页清理。写盘前比对库内该来源现存
+ * question/section 页题号与本次拆分结果——新拆集合少于旧集合时，多出的
+ * 旧页面是上一次（可能基于假边界）拆分的残留，会永久留在库里污染题目层。
+ * 移入项目内隔离区 `.llm-wiki/quarantine/`（不直删，可人工回滚）并记
+ * manifest。幂等承诺的严格语义：重跑后库状态 = 全新拆分结果。
+ */
+export async function quarantineStaleQaSplitPages(
+  pp: string,
+  sourceIdentity: string,
+  sourceSummarySlug: string,
+  keptQuestionNos: Set<number>,
+): Promise<string[]> {
+  const escapedSlug = sourceSummarySlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const questionRe = new RegExp(`^${escapedSlug}-q(\\d+)\\.md$`)
+  const sectionRe = new RegExp(`^${escapedSlug}-q(\\d+)-s(\\d+)\\.md$`)
+
+  const stale: { absPath: string; relPath: string }[] = []
+  for (const [dir, relDir, pattern] of [
+    ["wiki/questions", "wiki/questions", questionRe],
+    ["wiki/sections", "wiki/sections", sectionRe],
+  ] as const) {
+    let nodes
+    try {
+      nodes = await listDirectory(`${pp}/${dir}`)
+    } catch {
+      continue // 目录不存在 = 无存量，无孤儿
+    }
+    for (const node of nodes) {
+      if (node.is_dir) continue
+      const m = node.name.match(pattern)
+      if (!m) continue
+      if (keptQuestionNos.has(parseInt(m[1], 10))) continue
+      stale.push({ absPath: node.path || `${pp}/${dir}/${node.name}`, relPath: `${relDir}/${node.name}` })
+    }
+  }
+  if (stale.length === 0) return []
+
+  const batchId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(36).slice(2, 8)}`
+  const batchDir = `${pp}/.llm-wiki/quarantine/pages/${batchId}`
+  await createDirectory(batchDir)
+  for (const page of stale) {
+    const content = await readFile(page.absPath)
+    await writeFile(`${batchDir}/${page.relPath.replace(/\//g, "__")}`, content)
+    await deleteFile(page.absPath)
+  }
+  try {
+    const manifestPath = `${pp}/.llm-wiki/quarantine/manifest.jsonl`
+    const existing = await tryReadFile(manifestPath)
+    const entry = JSON.stringify({
+      at: new Date().toISOString(),
+      source: sourceIdentity,
+      reason: "re-split stale question numbers",
+      batchDir,
+      pages: stale.map((page) => page.relPath),
+    })
+    await writeFile(manifestPath, `${existing.trimEnd()}${existing.trim() ? "\n" : ""}${entry}\n`)
+  } catch (err) {
+    console.warn(
+      `[ingest:qa-split] Failed to append quarantine manifest for "${sourceIdentity}":`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return stale.map((page) => page.relPath)
+}
+
+async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]> {
+  const {
+    projectPath: pp,
+    sourceIdentity,
+    sourceSummarySlug,
+    sourceSummaryPath,
+    sourceContent,
+    fileName,
+    qaKind,
+    llmConfig,
+    signal,
+    activityId,
+    onFileWritten,
+    runCommit,
+  } = args
+  const activity = useActivityStore.getState()
+
+  return runCommit(async () => {
+    throwIfIngestAborted(signal, activityId)
+    activity.updateItem(activityId, { detail: "qa-split: 识别题号边界（规则，零 LLM）..." })
+
+    const pathMeta = extractPathMeta(sourceIdentity)
+    const roundMeta = extractRoundMeta(sourceContent, fileName)
+    let split = splitQaDocument(sourceContent, qaKind!)
+
+    // ── L6 难例 LLM 兜底（2026-10-12 混合架构：规则主干 + LLM 难例 + 机械
+    //    校验红线）。规则通道 0 题时（T1 manualQueue / T2 单题意见书），LLM
+    //    只提供题边界候选，机械校验器逐字定位/序列/覆盖过滤后才采信；切块
+    //    仍走 cutQuestions，正文永远是原文切片。失败回落人工队列，如实记录。
+    let fallbackTags: string[] = []
+    let fallbackUsage: LlmFallbackUsage | undefined
+    let fallbackDetail = ""
+    if (
+      split.questions.length === 0 &&
+      useWikiStore.getState().qaSplitConfig.llmFallbackEnabled
+    ) {
+      throwIfIngestAborted(signal, activityId)
+      activity.updateItem(activityId, {
+        detail: "qa-split: 规则通道 0 题，LLM 兜底识别题边界（L6）...",
+      })
+      const outcome = await llmFallbackSplit(sourceContent, qaKind!, {
+        callLlm: (systemPrompt, userPrompt) =>
+          streamChatWithContinuation(
+            llmConfig,
+            systemPrompt,
+            userPrompt,
+            {
+              temperature: 0,
+              reasoning: resolveIngestReasoning(llmConfig),
+              max_tokens: INGEST_GENERATION_TOKENS_DEFAULT,
+            },
+            () => {},
+            signal,
+          ).then((result) => result.text),
+        signal,
+      })
+      if (outcome.split.questions.length > 0) {
+        split = outcome.split
+        fallbackTags = outcome.tags
+        fallbackUsage = outcome.usage
+        fallbackDetail = outcome.detail
+      } else {
+        // 0 题结果不落盘不缓存，原因带回人工队列路径如实暴露
+        fallbackDetail = outcome.split.manualQueue ?? outcome.detail
+      }
+    }
+
+    const report = (status: "ok" | "manual-queue" | "rejected", detail: string, pages = 0, sections = 0) =>
+      appendQaSplitReport(
+        pp,
+        buildQaSplitReportEntry(sourceIdentity, split, roundMeta, pages, status, detail, sections, {
+          llmUsage: fallbackUsage,
+          // L4：L6 通道恒写 tagsApplied（含 0=标签全被值域丢弃），与
+          // 「非 L6 通道未打标=字段不出现」在对账文件里可区分。
+          tagsApplied: split.channel === "L6" ? fallbackTags.length : undefined,
+        }),
+      )
+
+    // 人工兜底队列：识别失败如实暴露，不静默跳过、不缓存失败结果
+    if (split.questions.length === 0) {
+      const reason = fallbackDetail || split.manualQueue || "识别到 0 题"
+      await appendIngestWarningLog(pp, sourceIdentity, [
+        `[qa-split] 无法识别题号，进人工兜底队列：${reason}`,
+      ])
+      await report("manual-queue", reason)
+      activity.updateItem(activityId, {
+        status: "error",
+        detail: `qa-split 无法识别题号（${reason}）— 已进人工兜底队列，见 .llm-wiki/qa-split-report.jsonl`,
+        filesWritten: [],
+      })
+      // 返回空列表让队列的 length-0 安全网把任务标记为待重试/待人工，
+      // 而不是把它当成功吞掉。
+      return []
+    }
+
+    const { fileBlocksText, verbatimViolations, pageCount, sectionCount } =
+      buildQuestionFileBlocks(
+        sourceContent,
+        split,
+        pathMeta,
+        roundMeta,
+        sourceIdentity,
+        sourceSummarySlug,
+        fallbackTags,
+      )
+    // 质量红线：逐字转录断言失败=拆题器缺陷，拒绝写盘并显式失败
+    if (verbatimViolations.length > 0) {
+      await appendIngestWarningLog(pp, sourceIdentity, verbatimViolations)
+      await report("rejected", verbatimViolations.join("; "))
+      throw new Error(
+        `qa-split verbatim check failed for "${sourceIdentity}": ${verbatimViolations.join("; ")}`,
+      )
+    }
+
+    throwIfIngestAborted(signal, activityId)
+    activity.updateItem(activityId, {
+      detail: `qa-split: 写入 ${pageCount} 个 question 页 + ${sectionCount} 个 section 页（通道 ${split.channel}）...`,
+    })
+    await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
+    // F2: 先隔离旧拆题号残留，再写盘——重跑后库状态 = 全新拆分结果。
+    const quarantinedPages = await quarantineStaleQaSplitPages(
+      pp,
+      sourceIdentity,
+      sourceSummarySlug,
+      new Set(split.questions.map((question) => question.questionNo)),
+    )
+    if (quarantinedPages.length > 0) {
+      await appendIngestWarningLog(pp, sourceIdentity, [
+        `[qa-split] 重拆后 ${quarantinedPages.length} 个旧题号页面移入隔离区 .llm-wiki/quarantine/：${quarantinedPages.join("、")}`,
+      ])
+    }
+    const writeResult = await writeFileBlocks(
+      pp,
+      fileBlocksText,
+      llmConfig,
+      sourceIdentity,
+      sourceSummaryPath,
+      signal,
+      activityId,
+      onFileWritten,
+      // F2: sources 摘要页与 question/section 同为单源确定性产物——
+      // title 带本次拆题计数，merge 锁旧 title 会留旧计数。
+      { summaryIsDeterministic: true },
+    )
+    const writtenPaths = uniqueNormalizedPaths(writeResult.writtenPaths)
+
+    if (writeResult.hardFailures.length > 0) {
+      await appendIngestWarningLog(pp, sourceIdentity, writeResult.warnings)
+      await report("rejected", `${writeResult.hardFailures.length} 个页面写盘失败`, writtenPaths.length)
+      throw new Error(
+        `qa-split incomplete for "${sourceIdentity}": ${writeResult.hardFailures.length} write failure(s)`,
+      )
+    }
+    if (writeResult.warnings.length > 0) {
+      await appendIngestWarningLog(pp, sourceIdentity, writeResult.warnings)
+    }
+
+    // F3 红线闭环：落盘读回复检——question/section 页正文必须仍是原文切片
+    // 的连续子串（行尾归一后）。写盘管道已对 qa 页跳过 body wikilink 规范
+    // 化，本断言覆盖 sanitize/stamp/canonicalize 之后的最终落盘形态；
+    // 失败=管线缺陷（理论不可达），loud 失败进人工视野。
+    const writtenSet = new Set(writtenPaths.map((p) => normalizePath(p)))
+    const readBack = async (expectedPath: string): Promise<string | null> => {
+      if (!writtenSet.has(normalizePath(expectedPath))) return null // 未写出（写盘失败路径已如实上报）
+      const content = await tryReadFile(`${pp}/${expectedPath}`)
+      return content ? content.replace(/\r\n/g, "\n") : null
+    }
+    const postViolations: string[] = []
+    for (const question of split.questions) {
+      const onDisk = await readBack(`wiki/questions/${sourceSummarySlug}-q${question.questionNo}.md`)
+      if (onDisk == null) continue
+      if (!onDisk.includes(question.questionText)) {
+        postViolations.push(`q${question.questionNo}: 落盘题目正文不再是原文连续子串`)
+      }
+      if (question.replyText && !onDisk.includes(question.replyText)) {
+        postViolations.push(`q${question.questionNo}: 落盘回复正文不再是原文连续子串`)
+      }
+      for (const section of splitReplySections(question.replyText, question.questionNo)) {
+        const sectionOnDisk = await readBack(
+          `wiki/sections/${sourceSummarySlug}-q${question.questionNo}-s${section.sectionNo}.md`,
+        )
+        if (sectionOnDisk != null && !sectionOnDisk.includes(section.text)) {
+          postViolations.push(
+            `q${question.questionNo}-s${section.sectionNo}: 落盘小节正文不再是原文连续子串`,
+          )
+        }
+      }
+    }
+    if (postViolations.length > 0) {
+      await appendIngestWarningLog(pp, sourceIdentity, postViolations)
+      await report(
+        "rejected",
+        `落盘复检失败（页面已写出，需人工处置）：${postViolations.join("; ")}`,
+        writtenPaths.length,
+        sectionCount,
+      )
+      throw new Error(
+        `qa-split post-write verbatim check failed for "${sourceIdentity}": ${postViolations.join("; ")}`,
+      )
+    }
+
+    try {
+      if (await updateWikiIndexDeterministically(pp, writtenPaths)) {
+        writtenPaths.push("wiki/index.md")
+        onFileWritten?.("wiki/index.md")
+      }
+    } catch (err) {
+      await appendIngestWarningLog(pp, sourceIdentity, [
+        `Deterministic index update failed: ${err instanceof Error ? err.message : String(err)}`,
+      ])
+    }
+    if (
+      !writtenPaths.some((path) => normalizePath(path).toLowerCase() === "wiki/log.md") &&
+      !signal?.aborted
+    ) {
+      try {
+        const logPath = `${pp}/wiki/log.md`
+        const existingLog = await tryReadFile(logPath)
+        await writeFile(logPath, buildDeterministicIngestLog(existingLog, sourceIdentity))
+        writtenPaths.push("wiki/log.md")
+        onFileWritten?.("wiki/log.md")
+      } catch (err) {
+        await appendIngestWarningLog(pp, sourceIdentity, [
+          `Deterministic log update failed: ${err instanceof Error ? err.message : String(err)}`,
+        ])
+      }
+    }
+
+    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, "qa-split")
+
+    // 与归纳路径同款 embedding 步骤：question 页进向量索引才可被语义召回
+    const embCfg = useWikiStore.getState().embeddingConfig
+    if (embCfg.enabled && embCfg.model && writtenPaths.length > 0) {
+      try {
+        const { embedPage, wikiPageIdFromPath } = await import("@/lib/embedding")
+        for (const wpath of writtenPaths) {
+          const pageId = wikiPageIdFromPath(pp, wpath)
+          const pageStem = wpath.split("/").pop()?.replace(/\.md$/, "") ?? ""
+          if (!pageId || ["index", "log", "overview"].includes(pageStem)) continue
+          try {
+            const content = await readFile(`${pp}/${wpath}`)
+            const fmTitle = parseFrontmatter(content).frontmatter?.title
+            const title = typeof fmTitle === "string" && fmTitle.trim() ? fmTitle.trim() : pageId
+            await embedPage(pp, pageId, title, content, embCfg)
+          } catch {
+            // non-critical
+          }
+        }
+      } catch {
+        // embedding module not available
+      }
+    }
+
+    if (writtenPaths.length > 0) {
+      try {
+        await refreshProjectFileTree(pp, { bumpDataVersion: true })
+      } catch {
+        // ignore
+      }
+    }
+
+    const reconciliation =
+      `目录题号 ${split.tocNumbers.length} 个 / 正文拆出 ${split.questions.length} 题 / section 小节 ${sectionCount} 页` +
+      (quarantinedPages.length > 0
+        ? ` / 旧题号残留隔离 ${quarantinedPages.length} 页`
+        : "") +
+      (split.manualQueue ? ` / ${split.manualQueue}` : "") +
+      (split.channel === "L6" && fallbackDetail ? ` / L6 兜底：${fallbackDetail}` : "") +
+      (fallbackTags.length > 0 ? ` / 标签 ${fallbackTags.length} 个` : "")
+    await report("ok", reconciliation, writtenPaths.length, sectionCount)
+    activity.updateItem(activityId, {
+      status: "done",
+      detail: split.channel === "L6"
+        ? `qa-split(llm-fallback)：${split.questions.length} 题（${fallbackDetail}）+ ${sectionCount} 小节（${roundMeta.roundKind}${roundMeta.roundNo ? `第${roundMeta.roundNo}轮` : ""}）→ ${writtenPaths.length} 页`
+        : `qa-split：${split.questions.length} 题 + ${sectionCount} 小节（通道 ${split.channel}，${roundMeta.roundKind}${roundMeta.roundNo ? `第${roundMeta.roundNo}轮` : ""}）→ ${writtenPaths.length} 页`,
+      filesWritten: writtenPaths,
+    })
+    return writtenPaths
   })
 }
 
@@ -2252,6 +2692,7 @@ async function writeFileBlocks(
   signal?: AbortSignal,
   activityId?: string,
   onFileWritten?: (relativePath: string) => void,
+  opts?: { summaryIsDeterministic?: boolean },
 ): Promise<{
   writtenPaths: string[]
   completedInputPaths: string[]
@@ -2301,7 +2742,17 @@ async function writeFileBlocks(
     // step ~45% of generated entity pages went to disk with
     // unparseable frontmatter and the read-time fallback had to
     // paper over it forever.
-    let content = sanitizeIngestedFileContent(rawContent)
+    // qa-split question/section pages (F3, 2026-10-12 审查): body is a
+    // verbatim slice of the source document (零改写红线) — skip the body
+    // wikilink normalization; the remaining sanitize steps only touch
+    // frontmatter / wrapper shapes, which are no-ops for code-generated
+    // pages. A post-write read-back re-check closes the loop.
+    const isQaSplitVerbatimPage =
+      relativePath.startsWith("wiki/questions/") ||
+      relativePath.startsWith("wiki/sections/")
+    let content = sanitizeIngestedFileContent(rawContent, {
+      keepBodyVerbatim: isQaSplitVerbatimPage,
+    })
     if (isLogPath(relativePath)) {
       content = stampGeneratedLogDate(content, today)
     } else if (!isListingPath(relativePath)) {
@@ -2379,12 +2830,30 @@ async function writeFileBlocks(
         const appended = existing ? `${existing}\n\n${content.trim()}` : content.trim()
         await writeFile(fullPath, appended)
       } else if (
-        isListingPath(relativePath)
+        isListingPath(relativePath) ||
+        relativePath.startsWith("wiki/questions/") ||
+        relativePath.startsWith("wiki/sections/") ||
+        (opts?.summaryIsDeterministic &&
+          sourceSummaryPath != null &&
+          relativePath === sourceSummaryPath)
       ) {
         // Listing pages (index / overview) are always overwritten
         // wholesale — their sources field is incidental and merging
         // wouldn't make semantic sense (they aren't source-derived
         // content pages).
+        // qa-split question/section pages are the same kind of
+        // deterministic product: re-split = regenerate. The merge
+        // path locks frontmatter title/created to the existing page,
+        // which welds a previous split's stale title onto the new
+        // body (天风 7-3 re-split 2026-10-12: body showed the new
+        // boundary while title still named the old false boundary).
+        // F2 (2026-10-12 审查): the qa-split sources summary page gets
+        // the same treatment — its title carries the live split count
+        // (`qa-split H2·3题`), and merge-locking title kept stale
+        // counts after re-splits (同病根，天风修复轮只覆盖了
+        // question/section). Opt-in via summaryIsDeterministic so
+        // the归纳式 ingest summary pages keep their multi-source
+        // merge semantics.
         await writeFile(fullPath, content)
       } else {
         // Content pages (entities / concepts / queries / synthesis /

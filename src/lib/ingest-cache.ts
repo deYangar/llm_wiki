@@ -11,6 +11,12 @@ interface CacheEntry {
   hash: string
   timestamp: number
   filesWritten: string[]
+  /**
+   * Ingest mode that produced this entry: "summarize" (inductive LLM
+   * pipeline) or "qa-split" (W7 deterministic question splitter). Entries
+   * written before the field existed are summarize products.
+   */
+  mode?: string
 }
 
 interface CacheData {
@@ -68,10 +74,14 @@ export async function checkIngestCache(
   projectPath: string,
   sourceFileName: string,
   sourceContent: string,
+  mode: string = "summarize",
 ): Promise<string[] | null> {
   const cache = await loadCache(projectPath)
   const entry = cache.entries[sourceFileName]
   if (!entry) return null
+  // Mode isolation: a summarize entry never satisfies a qa-split request and
+  // vice versa — the two pipelines produce different file sets.
+  if ((entry.mode ?? "summarize") !== mode) return null
 
   const currentHash = await sha256(sourceContent)
   if (entry.hash !== currentHash) return null
@@ -106,6 +116,7 @@ export async function saveIngestCache(
   sourceFileName: string,
   sourceContent: string,
   filesWritten: string[],
+  mode: string = "summarize",
 ): Promise<void> {
   const cache = await loadCache(projectPath)
   const hash = await sha256(sourceContent)
@@ -114,6 +125,7 @@ export async function saveIngestCache(
     hash,
     timestamp: Date.now(),
     filesWritten,
+    mode,
   }
   await saveCache(projectPath, { entries: newEntries })
 }
