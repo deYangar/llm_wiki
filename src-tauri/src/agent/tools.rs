@@ -684,7 +684,11 @@ pub fn write_wiki_page_verified(
     })
 }
 
-fn write_wiki_page_with_activity(
+/// Full-guarded wiki page write (global write lock, path sandbox, atomic
+/// replace, read-back verification, rollback, file-history versioning).
+/// `pub(crate)` so the API server's field-level frontmatter PATCH endpoint
+/// can persist through the exact same guard rails.
+pub(crate) fn write_wiki_page_with_activity(
     project_path: &str,
     rel_path: &str,
     content: &str,
@@ -1000,6 +1004,8 @@ pub async fn run_wiki_search(
         top_k,
         include_content,
         query_embedding,
+        None,
+        0,
     )
     .await?;
     let project_for_context = project_path.clone();
@@ -2434,42 +2440,18 @@ fn extract_wikilinks(content: &str) -> Vec<String> {
     links
 }
 
+/// Frontmatter list extraction used by the agent wiki tools. The parser
+/// lives in `crate::frontmatter` (shared with the API server retrieval
+/// paths); this re-export keeps the agent-side call sites and behavior
+/// (empty list for pages without a well-formed block) unchanged.
 fn extract_frontmatter_list(content: &str, key: &str) -> Vec<String> {
-    let normalized = content.replace("\r\n", "\n");
-    let Some(rest) = normalized.strip_prefix("---\n") else {
-        return Vec::new();
-    };
-    let Some(end) = rest.find("\n---") else {
-        return Vec::new();
-    };
-    let prefix = format!("{key}:");
-    let lines: Vec<&str> = rest[..end].lines().collect();
-    for (index, line) in lines.iter().enumerate() {
-        let Some(value) = line.trim().strip_prefix(&prefix) else {
-            continue;
-        };
-        let inline = value.trim();
-        if inline.starts_with('[') && inline.ends_with(']') {
-            return inline[1..inline.len() - 1]
-                .split(',')
-                .map(|item| item.trim().trim_matches(['\'', '"']).to_string())
-                .filter(|item| !item.is_empty())
-                .collect();
-        }
-        let mut values = Vec::new();
-        for next in lines.iter().skip(index + 1) {
-            let trimmed = next.trim();
-            let Some(item) = trimmed.strip_prefix('-') else {
-                break;
-            };
-            let item = item.trim().trim_matches(['\'', '"']);
-            if !item.is_empty() {
-                values.push(item.to_string());
-            }
-        }
-        return values;
+    match crate::frontmatter::split_frontmatter(content) {
+        Some((_, block)) => crate::frontmatter::Frontmatter::parse(block)
+            .get(key)
+            .map(|values| values.to_vec())
+            .unwrap_or_default(),
+        None => Vec::new(),
     }
-    Vec::new()
 }
 
 pub fn read_wiki_page(project_path: &str, rel_path: &str) -> Result<String, String> {

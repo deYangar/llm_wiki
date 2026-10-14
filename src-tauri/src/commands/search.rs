@@ -2,11 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use crate::commands::vectorstore;
+use crate::frontmatter::{Frontmatter, SearchFilter, split_frontmatter};
 use crate::panic_guard::run_guarded_async;
 
 const DEFAULT_RESULTS: usize = 20;
@@ -20,7 +22,13 @@ const TITLE_TOKEN_WEIGHT: f64 = 5.0;
 const CONTENT_TOKEN_WEIGHT: f64 = 1.0;
 const SNIPPET_CONTEXT: usize = 80;
 const SEARCH_EMBEDDING_TIMEOUT_SECS: u64 = 8;
-const MAX_SEARCH_FILES: usize = 10_000;
+// Defensive scan ceiling, NOT a working-set hint: the production library
+// holds 17k+ pages, and WalkDir order is alphabetical — a ceiling below the
+// real corpus silently cuts whole directory ranges (2026-10-12 实测:
+// 10_000 dropped every wiki/questions/ page, so `type:question` filters
+// returned zero while pages/query and /graph saw them all). 50k keeps the
+// runaway-file guard while covering the corpus with headroom.
+const MAX_SEARCH_FILES: usize = 50_000;
 const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
 const MAX_GRAPH_RESULT_RATIO: f64 = 0.30;
 const MAX_GRAPH_SEEDS: usize = 20;
@@ -57,6 +65,14 @@ pub struct ProjectSearchResponse {
     pub token_hits: usize,
     pub vector_hits: usize,
     pub graph_hits: usize,
+    /// Size of the candidate set after frontmatter/path filtering (the
+    /// number the consumer UI renders as "N pages match the constraint").
+    /// Without a filter this is the scanned markdown count.
+    #[serde(default)]
+    pub total_filtered: usize,
+    /// Echo of the request offset applied as the final page slice.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +128,8 @@ pub async fn search_project(
     include_content: Option<bool>,
     query_embedding: Option<Vec<f32>>,
     embedding_config: Option<SearchEmbeddingConfig>,
+    filter: Option<SearchFilter>,
+    offset: Option<usize>,
 ) -> Result<ProjectSearchResponse, String> {
     run_guarded_async("search_project", async move {
         let query_embedding =
@@ -122,6 +140,8 @@ pub async fn search_project(
             top_k.unwrap_or(DEFAULT_RESULTS),
             include_content.unwrap_or(false),
             query_embedding,
+            filter,
+            offset.unwrap_or(0),
         )
         .await
     })
@@ -330,11 +350,21 @@ pub async fn search_project_inner(
     top_k: usize,
     include_content: bool,
     query_embedding: Option<Vec<f32>>,
+    filter: Option<SearchFilter>,
+    offset: usize,
 ) -> Result<ProjectSearchResponse, String> {
     if query.trim().is_empty() {
         return Err("query is required".to_string());
     }
     let limit = top_k.clamp(1, MAX_RESULTS);
+    // An all-empty filter is normalized to None so the no-filter path is
+    // byte-identical to the pre-filter implementation (baseline guarantee).
+    let filter = filter.filter(|f| !f.is_empty());
+    // Page slice [offset, offset+limit): fusion/scoring runs over the whole
+    // window so every page returns a full top_k page, then the final results
+    // skip `offset`. Clamped to the scan ceiling so a pathological offset
+    // can't blow up the vector fetch.
+    let window = offset.saturating_add(limit).min(MAX_SEARCH_FILES);
     let tokens = tokenize_query(&query);
     let effective_tokens = if tokens.is_empty() {
         vec![query.trim().to_lowercase()]
@@ -346,71 +376,137 @@ pub async fn search_project_inner(
     let mut page_paths_by_vector_id = BTreeMap::new();
     let mut legacy_stem_candidates = BTreeMap::<String, Vec<String>>::new();
     let mut graph_pages = BTreeMap::new();
+    let mut total_filtered = 0usize;
 
     let wiki_root = Path::new(&project_path).join("wiki");
     if wiki_root.exists() {
-        let mut searched_files = 0usize;
-        for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file()
-                || !entry
-                    .path()
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-            {
-                continue;
-            }
-            searched_files += 1;
-            if searched_files > MAX_SEARCH_FILES {
-                eprintln!(
-                    "[Search] stopped scanning wiki after {MAX_SEARCH_FILES} markdown files in {project_path}"
+        // F7-a (2026-10-12 审查): collect the scan list first (deterministic
+        // WalkDir order, same MAX_SEARCH_FILES ceiling as the sequential
+        // version), then fan the per-file work — full-text read, frontmatter
+        // filter, tokenize scoring, graph-link extraction — out across the
+        // rayon pool. The per-file pipeline is pure, and results fold back
+        // in walk order, so the (score, path) ranking tie-breaks keep the
+        // sequential semantics exactly; only the elapsed wall time changes
+        // (the single-threaded full-corpus lowercasing/scoring was the
+        // P95 bottleneck).
+        let files: Vec<std::path::PathBuf> = WalkDir::new(&wiki_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            })
+            .take(MAX_SEARCH_FILES)
+            .map(|entry| entry.path().to_path_buf())
+            .collect();
+        if files.len() >= MAX_SEARCH_FILES {
+            eprintln!(
+                "[Search] stopped scanning wiki after {MAX_SEARCH_FILES} markdown files in {project_path}"
+            );
+        }
+        struct ScannedPage {
+            relative_path: String,
+            title: String,
+            links: Vec<String>,
+            content: String,
+            hit: Option<ProjectSearchResult>,
+        }
+        let scanned: Vec<Option<ScannedPage>> = files
+            .into_par_iter()
+            .map(|path| {
+                // With a filter, a 16KB head read decides inclusion before
+                // the full-text read — pages the filter drops never pay for
+                // content IO. A head that shows no closed frontmatter block
+                // falls through to the full read: an over-16KB frontmatter
+                // must not get a page erroneously filter-dropped.
+                let mut head_verified = false;
+                if let Some(filter) = &filter {
+                    if let Ok(Some(fm)) = crate::frontmatter::load_head(&path) {
+                        let rel = relative_to_project(&project_path, &path);
+                        if !filter.matches(&fm, &rel) {
+                            return None;
+                        }
+                        head_verified = true;
+                    }
+                }
+                let content = match fs::read_to_string(&path) {
+                    Ok(content) => content,
+                    Err(_) => return None,
+                };
+                let relative_path = relative_to_project(&project_path, &path);
+                // FILTER BEFORE SCORING: pages failing the frontmatter/path
+                // filter never enter any retrieval lane (token scoring,
+                // vector materialization, graph blending) and never count
+                // toward tokenHits/vectorHits — the constraint threads
+                // through the whole recall chain, it doesn't post-filter
+                // a top-k. The full-text parse only runs when the head
+                // could not parse a closed block (>16KB frontmatter); a
+                // verified head already decided against the identical
+                // bytes.
+                if !head_verified {
+                    if let Some(filter) = &filter {
+                        let fm = split_frontmatter(&content)
+                            .map(|(_, block)| Frontmatter::parse(block))
+                            .unwrap_or_default();
+                        if !filter.matches(&fm, &relative_path) {
+                            return None;
+                        }
+                    }
+                }
+                let title = extract_title(
+                    &content,
+                    path.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
                 );
-                break;
+                let hit = score_file(
+                    &project_path,
+                    &path,
+                    &content,
+                    &effective_tokens,
+                    &query_phrase,
+                    &query,
+                    include_content,
+                );
+                let links = extract_graph_links(&content);
+                Some(ScannedPage {
+                    relative_path,
+                    title,
+                    links,
+                    content,
+                    hit,
+                })
+            })
+            .collect();
+        for page in scanned.into_iter().flatten() {
+            if let Some(vector_id) = vector_page_id(&page.relative_path) {
+                page_paths_by_vector_id.insert(vector_id, page.relative_path.clone());
             }
-            let content = match fs::read_to_string(entry.path()) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            let relative_path = relative_to_project(&project_path, entry.path());
-            if let Some(vector_id) = vector_page_id(&relative_path) {
-                page_paths_by_vector_id.insert(vector_id, relative_path.clone());
-            }
-            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+            if let Some(stem) = std::path::Path::new(&page.relative_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
                 legacy_stem_candidates
                     .entry(stem.to_string())
                     .or_default()
-                    .push(relative_path.clone());
+                    .push(page.relative_path.clone());
             }
-            let title = extract_title(
-                &content,
-                entry
-                    .path()
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default(),
-            );
-            let hit = score_file(
-                &project_path,
-                entry.path(),
-                &content,
-                &effective_tokens,
-                &query_phrase,
-                &query,
-                include_content,
-            );
             graph_pages.insert(
-                normalize_path(&relative_path),
+                normalize_path(&page.relative_path),
                 GraphPage {
-                    path: relative_path,
-                    title,
-                    links: extract_graph_links(&content),
-                    content,
+                    path: page.relative_path.clone(),
+                    title: page.title,
+                    links: page.links,
+                    content: page.content,
                 },
             );
-            if let Some(hit) = hit {
+            if let Some(hit) = page.hit {
                 results.push(hit);
             }
         }
+        total_filtered = graph_pages.len();
     }
     let legacy_page_paths = legacy_stem_candidates
         .into_iter()
@@ -436,8 +532,24 @@ pub async fn search_project_inner(
     let mut vector_hits = 0;
     if let Some(embedding) = query_embedding {
         if !embedding.is_empty() {
-            match search_by_embedding(&project_path, embedding, limit.max(10)).await {
+            match search_by_embedding(&project_path, embedding, window.max(10)).await {
                 Ok(vector_results) => {
+                    // The vector lane must honor the same constraint: keep
+                    // only hits that map back onto a page surviving the
+                    // filter (page_paths_by_vector_id / legacy_page_paths
+                    // are populated strictly from filtered files). Dropped
+                    // hits don't count toward vectorHits either.
+                    let vector_results = if filter.is_some() {
+                        vector_results
+                            .into_iter()
+                            .filter(|vr| {
+                                page_paths_by_vector_id.contains_key(&vr.id)
+                                    || legacy_page_paths.contains_key(&vr.id)
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        vector_results
+                    };
                     vector_hits = vector_results.len();
                     for (idx, vr) in vector_results.iter().enumerate() {
                         vector_rank.insert(vr.id.clone(), idx + 1);
@@ -480,16 +592,26 @@ pub async fn search_project_inner(
     let graph_hits = blend_graph_results(
         &mut results,
         &graph_pages,
-        limit,
+        window,
         vector_hits,
         include_content,
     );
+
+    // Final page slice: skip `offset` ranked results AFTER fusion, so
+    // [offset, offset+top_k) is a true window into the ranked list.
+    if offset > 0 {
+        let skip = offset.min(results.len());
+        results.drain(..skip);
+        results.truncate(limit);
+    }
 
     Ok(ProjectSearchResponse {
         mode: search_mode(token_rank.is_empty(), vector_hits, graph_hits).to_string(),
         token_hits: token_rank.len(),
         vector_hits,
         graph_hits,
+        total_filtered,
+        offset,
         results,
     })
 }
@@ -2235,6 +2357,8 @@ mod tests {
             20,
             false,
             None,
+            None,
+            0,
         )
         .await
         .unwrap();
@@ -2271,6 +2395,8 @@ mod tests {
             10,
             false,
             None,
+            None,
+            0,
         )
         .await
         .unwrap();
@@ -2390,6 +2516,8 @@ mod tests {
             20,
             false,
             None,
+            None,
+            0,
         )
         .await
         .unwrap();
@@ -2419,6 +2547,8 @@ mod tests {
             20,
             false,
             None,
+            None,
+            0,
         )
         .await
         .unwrap();

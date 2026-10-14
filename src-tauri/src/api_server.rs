@@ -436,6 +436,12 @@ fn handle_request(
         (&Method::Post, ["projects", project_id, "pages", "write"]) => {
             handle_write_page(app, project_id, body)
         }
+        (&Method::Patch, ["projects", project_id, "pages", "frontmatter"]) => {
+            handle_patch_frontmatter(app, project_id, body)
+        }
+        (&Method::Post, ["projects", project_id, "pages", "query"]) => {
+            handle_pages_query(app, project_id, body)
+        }
         (&Method::Post, ["projects", project_id, "chat"]) => handle_chat(app, project_id, body),
         (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
             handle_cancel_chat(app, project_id, session_id)
@@ -492,6 +498,14 @@ fn is_token_required_request(method: &Method, path: &str) -> bool {
             parts.as_slice(),
             ["projects", _, "pages", "embed"] | ["projects", _, "pages", "write"]
         )
+        || method == &Method::Patch
+            && matches!(parts.as_slice(), ["projects", _, "pages", "frontmatter"])
+    // F8 (2026-10-12 拍板「读开放、写授权」): read endpoints (search /
+    // graph / pages-query) are token-free; writes (embed / write /
+    // frontmatter) and agent chat stay fail-closed. pages/query was
+    // previously lumped in with the write routes even though search —
+    // which can return full page bodies — was open; query only returns
+    // frontmatter projections.
 }
 
 fn chat_project_id<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
@@ -1909,6 +1923,14 @@ struct SearchRequest {
     top_k: Option<usize>,
     include_content: Option<bool>,
     query_embedding: Option<Vec<f32>>,
+    /// Frontmatter/path constraint applied BEFORE scoring (AND semantics;
+    /// absent members don't filter). Threads through every recall lane.
+    #[serde(default)]
+    filter: Option<crate::frontmatter::SearchFilter>,
+    /// Final page slice applied after fusion ranking. Combined with top_k
+    /// into [offset, offset+top_k).
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1966,6 +1988,268 @@ fn handle_write_page(app: &AppHandle, project_id: &str, body: &str) -> ApiRespon
             err(status, error)
         }
     }
+}
+
+/// Field-level frontmatter read-modify-write for batch tagging.
+///
+/// Semantics (plan W4): `remove_keys` then `set` then `merge_tags`;
+/// `merge_tags` is a union so reruns are idempotent; when the re-rendered
+/// block is byte-identical to the original the endpoint reports
+/// `changed=false` and touches neither disk nor file history. Pages whose
+/// frontmatter contains shapes outside the schema value domain are
+/// rejected 422 with the offending keys — batch producers must see broken
+/// pages explicitly instead of silently losing nested data on rewrite.
+#[derive(Deserialize)]
+struct PatchFrontmatterRequest {
+    path: String,
+    #[serde(default)]
+    set: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    merge_tags: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    #[serde(default)]
+    remove_keys: Option<Vec<String>>,
+}
+
+fn handle_patch_frontmatter(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let req: PatchFrontmatterRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    patch_frontmatter_inner(&project.path, req)
+}
+
+fn patch_frontmatter_inner(project_path: &str, req: PatchFrontmatterRequest) -> ApiResponse {
+    if req.path.trim().is_empty() {
+        return err(400, "path is required");
+    }
+    let set = req.set.unwrap_or_default();
+    let merge_tags = req.merge_tags.unwrap_or_default();
+    let remove_keys = req.remove_keys.unwrap_or_default();
+    if set.is_empty() && merge_tags.is_empty() && remove_keys.is_empty() {
+        return err(400, "nothing to change: set, merge_tags and remove_keys are all empty");
+    }
+    // Pre-checks classify sandbox violations (403) before existence (404);
+    // the write itself goes through the full write guard rails anyway.
+    let normalized = req.path.replace('\\', "/");
+    if !normalized.to_ascii_lowercase().starts_with("wiki/") {
+        return err(403, "path must stay under wiki/");
+    }
+    let abs = match safe_join(project_path, &normalized) {
+        Ok(abs) => abs,
+        Err(_) => return err(403, "path escapes the project sandbox"),
+    };
+    if !abs.is_file() {
+        return err(404, format!("page not found: {}", req.path));
+    }
+    let raw = match fs::read_to_string(&abs) {
+        Ok(content) => content,
+        Err(e) => return err(500, format!("Failed to read page: {e}")),
+    };
+    // F6: remember the BOM so the write puts it back — dropping it would
+    // surface as a spurious extra hunk in every first PATCH diff.
+    let had_bom = raw.starts_with('\u{feff}');
+    let original = raw.strip_prefix('\u{feff}').unwrap_or(&raw).to_string();
+    let (body_start, original_block, mut fm) =
+        match crate::frontmatter::split_frontmatter(&original) {
+            Some((body_start, block)) => (
+                Some(body_start),
+                block.to_string(),
+                crate::frontmatter::Frontmatter::parse(block),
+            ),
+            None => (None, String::new(), crate::frontmatter::Frontmatter::default()),
+        };
+    if !fm.skipped_lines().is_empty() {
+        return err(
+            422,
+            format!(
+                "frontmatter contains keys outside the schema value domain (strings / string lists); refusing to rewrite: {}",
+                fm.skipped_lines().join(", ")
+            ),
+        );
+    }
+    for key in &remove_keys {
+        fm.remove_key(key);
+    }
+    for (key, value) in &set {
+        fm.set_scalar(key, value);
+    }
+    for (key, items) in &merge_tags {
+        fm.merge_list(key, items);
+    }
+    let tags_after = fm.get("tags").map(|tags| tags.to_vec()).unwrap_or_default();
+    let rendered = fm.render();
+    // F5 (2026-10-12 拍板): semantic idempotency — compare parsed
+    // (key, values) pairs instead of the serialized text, so a pure
+    // re-serialization (inline `tags: [a, b]` → block form) with zero
+    // semantic change neither writes to disk nor records a version.
+    if body_start.is_some()
+        && crate::frontmatter::Frontmatter::parse(&original_block).semantic_pairs()
+            == fm.semantic_pairs()
+    {
+        // Idempotent rerun: nothing changed on disk, no version recorded.
+        return ok(json!({
+            "ok": true,
+            "path": req.path,
+            "tagsAfter": tags_after,
+            "changed": false,
+        }));
+    }
+    let new_content = match body_start {
+        Some(start) => format!("{}---\n{rendered}---\n{}", if had_bom { "\u{feff}" } else { "" }, &original[start..]),
+        None => format!("{}---\n{rendered}---\n\n{original}", if had_bom { "\u{feff}" } else { "" }),
+    };
+    match agent::tools::write_wiki_page_with_activity(project_path, &normalized, &new_content, true)
+    {
+        Ok(_) => ok(json!({
+            "ok": true,
+            "path": req.path,
+            "tagsAfter": tags_after,
+            "changed": true,
+        })),
+        Err(error) => {
+            let lower = error.to_ascii_lowercase();
+            let status = if lower.contains("sandbox")
+                || lower.contains("escapes")
+                || lower.contains("outside")
+                || lower.contains("symlink")
+            {
+                403
+            } else if lower.contains("too large") || lower.contains("markdown file") {
+                400
+            } else {
+                500
+            };
+            err(status, error)
+        }
+    }
+}
+
+/// Structured page enumeration for mirror syncs and coverage stats
+/// (plan W5). Returns projected frontmatter fields — never page content —
+/// ordered stably for consistent pagination.
+#[derive(Deserialize)]
+struct PagesQueryRequest {
+    #[serde(default)]
+    filter: Option<crate::frontmatter::SearchFilter>,
+    #[serde(default)]
+    fields: Option<Vec<String>>,
+    #[serde(default)]
+    order_by: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+fn handle_pages_query(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let req: PagesQueryRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    pages_query_inner(&project.path, req)
+}
+
+fn pages_query_inner(project_path: &str, req: PagesQueryRequest) -> ApiResponse {
+    let order_by = match req.order_by.as_deref() {
+        None | Some("path") => "path",
+        Some("title") => "title",
+        Some(other) => return err(400, format!("order_by must be \"path\" or \"title\", got \"{other}\"")),
+    };
+    let limit = req.limit.unwrap_or(200).clamp(1, 500);
+    let offset = req.offset.unwrap_or(0);
+    let filter = req.filter.filter(|f| !f.is_empty());
+
+    let wiki_root = Path::new(project_path).join("wiki");
+    if !wiki_root.exists() {
+        return ok(json!({ "ok": true, "total": 0, "hasMore": false, "items": [] }));
+    }
+    // F7 (G5): the per-page work (16KB head read + parse + filter match) is
+    // pure and independent — fan it out across the rayon pool like the
+    // search scan. The result order is fully determined by the sort below
+    // (path / title with a path tie-break), so parallel collection keeps
+    // the response byte-identical; only the wall time changes (the serial
+    // full-corpus head read was the >500ms bottleneck on 17k pages).
+    let files: Vec<std::path::PathBuf> = WalkDir::new(&wiki_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|s| s.to_str()) == Some("md")
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    let mut entries: Vec<(String, crate::frontmatter::Frontmatter)> = files
+        .into_par_iter()
+        .filter_map(|path| {
+            let rel_path = relative_to_project(project_path, &path);
+            let fm = crate::frontmatter::load_head(&path)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if let Some(filter) = &filter {
+                if !filter.matches(&fm, &rel_path) {
+                    return None;
+                }
+            }
+            Some((rel_path, fm))
+        })
+        .collect();
+    let total = entries.len();
+    match order_by {
+        "title" => entries.sort_by(|(path_a, fm_a), (path_b, fm_b)| {
+            let title_of = |fm: &crate::frontmatter::Frontmatter, path: &str| {
+                fm.get("title")
+                    .and_then(|values| values.first().cloned())
+                    .unwrap_or_else(|| path.to_string())
+            };
+            title_of(fm_a, path_a)
+                .cmp(&title_of(fm_b, path_b))
+                .then_with(|| path_a.cmp(path_b))
+        }),
+        _ => entries.sort_by(|(path_a, _), (path_b, _)| path_a.cmp(path_b)),
+    }
+    let has_more = offset.saturating_add(limit) < total;
+    let items: Vec<Value> = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(path, fm)| {
+            let mut fields = serde_json::Map::new();
+            for (key, values, is_scalar) in fm.iter_fields() {
+                if let Some(wanted) = &req.fields {
+                    if !wanted.iter().any(|k| k == key) {
+                        continue;
+                    }
+                }
+                let value = if is_scalar && values.len() <= 1 {
+                    match values.first() {
+                        Some(scalar) => Value::String(scalar.clone()),
+                        None => Value::String(String::new()),
+                    }
+                } else {
+                    Value::Array(
+                        values.iter().map(|v| Value::String(v.clone())).collect(),
+                    )
+                };
+                fields.insert(key.to_string(), value);
+            }
+            json!({ "path": path, "fields": Value::Object(fields) })
+        })
+        .collect();
+    ok(json!({
+        "ok": true,
+        "total": total,
+        "hasMore": has_more,
+        "items": items,
+    }))
 }
 
 struct PageEmbedSlot;
@@ -2041,6 +2325,7 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
         return err(400, "query is required");
     }
     let top_k = req.top_k.unwrap_or(10).clamp(1, MAX_SEARCH_RESULTS);
+    let offset = req.offset.unwrap_or(0);
     let query = req.query;
     let query_embedding =
         match tauri::async_runtime::block_on(commands::search::resolve_query_embedding(
@@ -2057,6 +2342,8 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
         top_k,
         req.include_content.unwrap_or(false),
         query_embedding,
+        req.filter,
+        offset,
     )) {
         Ok(search) => ok(json!({
             "ok": true,
@@ -2066,6 +2353,8 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
             "tokenHits": search.token_hits,
             "vectorHits": search.vector_hits,
             "graphHits": search.graph_hits,
+            "totalFiltered": search.total_filtered,
+            "offset": search.offset,
             "results": search.results,
         })),
         Err(e) => err(500, e),
@@ -2566,6 +2855,11 @@ struct ApiGraphNode {
     node_type: String,
     path: String,
     link_count: usize,
+    /// Frontmatter `tags` of the underlying page (empty for pages without
+    /// a well-formed block). Powers the `tag` query filter so consumers can
+    /// pull related nodes by tag prefix instead of wikilinks only.
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2584,6 +2878,19 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
     let params = parse_query(query);
     let q = params.get("q").map(|s| s.to_lowercase());
     let node_type = params.get("nodeType").map(|s| s.to_lowercase());
+    // Comma-separated tag patterns, AND semantics, trailing `*` = prefix
+    // match. Filtered AFTER q/nodeType and BEFORE the pagination slice;
+    // `total` reports the post-tag-filter node count.
+    let tag_patterns: Option<Vec<String>> = params
+        .get("tag")
+        .map(|raw| {
+            raw.split(',')
+                .map(|pattern| pattern.trim())
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|patterns| !patterns.is_empty());
     let limit = params
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
@@ -2601,6 +2908,7 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
                 &snapshot.edges,
                 q.as_deref(),
                 node_type.as_deref(),
+                tag_patterns.as_deref(),
                 offset,
                 limit,
             );
@@ -2684,7 +2992,9 @@ const MAX_GRAPH_EDGES_PER_RESPONSE: usize = 20_000;
 /// /graph query semantics.
 ///
 /// Filtering: `q` (pre-lowercased) matches id/label/path substring;
-/// `node_type` (pre-lowercased) matches equality.
+/// `node_type` (pre-lowercased) matches equality; `tag_patterns` (already
+/// split on commas) all must hit the node's frontmatter tags — element
+/// level, exact or trailing-`*` prefix.
 ///
 /// Pagination: nodes are the filtered list sliced to
 /// `[offset, offset+limit)`, with `total` reporting the pre-slice count so
@@ -2702,29 +3012,39 @@ fn filter_graph<'a>(
     edges: &'a [OwnedGraphEdge],
     q: Option<&str>,
     node_type: Option<&str>,
+    tag_patterns: Option<&[String]>,
     offset: usize,
     limit: usize,
 ) -> GraphQueryResult<'a> {
+    let tag_matches = |n: &ApiGraphNode| match tag_patterns {
+        Some(patterns) if !patterns.is_empty() => patterns.iter().all(|pattern| {
+            crate::frontmatter::SearchFilter::tag_pattern_matches(pattern, &n.tags)
+        }),
+        _ => true,
+    };
     let matches_query = |n: &ApiGraphNode| match (q, node_type) {
         (Some(q), Some(node_type)) => {
             (n.id.to_lowercase().contains(q)
                 || n.label.to_lowercase().contains(q)
                 || n.path.to_lowercase().contains(q))
                 && n.node_type == node_type
+                && tag_matches(n)
         }
         (Some(q), None) => {
-            n.id.to_lowercase().contains(q)
+            (n.id.to_lowercase().contains(q)
                 || n.label.to_lowercase().contains(q)
-                || n.path.to_lowercase().contains(q)
+                || n.path.to_lowercase().contains(q))
+                && tag_matches(n)
         }
-        (None, Some(node_type)) => n.node_type == node_type,
-        (None, None) => true,
+        (None, Some(node_type)) => n.node_type == node_type && tag_matches(n),
+        (None, None) => tag_matches(n),
     };
     // Unfiltered queries keep the snapshot's own ordering, so the page
     // window is a straight slice of `nodes` (zero-copy) and the
     // precomputed min_index is the filtered position as-is; filtered
     // queries collect an owned subset and build an id→index map.
-    let unfiltered = q.is_none() && node_type.is_none();
+    let unfiltered =
+        q.is_none() && node_type.is_none() && tag_patterns.is_none_or(|p| p.is_empty());
     let (page_nodes, total, filtered): (PageNodes<'a>, usize, Option<Vec<&'a ApiGraphNode>>) =
         if unfiltered {
             let total = nodes.len();
@@ -2974,7 +3294,7 @@ fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdg
         })
         .map(|entry| entry.path().to_path_buf())
         .collect();
-    let parsed: Vec<Option<(String, String, String, String, Vec<String>)>> = files
+    let parsed: Vec<Option<(String, String, String, String, Vec<String>, Vec<String>)>> = files
         .par_iter()
         .map(|path| {
             let content = fs::read_to_string(path).ok()?;
@@ -2989,12 +3309,19 @@ fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdg
             let node_type = extract_type(&content);
             let rel_path = relative_to_project(project_path, path);
             let links = commands::search::extract_graph_links(&content);
-            Some((id, title, node_type, rel_path, links))
+            // Tags come from the same already-read content — no extra head
+            // read per page, so the graph build cost is unaffected.
+            let tags = crate::frontmatter::split_frontmatter(&content)
+                .map(|(_, block)| crate::frontmatter::Frontmatter::parse(block))
+                .and_then(|fm| fm.get("tags").map(|tags| tags.to_vec()))
+                .unwrap_or_default();
+            Some((id, title, node_type, rel_path, links, tags))
         })
         .collect();
-    let mut raw: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
-    for (id, title, node_type, rel_path, links) in parsed.into_iter().flatten() {
-        raw.insert(id, (title, node_type, rel_path, links));
+    let mut raw: BTreeMap<String, (String, String, String, Vec<String>, Vec<String>)> =
+        BTreeMap::new();
+    for (id, title, node_type, rel_path, links, tags) in parsed.into_iter().flatten() {
+        raw.insert(id, (title, node_type, rel_path, links, tags));
     }
     let ids: BTreeSet<String> = raw.keys().cloned().collect();
     // Precomputed lookup tables for resolve_link. The original form ran a
@@ -3014,7 +3341,7 @@ fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdg
     let mut link_count: BTreeMap<String, usize> = raw.keys().map(|id| (id.clone(), 0)).collect();
     let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
-    for (source, (_, _, _, links)) in &raw {
+    for (source, (_, _, _, links, _)) in &raw {
         for link in links {
             let Some(target) = resolve_link(link, &ids, &by_lower, &by_norm) else {
                 continue;
@@ -3040,13 +3367,14 @@ fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdg
     }
     let nodes = raw
         .into_iter()
-        .filter(|(_, (_, node_type, _, _))| node_type != "query")
-        .map(|(id, (label, node_type, path, _))| ApiGraphNode {
+        .filter(|(_, (_, node_type, _, _, _))| node_type != "query")
+        .map(|(id, (label, node_type, path, _, tags))| ApiGraphNode {
             link_count: *link_count.get(&id).unwrap_or(&0),
             id,
             label,
             node_type,
             path,
+            tags,
         })
         .collect();
     Ok((nodes, edges))
@@ -3925,9 +4253,19 @@ mod tests {
             &Method::Post,
             "/api/v1/projects/current/chat"
         ));
+        assert!(is_token_required_request(
+            &Method::Patch,
+            "/api/v1/projects/current/pages/frontmatter"
+        ));
         assert!(!is_token_required_request(
             &Method::Post,
             "/api/v1/projects/current/search"
+        ));
+        // F8「读开放、写授权」: pages/query is a read (frontmatter
+        // projections only) — token-free like search and graph.
+        assert!(!is_token_required_request(
+            &Method::Post,
+            "/api/v1/projects/current/pages/query"
         ));
         assert!(!is_token_required_request(
             &Method::Get,
@@ -4212,7 +4550,7 @@ mod tests {
     // Golden serialization of the fixture below (nodes JSON + edges JSON),
     // pinned by graph_fixture_snapshot_is_byte_stable.
 
-    const GRAPH_FIXTURE_SNAPSHOT: &str = "[{\"id\":\"attention\",\"label\":\"attention\",\"nodeType\":\"note\",\"path\":\"wiki/sub/attention.md\",\"linkCount\":3},{\"id\":\"gpu-cluster\",\"label\":\"gpu cluster\",\"nodeType\":\"hardware\",\"path\":\"wiki/gpu-cluster.md\",\"linkCount\":1},{\"id\":\"transformer\",\"label\":\"Transformer 模型\",\"nodeType\":\"other\",\"path\":\"wiki/transformer.md\",\"linkCount\":1},{\"id\":\"检索\",\"label\":\"检索\",\"nodeType\":\"workflow\",\"path\":\"wiki/检索.md\",\"linkCount\":2}]\n[{\"source\":\"attention\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"gpu-cluster\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"query-hub\",\"target\":\"attention\",\"weight\":1.0},{\"source\":\"transformer\",\"target\":\"attention\",\"weight\":1.0}]";
+    const GRAPH_FIXTURE_SNAPSHOT: &str = "[{\"id\":\"attention\",\"label\":\"attention\",\"nodeType\":\"note\",\"path\":\"wiki/sub/attention.md\",\"linkCount\":3,\"tags\":[]},{\"id\":\"gpu-cluster\",\"label\":\"gpu cluster\",\"nodeType\":\"hardware\",\"path\":\"wiki/gpu-cluster.md\",\"linkCount\":1,\"tags\":[]},{\"id\":\"transformer\",\"label\":\"Transformer 模型\",\"nodeType\":\"other\",\"path\":\"wiki/transformer.md\",\"linkCount\":1,\"tags\":[\"topic:检索\"]},{\"id\":\"检索\",\"label\":\"检索\",\"nodeType\":\"workflow\",\"path\":\"wiki/检索.md\",\"linkCount\":2,\"tags\":[\"topic:检索\",\"role:业务\"]}]\n[{\"source\":\"attention\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"gpu-cluster\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"query-hub\",\"target\":\"attention\",\"weight\":1.0},{\"source\":\"transformer\",\"target\":\"attention\",\"weight\":1.0}]";
 
     //
     // These tests pin the exact build_graph/filter_graph behavior that the
@@ -4246,15 +4584,17 @@ mod tests {
         .unwrap();
         fs::write(
             wiki.join("transformer.md"),
-            "# Transformer 模型\n\nBased on [[attention]].\n",
+            "---\ntags: [\"topic:检索\"]\n---\n# Transformer 模型\n\nBased on [[attention]].\n",
         )
         .unwrap();
         fs::write(wiki.join("query-hub.md"), "type: query\n\n[[attention]]\n").unwrap();
         fs::write(
             wiki.join("检索.md"),
-            "---\ntype: workflow\n---\n相关 [[Attention 机制]]。\n",
+            "---\ntype: workflow\ntags:\n  - \"topic:检索\"\n  - \"role:业务\"\n---\n相关 [[Attention 机制]]。\n",
         )
         .unwrap();
+        // No fence, bare `type:` line — tags degrade to [] (honest fallback
+        // for the no-frontmatter shape the writer pipeline has to seal).
         fs::write(wiki.join("gpu-cluster.md"), "type: hardware\n\n[[检索]]\n").unwrap();
         fs::write(wiki.join("ignore.txt"), "type: other\n[[attention]]\n").unwrap();
     }
@@ -4291,6 +4631,15 @@ mod tests {
         assert_eq!(node("gpu-cluster").label, "gpu cluster"); // '-' -> ' '
         assert_eq!(node("gpu-cluster").node_type, "hardware");
         assert_eq!(node("gpu-cluster").link_count, 1);
+        // Tags are carried from frontmatter (both list styles land as
+        // element arrays); fence-less pages degrade to [].
+        assert_eq!(
+            node("检索").tags,
+            vec!["topic:检索".to_string(), "role:业务".to_string()]
+        );
+        assert_eq!(node("transformer").tags, vec!["topic:检索".to_string()]);
+        assert_eq!(node("gpu-cluster").tags, Vec::<String>::new());
+        assert_eq!(attention.tags, Vec::<String>::new());
         assert_eq!(node("transformer").label, "Transformer 模型");
         assert_eq!(node("transformer").node_type, "other");
         assert_eq!(node("transformer").link_count, 1);
@@ -4344,7 +4693,7 @@ mod tests {
         // Full page: same nodes/edges the v0.6.11 single-page response
         // returned (query-hub edge drops because its source node was
         // filtered out at build time), plus the new paging metadata.
-        let r = filter_graph(&nodes, &edges, None, None, 0, 200);
+        let r = filter_graph(&nodes, &edges, None, None, None, 0, 200);
         assert_eq!(r.total, 4);
         assert_eq!(
             r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
@@ -4360,7 +4709,7 @@ mod tests {
         // Truncated page keeps edges whose far endpoint fell outside the
         // window (the v0.6.11 symptom 6 fix): both 检索 edges survive even
         // though 检索 itself is on the next page.
-        let r = filter_graph(&nodes, &edges, None, None, 0, 3);
+        let r = filter_graph(&nodes, &edges, None, None, None, 0, 3);
         assert_eq!(
             r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["attention", "gpu-cluster", "transformer"]
@@ -4375,7 +4724,7 @@ mod tests {
         // Second (last) page owns no edges: every edge's lower-indexed
         // endpoint lives on page one. Union of both pages reassembles the
         // full graph — no duplicate, no drop.
-        let r2 = filter_graph(&nodes, &edges, None, None, 3, 200);
+        let r2 = filter_graph(&nodes, &edges, None, None, None, 3, 200);
         assert_eq!(
             r2.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["检索"]
@@ -4384,23 +4733,23 @@ mod tests {
         assert!(pairs(&r2).is_empty());
 
         // Offset beyond total: empty page, not an error.
-        let r3 = filter_graph(&nodes, &edges, None, None, 40, 200);
+        let r3 = filter_graph(&nodes, &edges, None, None, None, 40, 200);
         assert!(r3.nodes.as_slice().is_empty());
         assert_eq!(r3.total, 4);
 
         // nodeType filter: single node, every edge loses an endpoint to the
         // filter, so no edges come back.
-        let r = filter_graph(&nodes, &edges, None, Some("note"), 0, 200);
+        let r = filter_graph(&nodes, &edges, None, Some("note"), None, 0, 200);
         assert_eq!(r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
         assert_eq!(r.total, 1);
         assert!(r.edges.is_empty());
 
         // q matches id (attention contains "att").
-        let r = filter_graph(&nodes, &edges, Some("att"), None, 0, 200);
+        let r = filter_graph(&nodes, &edges, Some("att"), None, None, 0, 200);
         assert_eq!(r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["attention"]);
 
         // q matches label ("gpu cluster" contains "cluster").
-        let r = filter_graph(&nodes, &edges, Some("cluster"), None, 0, 200);
+        let r = filter_graph(&nodes, &edges, Some("cluster"), None, None, 0, 200);
         assert_eq!(
             r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["gpu-cluster"]
@@ -4408,7 +4757,7 @@ mod tests {
 
         // q now also matches path: "sub" only appears in
         // wiki/sub/attention.md, a recall the id/label-only match missed.
-        let r = filter_graph(&nodes, &edges, Some("sub"), None, 0, 200);
+        let r = filter_graph(&nodes, &edges, Some("sub"), None, None, 0, 200);
         assert_eq!(
             r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["attention"]
@@ -4416,9 +4765,9 @@ mod tests {
 
         // q + nodeType must both hold: "att" matches attention's id, but
         // the node_type mismatch excludes it (guards the && vs || pitfall).
-        let r = filter_graph(&nodes, &edges, Some("att"), Some("hardware"), 0, 200);
+        let r = filter_graph(&nodes, &edges, Some("att"), Some("hardware"), None, 0, 200);
         assert!(r.nodes.as_slice().is_empty());
-        let r = filter_graph(&nodes, &edges, Some("att"), Some("note"), 0, 200);
+        let r = filter_graph(&nodes, &edges, Some("att"), Some("note"), None, 0, 200);
         assert_eq!(
             r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             vec!["attention"]
@@ -4608,7 +4957,7 @@ mod tests {
         let path = root.to_string_lossy().to_string();
         let (nodes, raw_edges) = build_graph(&path).unwrap();
         let edges = own_edges(&nodes, raw_edges);
-        let full = filter_graph(&nodes, &edges, None, None, 0, 1000);
+        let full = filter_graph(&nodes, &edges, None, None, None, 0, 1000);
         assert_eq!(full.total, 151);
         assert_eq!(full.edges.len(), 300);
 
@@ -4618,7 +4967,7 @@ mod tests {
         let mut got_edges: Vec<(String, String)> = Vec::new();
         let mut offset = 0;
         loop {
-            let r = filter_graph(&nodes, &edges, None, None, offset, 40);
+            let r = filter_graph(&nodes, &edges, None, None, None, offset, 40);
             got_ids.extend(r.nodes.as_slice().iter().map(|n| n.id.clone()));
             got_edges.extend(r.edges.iter().map(|e| (e.source.clone(), e.target.clone())));
             let consumed = offset + r.nodes.as_slice().len();
@@ -4639,6 +4988,557 @@ mod tests {
             .collect();
         let got_set: BTreeSet<(String, String)> = got_edges.into_iter().collect();
         assert_eq!(got_set, full_pairs);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ── Plan W2/W3/W4/W5: frontmatter filter, graph tags, PATCH, query ──
+
+    use crate::frontmatter::SearchFilter;
+
+    fn write_search_fixture(root: &Path) {
+        let wiki = root.join("wiki").join("cases");
+        fs::create_dir_all(&wiki).unwrap();
+        fs::write(
+            wiki.join("a.md"),
+            "---\ntype: case\ntitle: 收入确认A\nyear: 2025\ntags: [\"topic:收入确认\"]\n---\n# 收入确认A\n\n寄售模式 收入确认 时点。",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("b.md"),
+            "---\ntype: case\ntitle: 收入确认时点B\nyear: 2024\ntags: [\"topic:收入确认时点\"]\n---\n# 收入确认时点B\n\n寄售模式 收入确认。",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("c.md"),
+            "---\ntype: case\ntitle: 毛利率C\nyear: 2025\ntags: [\"topic:毛利率异常\"]\n---\n# 毛利率C\n\n寄售模式 毛利率。",
+        )
+        .unwrap();
+        fs::write(
+            root.join("wiki").join("d.md"),
+            "---\ntype: issue\ntitle: 其他D\n---\n# 其他D\n\n寄售模式 无关内容。",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_filter_tags_all_exact_and_prefix() {
+        let root = test_project_dir();
+        write_search_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+
+        let exact = commands::search::search_project_inner(
+            path.clone(),
+            "寄售模式".into(),
+            10,
+            false,
+            None,
+            Some(SearchFilter {
+                tags_all: Some(vec!["topic:收入确认".to_string()]),
+                ..Default::default()
+            }),
+            0,
+        )
+        .await
+        .unwrap();
+        // Element-level equality: 收入确认时点 must NOT match 收入确认.
+        assert_eq!(exact.total_filtered, 1);
+        assert_eq!(exact.results.len(), 1);
+        assert!(exact.results[0].path.ends_with("cases/a.md"));
+
+        let prefix = commands::search::search_project_inner(
+            path.clone(),
+            "寄售模式".into(),
+            10,
+            false,
+            None,
+            Some(SearchFilter {
+                tags_all: Some(vec!["topic:收入确认*".to_string()]),
+                ..Default::default()
+            }),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prefix.total_filtered, 2);
+        assert!(prefix.results.iter().all(|r| r.path.ends_with("cases/a.md")
+            || r.path.ends_with("cases/b.md")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn search_filter_runs_before_scoring() {
+        let root = test_project_dir();
+        write_search_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        // 3 case candidates all match the query; top_k=2. totalFiltered
+        // must report the pre-scoring candidate count (3), not the page
+        // length (2) — pinning filter-before-scoring.
+        let out = commands::search::search_project_inner(
+            path,
+            "寄售模式".into(),
+            2,
+            false,
+            None,
+            Some(SearchFilter {
+                r#type: Some("case".to_string()),
+                ..Default::default()
+            }),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.total_filtered, 3);
+        assert_eq!(out.results.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn search_filter_field_eq_year() {
+        let root = test_project_dir();
+        write_search_fixture(&root);
+        let out = commands::search::search_project_inner(
+            root.to_string_lossy().to_string(),
+            "寄售模式".into(),
+            10,
+            false,
+            None,
+            Some(SearchFilter {
+                field_eq: Some(std::collections::BTreeMap::from([(
+                    "year".to_string(),
+                    "2024".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.total_filtered, 1);
+        assert!(out.results[0].path.ends_with("cases/b.md"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn search_filter_empty_matches_baseline() {
+        let root = test_project_dir();
+        write_search_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        let baseline = commands::search::search_project_inner(
+            path.clone(),
+            "寄售模式".into(),
+            10,
+            false,
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        let empty_filter = commands::search::search_project_inner(
+            path,
+            "寄售模式".into(),
+            10,
+            false,
+            None,
+            Some(SearchFilter::default()),
+            0,
+        )
+        .await
+        .unwrap();
+        let paths_of = |r: &commands::search::ProjectSearchResponse| {
+            r.results.iter().map(|x| x.path.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(paths_of(&baseline), paths_of(&empty_filter));
+        assert_eq!(baseline.total_filtered, empty_filter.total_filtered);
+        assert_eq!(baseline.token_hits, empty_filter.token_hits);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn search_offset_pagination() {
+        let root = test_project_dir();
+        write_search_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        let filter = Some(SearchFilter {
+            r#type: Some("case".to_string()),
+            ..Default::default()
+        });
+        let page1 = commands::search::search_project_inner(
+            path.clone(),
+            "寄售模式".into(),
+            2,
+            false,
+            None,
+            filter.clone(),
+            0,
+        )
+        .await
+        .unwrap();
+        let page2 = commands::search::search_project_inner(
+            path.clone(),
+            "寄售模式".into(),
+            2,
+            false,
+            None,
+            filter.clone(),
+            2,
+        )
+        .await
+        .unwrap();
+        let page3 = commands::search::search_project_inner(path, "寄售模式".into(), 2, false, None, filter, 4)
+            .await
+            .unwrap();
+        assert_eq!(page1.results.len(), 2);
+        assert_eq!(page1.offset, 0);
+        assert_eq!(page2.results.len(), 1);
+        assert_eq!(page2.offset, 2);
+        assert_eq!(page3.results.len(), 0);
+        // Pages must not overlap and must respect the ranked order.
+        let p1: Vec<&str> = page1.results.iter().map(|r| r.path.as_str()).collect();
+        let p2: Vec<&str> = page2.results.iter().map(|r| r.path.as_str()).collect();
+        assert!(p1.iter().all(|p| !p2.contains(p)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_filter_by_tag_prefix() {
+        let root = test_project_dir();
+        let (nodes, edges) = graph_fixture(&root);
+        let edges = own_edges(&nodes, edges);
+        // Serialized nodes must all carry the new tags field (W3 contract).
+        for node in &nodes {
+            let raw = serde_json::to_value(node).unwrap();
+            assert!(raw.get("tags").is_some(), "node {} missing tags", node.id);
+        }
+        let patterns = vec!["topic:检索*".to_string()];
+        let r = filter_graph(
+            &nodes,
+            &edges,
+            None,
+            None,
+            Some(&patterns),
+            0,
+            200,
+        );
+        let ids: Vec<&str> = r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["transformer", "检索"]);
+        assert_eq!(r.total, 2);
+        // AND semantics with two patterns: only 检索 carries role:业务.
+        let patterns = vec![
+            "topic:检索*".to_string(),
+            "role:业务".to_string(),
+        ];
+        let r = filter_graph(&nodes, &edges, None, None, Some(&patterns), 0, 200);
+        let ids: Vec<&str> = r.nodes.as_slice().iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["检索"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn patch_req(path: &str, set: &[(&str, &str)], merge: &[(&str, Vec<&str>)], remove: &[&str]) -> PatchFrontmatterRequest {
+        PatchFrontmatterRequest {
+            path: path.to_string(),
+            set: (!set.is_empty()).then(|| {
+                set.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            }),
+            merge_tags: (!merge.is_empty()).then(|| {
+                merge
+                    .iter()
+                    .map(|(k, vs)| {
+                        (
+                            k.to_string(),
+                            vs.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            }),
+            remove_keys: (!remove.is_empty())
+                .then(|| remove.iter().map(|k| k.to_string()).collect::<Vec<_>>()),
+        }
+    }
+
+    #[test]
+    fn patch_merge_tags_idempotent() {
+        let root = test_project_dir();
+        let page = root.join("wiki").join("issues").join("收入确认.md");
+        fs::create_dir_all(page.parent().unwrap()).unwrap();
+        fs::write(
+            &page,
+            "---\ntype: issue\ntitle: 收入确认\ntags:\n  - \"topic:收入确认\"\n---\n\n## 监管关注点\n正文保持不变。",
+        )
+        .unwrap();
+        let path_str = root.to_string_lossy().to_string();
+
+        let first = patch_frontmatter_inner(
+            &path_str,
+            patch_req(
+                "wiki/issues/收入确认.md",
+                &[],
+                &[("tags", vec!["inquiry-stage:交易所首轮问询"])],
+                &[],
+            ),
+        );
+        assert_eq!(first.status, 200);
+        assert_eq!(first.body["changed"], json!(true));
+        assert_eq!(
+            first.body["tagsAfter"],
+            json!(["topic:收入确认", "inquiry-stage:交易所首轮问询"])
+        );
+        let after_first = fs::read_to_string(&page).unwrap();
+
+        let second = patch_frontmatter_inner(
+            &path_str,
+            patch_req(
+                "wiki/issues/收入确认.md",
+                &[],
+                &[("tags", vec!["inquiry-stage:交易所首轮问询"])],
+                &[],
+            ),
+        );
+        assert_eq!(second.status, 200);
+        assert_eq!(second.body["changed"], json!(false), "rerun must be a no-op");
+        assert_eq!(fs::read_to_string(&page).unwrap(), after_first);
+        // Body content below the block is untouched.
+        assert!(after_first.contains("## 监管关注点\n正文保持不变。"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn patch_semantic_no_op_on_inline_list_form_does_not_rewrite() {
+        // F5 (2026-10-12 拍板): a page whose only "change" is the
+        // re-serialization shape (inline `tags: [a, b]` → block form)
+        // must NOT count as a change — no disk write, no version bump.
+        let root = test_project_dir();
+        let page = root.join("wiki").join("cases").join("形态.md");
+        fs::create_dir_all(page.parent().unwrap()).unwrap();
+        let original = "---\ntype: case\ntitle: 形态\ntags: [\"topic:收入\", \"role:财务\"]\n---\n\n## 正文\n不动。";
+        fs::write(&page, original).unwrap();
+        let path_str = root.to_string_lossy().to_string();
+
+        // Merging a tag that is already present: semantics unchanged.
+        let resp = patch_frontmatter_inner(
+            &path_str,
+            patch_req(
+                "wiki/cases/形态.md",
+                &[],
+                &[("tags", vec!["topic:收入"])],
+                &[],
+            ),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body["changed"], json!(false), "pure re-serialization is not a change");
+        assert_eq!(fs::read_to_string(&page).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn patch_preserves_leading_bom() {
+        // F6: the write-back must put the BOM back — dropping it would
+        // show up as a spurious extra hunk in the first PATCH diff.
+        let root = test_project_dir();
+        let page = root.join("wiki").join("issues").join("BOM页.md");
+        fs::create_dir_all(page.parent().unwrap()).unwrap();
+        fs::write(&page, "\u{feff}---\ntype: issue\ntitle: BOM页\n---\n\n## 正文\n内容。").unwrap();
+        let path_str = root.to_string_lossy().to_string();
+
+        let resp = patch_frontmatter_inner(
+            &path_str,
+            patch_req(
+                "wiki/issues/BOM页.md",
+                &[("title", "BOM页-改")],
+                &[],
+                &[],
+            ),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body["changed"], json!(true));
+        let after = fs::read_to_string(&page).unwrap();
+        assert!(after.starts_with("\u{feff}---\n"), "BOM must survive the rewrite");
+        assert!(after.contains("title: BOM页-改"));
+        assert!(after.contains("## 正文\n内容。"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn patch_set_overwrites_and_preserves_other_keys() {
+        let root = test_project_dir();
+        let page = root.join("wiki").join("cases").join("A.md");
+        fs::create_dir_all(page.parent().unwrap()).unwrap();
+        fs::write(
+            &page,
+            "---\ntype: case\ntitle: A案例\ncompany: 某公司\nyear: 2025\ntags: [\"exchange:深交所\"]\n---\n\n正文。",
+        )
+        .unwrap();
+        let resp = patch_frontmatter_inner(
+            &root.to_string_lossy(),
+            patch_req("wiki/cases/A.md", &[("year", "2026"), ("status", "注册生效")], &[], &[]),
+        );
+        assert_eq!(resp.status, 200);
+        let updated = fs::read_to_string(&page).unwrap();
+        assert!(updated.contains("year: 2026"));
+        assert!(updated.contains("status: 注册生效"));
+        // Key order preserved, other keys intact.
+        assert!(updated.contains("company: 某公司"));
+        assert!(updated.contains("tags:"));
+        assert!(updated.contains("\"exchange:深交所\""));
+        assert!(updated.contains("type: case"));
+        assert!(updated.contains("正文。"));
+        // New keys append at the end of the block.
+        let block = updated.split("\n---\n").next().unwrap();
+        assert!(block.trim_end().ends_with("status: 注册生效"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn patch_creates_frontmatter_when_absent() {
+        let root = test_project_dir();
+        let page = root.join("wiki").join("cases").join("裸页.md");
+        fs::create_dir_all(page.parent().unwrap()).unwrap();
+        fs::write(&page, "# 裸页\n\n没有任何 frontmatter 的正文。").unwrap();
+        let resp = patch_frontmatter_inner(
+            &root.to_string_lossy(),
+            patch_req(
+                "wiki/cases/裸页.md",
+                &[("type", "case"), ("title", "裸页")],
+                &[("tags", vec!["topic:收入确认"])],
+                &[],
+            ),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body["changed"], json!(true));
+        let content = fs::read_to_string(&page).unwrap();
+        assert!(content.starts_with("---\n"));
+        assert!(content.contains("type: case"));
+        assert!(content.contains("- \"topic:收入确认\""));
+        // Original body preserved verbatim after the new block.
+        assert!(content.contains("\n---\n\n# 裸页\n\n没有任何 frontmatter 的正文。"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn patch_rejects_path_outside_sandbox_and_missing_page() {
+        let root = test_project_dir();
+        let path_str = root.to_string_lossy().to_string();
+        let outside = patch_frontmatter_inner(
+            &path_str,
+            patch_req("raw/sources/evil.pdf", &[("a", "b")], &[], &[]),
+        );
+        assert_eq!(outside.status, 403);
+        let traversal = patch_frontmatter_inner(
+            &path_str,
+            patch_req("wiki/../../secret.md", &[("a", "b")], &[], &[]),
+        );
+        assert_eq!(traversal.status, 403);
+        let missing = patch_frontmatter_inner(
+            &path_str,
+            patch_req("wiki/cases/不存在.md", &[("a", "b")], &[], &[]),
+        );
+        assert_eq!(missing.status, 404);
+        // Frontmatter outside the schema value domain: refuse, name keys.
+        let page = root.join("wiki").join("cases").join("嵌套.md");
+        fs::create_dir_all(page.parent().unwrap()).unwrap();
+        fs::write(
+            &page,
+            "---\ntype: case\nnested:\n  sub: value\n---\n\n正文。",
+        )
+        .unwrap();
+        let nested = patch_frontmatter_inner(
+            &path_str,
+            patch_req("wiki/cases/嵌套.md", &[("year", "2026")], &[], &[]),
+        );
+        assert_eq!(nested.status, 422);
+        assert!(nested.body["error"].as_str().unwrap().contains("nested"));
+        // And the page must be untouched.
+        assert!(fs::read_to_string(&page).unwrap().contains("sub: value"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn patch_records_file_history() {
+        let root = test_project_dir();
+        fs::create_dir_all(root.join(".llm-wiki")).unwrap();
+        fs::write(
+            root.join(".llm-wiki").join("history-settings.json"),
+            r#"{"enabled":true,"max_versions_per_file":10}"#,
+        )
+        .unwrap();
+        let page = root.join("wiki").join("cases").join("历史.md");
+        fs::create_dir_all(page.parent().unwrap()).unwrap();
+        fs::write(
+            &page,
+            "---\ntype: case\ntitle: 历史\n---\n\n正文。",
+        )
+        .unwrap();
+        let resp = patch_frontmatter_inner(
+            &root.to_string_lossy(),
+            patch_req("wiki/cases/历史.md", &[("year", "2026")], &[], &[]),
+        );
+        assert_eq!(resp.status, 200);
+        let history_dir = root.join(".llm-wiki").join("history");
+        let entries: Vec<_> = std::fs::read_dir(&history_dir)
+            .expect("history dir exists")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(!entries.is_empty(), "file history must record the PATCH");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pages_query_pagination_and_fields_projection() {
+        let root = test_project_dir();
+        write_search_fixture(&root);
+        let path_str = root.to_string_lossy().to_string();
+
+        let resp = pages_query_inner(
+            &path_str,
+            PagesQueryRequest {
+                filter: Some(SearchFilter {
+                    r#type: Some("case".to_string()),
+                    ..Default::default()
+                }),
+                fields: Some(vec![
+                    "title".to_string(),
+                    "year".to_string(),
+                    "tags".to_string(),
+                ]),
+                order_by: Some("path".to_string()),
+                limit: Some(2),
+                offset: Some(0),
+            },
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body["total"], json!(3));
+        assert_eq!(resp.body["hasMore"], json!(true));
+        let items = resp.body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        // path order: a.md first.
+        assert!(items[0]["path"].as_str().unwrap().ends_with("cases/a.md"));
+        let fields = items[0]["fields"].as_object().unwrap();
+        assert_eq!(fields.len(), 3, "projection must drop unrequested keys");
+        assert_eq!(fields["year"], json!("2025"));
+        assert_eq!(fields["tags"], json!(["topic:收入确认"]));
+
+        let page2 = pages_query_inner(
+            &path_str,
+            PagesQueryRequest {
+                filter: Some(SearchFilter {
+                    r#type: Some("case".to_string()),
+                    ..Default::default()
+                }),
+                fields: None,
+                order_by: None,
+                limit: Some(2),
+                offset: Some(2),
+            },
+        );
+        assert_eq!(page2.body["hasMore"], json!(false));
+        let items2 = page2.body["items"].as_array().unwrap();
+        assert_eq!(items2.len(), 1);
+        // fields omitted → full flat-key projection (type included).
+        assert_eq!(items2[0]["fields"]["type"], json!("case"));
+        // No page content ever leaves the endpoint.
+        assert!(serde_json::to_string(&page2.body).unwrap().find("寄售").is_none());
         let _ = fs::remove_dir_all(root);
     }
 }
