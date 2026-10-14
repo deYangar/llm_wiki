@@ -834,7 +834,9 @@
         "scanNow": "Scan Now",
         "scanning": "Scanning...",
         "lastScan": "Last scan: {{time}}",
-        "never": "Never"
+        "never": "Never",
+        "qaSplitLlmFallback": "Q&A split: LLM fallback for hard cases",
+        "qaSplitLlmFallbackHint": "When deterministic rules find no question boundaries (scanned/irregular inquiry-reply files), an LLM proposes boundaries which must pass verbatim mechanical validation before any page is written. Uses the ingest LLM preset."
       },
       "apiServer": {
         "title": "API + MCP",

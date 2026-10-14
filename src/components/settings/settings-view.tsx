@@ -104,6 +104,7 @@ function initialDraft(
   outputLanguage: ReturnType<typeof useWikiStore.getState>["outputLanguage"],
   proxy: ReturnType<typeof useWikiStore.getState>["proxyConfig"],
   scheduledImport: ReturnType<typeof useWikiStore.getState>["scheduledImportConfig"],
+  qaSplit: ReturnType<typeof useWikiStore.getState>["qaSplitConfig"],
   sourceWatch: ReturnType<typeof useWikiStore.getState>["sourceWatchConfig"],
   sourceWatchAllProjects: boolean,
   mineru: ReturnType<typeof useWikiStore.getState>["mineruConfig"],
@@ -169,6 +170,7 @@ function initialDraft(
     scheduledImportEnabled: scheduledImport.enabled,
     scheduledImportPath: displayPath,
     scheduledImportInterval: scheduledImport.interval,
+    qaSplitLlmFallback: qaSplit.llmFallbackEnabled,
     sourceWatchConfig: normalizeSourceWatchConfig(sourceWatch),
     sourceWatchAllProjects,
     mineruEnabled: mineru.enabled,
@@ -215,6 +217,8 @@ export function SettingsView() {
   const setProxyConfig = useWikiStore((s) => s.setProxyConfig)
   const scheduledImportConfig = useWikiStore((s) => s.scheduledImportConfig)
   const setScheduledImportConfig = useWikiStore((s) => s.setScheduledImportConfig)
+  const qaSplitConfig = useWikiStore((s) => s.qaSplitConfig)
+  const setQaSplitConfig = useWikiStore((s) => s.setQaSplitConfig)
   const sourceWatchConfig = useWikiStore((s) => s.sourceWatchConfig)
   const setSourceWatchConfig = useWikiStore((s) => s.setSourceWatchConfig)
   const sourceWatchAllProjects = useWikiStore((s) => s.sourceWatchAllProjects)
@@ -249,6 +253,7 @@ export function SettingsView() {
       outputLanguage,
       proxyConfig,
       scheduledImportConfig,
+      qaSplitConfig,
       sourceWatchConfig,
       sourceWatchAllProjects,
       mineruConfig,
@@ -317,6 +322,7 @@ export function SettingsView() {
         outputLanguage,
         proxyConfig,
         scheduledImportConfig,
+        qaSplitConfig,
         sourceWatchConfig,
         sourceWatchAllProjects,
         mineruConfig,
@@ -336,6 +342,7 @@ export function SettingsView() {
     outputLanguage,
     proxyConfig,
     scheduledImportConfig,
+    qaSplitConfig,
     sourceWatchConfig,
     sourceWatchAllProjects,
     mineruConfig,
@@ -369,6 +376,8 @@ export function SettingsView() {
       loadProxyConfig,
       saveScheduledImportConfig,
       loadScheduledImportConfig,
+      saveQaSplitConfig,
+      loadQaSplitConfig,
       saveSourceWatchConfig,
       saveSourceWatchAllProjects,
       saveMineruConfig,
@@ -435,6 +444,9 @@ export function SettingsView() {
       interval: Math.max(1, Math.min(1440, draft.scheduledImportInterval || 60)),
       lastScan: scheduledImportConfig.lastScan,
     }
+    const newQaSplitConfig = {
+      llmFallbackEnabled: draft.qaSplitLlmFallback,
+    }
     const newMineruConfig = {
       enabled: draft.mineruEnabled,
       backend: draft.mineruBackend,
@@ -477,6 +489,7 @@ export function SettingsView() {
     setSourceWatchAllProjects(draft.sourceWatchAllProjects)
     setIngestWorkerLimit(newSourceWatch.ingestConcurrency)
     setScheduledImportConfig(newScheduledImport)
+    setQaSplitConfig(newQaSplitConfig)
     setMaxHistoryMessages(draft.maxHistoryMessages)
     setMineruConfig(newMineruConfig)
     setApiConfig(newApiConfig)
@@ -529,6 +542,7 @@ export function SettingsView() {
       }
 
       await saveMineruConfig(newMineruConfig)
+      await saveQaSplitConfig(newQaSplitConfig)
 
       // The Rust side reads `apiConfig.{enabled,token,mcpEnabled,allowLanAccess}` from this
       // same `app-state.json` via a 5s cache, so saved changes propagate within
@@ -591,6 +605,7 @@ export function SettingsView() {
           persistedSourceWatch,
           persistedSourceWatchAllProjects,
           persistedScheduledImport,
+          persistedQaSplit,
           persistedMineru,
           persistedApi,
           persistedGeneral,
@@ -604,6 +619,7 @@ export function SettingsView() {
           loadSourceWatchConfig(project?.id),
           loadSourceWatchAllProjects(),
           project ? loadScheduledImportConfig(project.path) : Promise.resolve(null),
+          loadQaSplitConfig(),
           loadMineruConfig(),
           loadApiConfig(),
           loadGeneralConfig(),
@@ -619,6 +635,7 @@ export function SettingsView() {
           resultValue(persistedSourceWatchAllProjects, sourceWatchAllProjects),
         )
         setScheduledImportConfig(resultValue(persistedScheduledImport, null) ?? scheduledImportConfig)
+        setQaSplitConfig(resultValue(persistedQaSplit, qaSplitConfig))
         setMaxHistoryMessages(maxHistoryMessages)
         setMineruConfig(resultValue(persistedMineru, null) ?? mineruConfig)
         setApiConfig(resultValue(persistedApi, null) ?? apiConfig)
@@ -640,6 +657,7 @@ export function SettingsView() {
     sourceWatchConfig,
     sourceWatchAllProjects,
     scheduledImportConfig,
+    qaSplitConfig,
     mineruConfig,
     apiConfig,
     generalConfig,
@@ -650,6 +668,7 @@ export function SettingsView() {
     setOutputLanguage,
     setProxyConfig,
     setScheduledImportConfig,
+    setQaSplitConfig,
     setSourceWatchConfig,
     setSourceWatchAllProjects,
     setMineruConfig,

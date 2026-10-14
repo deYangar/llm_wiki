@@ -171,6 +171,28 @@ export function ScheduledImportSection({ draft, setDraft }: Props) {
         </p>
       </div>
 
+      <div className="space-y-1 border-t pt-4">
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={draft.qaSplitLlmFallback}
+            onChange={(e) => setDraft("qaSplitLlmFallback", e.target.checked)}
+            className="h-4 w-4"
+          />
+          <span className="text-sm">
+            {t("settings.sections.scheduledImport.qaSplitLlmFallback", {
+              defaultValue: "Q&A split: LLM fallback for hard cases",
+            })}
+          </span>
+        </label>
+        <p className="text-xs text-muted-foreground">
+          {t("settings.sections.scheduledImport.qaSplitLlmFallbackHint", {
+            defaultValue:
+              "When deterministic rules find no question boundaries (scanned/irregular inquiry-reply files), an LLM proposes boundaries which must pass verbatim mechanical validation before any page is written. Uses the ingest LLM preset.",
+          })}
+        </p>
+      </div>
+
       <div className="flex items-center gap-4">
         <Button
           variant="outline"

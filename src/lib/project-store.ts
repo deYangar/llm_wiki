@@ -1,6 +1,6 @@
 import { load } from "@tauri-apps/plugin-store"
 import type { WikiProject } from "@/types/wiki"
-import type { ApiConfig, CustomLlmPreset, GeneralConfig, LlmConfig, SearchApiConfig, EmbeddingConfig, MineruConfig, MultimodalConfig, OutputLanguage, ProjectLlmOverride, ProviderConfigs, ProxyConfig, ScheduledImportConfig, SourceWatchConfig, TaskModelRoutingConfig } from "@/stores/wiki-store"
+import type { ApiConfig, CustomLlmPreset, GeneralConfig, LlmConfig, QaSplitConfig, SearchApiConfig, EmbeddingConfig, MineruConfig, MultimodalConfig, OutputLanguage, ProjectLlmOverride, ProviderConfigs, ProxyConfig, ScheduledImportConfig, SourceWatchConfig, TaskModelRoutingConfig } from "@/stores/wiki-store"
 import { normalizeSourceWatchConfig } from "@/lib/source-watch-config"
 import { normalizePath } from "@/lib/path-utils"
 import { DEFAULT_ZOOM_LEVEL, clampZoomLevel } from "@/stores/zoom-store"
@@ -189,6 +189,20 @@ export async function saveMultimodalConfig(config: MultimodalConfig): Promise<vo
 export async function loadMultimodalConfig(): Promise<MultimodalConfig | null> {
   const store = await getStore()
   return (await store.get<MultimodalConfig>(MULTIMODAL_KEY)) ?? null
+}
+
+const QA_SPLIT_KEY = "qaSplitConfig"
+
+export async function saveQaSplitConfig(config: QaSplitConfig): Promise<void> {
+  const store = await getStore()
+  await store.set(QA_SPLIT_KEY, config)
+}
+
+export async function loadQaSplitConfig(): Promise<QaSplitConfig> {
+  const store = await getStore()
+  const saved = await store.get<QaSplitConfig>(QA_SPLIT_KEY)
+  // 默认开：undefined 视为开（存量用户升级即得兜底通道）；显式 false 才关
+  return { llmFallbackEnabled: saved?.llmFallbackEnabled !== false }
 }
 
 const MINERU_KEY = "mineruConfig"

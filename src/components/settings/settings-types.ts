@@ -69,6 +69,8 @@ export interface SettingsDraft {
   scheduledImportEnabled: boolean
   scheduledImportPath: string
   scheduledImportInterval: number // minutes
+  /** qa-split 难例 LLM 兜底（规则 0 题时用 LLM 识别题边界，机械校验红线不降级）。 */
+  qaSplitLlmFallback: boolean
 
   // UI
   uiLanguage: string

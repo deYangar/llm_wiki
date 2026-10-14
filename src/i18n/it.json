@@ -834,7 +834,9 @@
         "scanNow": "Scansiona ora",
         "scanning": "Scansione...",
         "lastScan": "Ultima scansione: {{time}}",
-        "never": "Mai"
+        "never": "Mai",
+        "qaSplitLlmFallback": "Suddivisione Q&A: fallback LLM per casi difficili",
+        "qaSplitLlmFallbackHint": "Quando le regole deterministiche non trovano confini di domanda (file scansionati/irregolari), un LLM propone i confini che devono superare la validazione meccanica verbatim prima di scrivere qualsiasi pagina. Usa il preset LLM di ingest."
       },
       "apiServer": {
         "title": "API + MCP",

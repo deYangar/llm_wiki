@@ -209,6 +209,11 @@ interface ScheduledImportConfig {
   lastScan: number | null // 上次扫描时间戳
 }
 
+interface QaSplitConfig {
+  /** 难例 LLM 兜底：规则通道 0 题时用 LLM 识别题边界（机械校验红线不降级）。 */
+  llmFallbackEnabled: boolean
+}
+
 /**
  * Local HTTP API server config. Read by the Rust `api_server` module on
  * every request via `load_app_state` (5s cache). The Rust side is the
@@ -443,6 +448,8 @@ interface WikiState {
   outputLanguage: OutputLanguage
   proxyConfig: ProxyConfig
   scheduledImportConfig: ScheduledImportConfig
+  /** qa-split 难例 LLM 兜底开关（跟随 ingest preset，不可单独选 provider）。 */
+  qaSplitConfig: QaSplitConfig
   sourceWatchConfig: SourceWatchConfig
   sourceWatchAllProjects: boolean
   mineruConfig: MineruConfig
@@ -475,6 +482,7 @@ interface WikiState {
   setOutputLanguage: (lang: OutputLanguage) => void
   setProxyConfig: (config: ProxyConfig) => void
   setScheduledImportConfig: (config: ScheduledImportConfig) => void
+  setQaSplitConfig: (config: QaSplitConfig) => void
   setSourceWatchConfig: (config: SourceWatchConfig) => void
   setSourceWatchAllProjects: (enabled: boolean) => void
   setMineruConfig: (config: MineruConfig) => void
@@ -636,6 +644,13 @@ export const useWikiStore = create<WikiState>((set) => ({
     lastScan: null,
   },
 
+  // qa-split 难例 LLM 兜底（2026-10-12 混合架构）：默认开——兜底只吃
+  // 规则通道拆不出的难例（manualQueue/单题意见书），且输出经机械校验器
+  // （逐字定位/序列/覆盖）过滤后才采信；关掉则难例全部落人工队列。
+  qaSplitConfig: {
+    llmFallbackEnabled: true,
+  },
+
   sourceWatchConfig: DEFAULT_SOURCE_WATCH_CONFIG,
   sourceWatchAllProjects: false,
   mineruConfig: {
@@ -688,6 +703,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   setOutputLanguage: (outputLanguage) => set({ outputLanguage }),
   setProxyConfig: (proxyConfig) => set({ proxyConfig }),
   setScheduledImportConfig: (scheduledImportConfig) => set({ scheduledImportConfig }),
+  setQaSplitConfig: (qaSplitConfig) => set({ qaSplitConfig }),
   setSourceWatchConfig: (sourceWatchConfig) => set({ sourceWatchConfig }),
   setSourceWatchAllProjects: (sourceWatchAllProjects) => set({ sourceWatchAllProjects }),
   setMineruConfig: (mineruConfig) => set({ mineruConfig }),
@@ -703,4 +719,4 @@ export const useWikiStore = create<WikiState>((set) => ({
   bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),
 }))
 
-export type { WikiState, LlmConfig, SearchApiConfig, EmbeddingConfig, MultimodalConfig, OutputLanguage, ProxyConfig, ScheduledImportConfig, SourceWatchConfig, ApiConfig }
+export type { WikiState, LlmConfig, SearchApiConfig, EmbeddingConfig, MultimodalConfig, OutputLanguage, ProxyConfig, ScheduledImportConfig, QaSplitConfig, SourceWatchConfig, ApiConfig }
