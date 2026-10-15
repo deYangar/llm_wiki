@@ -1259,6 +1259,10 @@ pub async fn write_file(path: String, contents: String) -> Result<(), String> {
                 .map_err(|e| format!("Failed to write file '{}': {}", path, e))?;
             crate::commands::file_history::record_file_version(p, "human", "ui.write_file");
             file_sync::mark_app_write_path(p);
+            // W6.1: a markdown write under a cached project's wiki/ drops
+            // that project's page-metadata cache (ingest / UI edits land
+            // here); non-markdown writes return without locking.
+            crate::frontmatter::invalidate_page_meta_cache_covering(p);
             Ok(())
         })
     })
@@ -1336,6 +1340,7 @@ pub async fn write_file_atomic(path: String, contents: String) -> Result<(), Str
             })?;
             crate::commands::file_history::record_file_version(p, "human", "ui.write_file_atomic");
             file_sync::mark_app_write_path(p);
+            crate::frontmatter::invalidate_page_meta_cache_covering(p);
             Ok(())
         })
     })

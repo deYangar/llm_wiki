@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+use rayon::prelude::*;
 use serde::Deserialize;
 
 /// Default head-read budget: 16KB comfortably covers every frontmatter
@@ -34,6 +35,14 @@ pub struct Frontmatter {
     /// project as JSON arrays. Preserving order keeps PATCH rewrites
     /// byte-stable across idempotent reruns.
     fields: Vec<(String, Vec<String>, bool)>,
+    /// Plain multiline scalars (e.g. long `description:` values continued
+    /// on deeper-indented lines) folded into their full value, kept with
+    /// the original source lines so `render()` reproduces them
+    /// byte-for-byte — PATCH must not reformat keys it wasn't asked to
+    /// touch. A `set_scalar` overwrite drops the entry (new value renders
+    /// as one line). (key, folded full value, original lines including
+    /// the `key: value` first line.)
+    folded: Vec<(String, String, Vec<String>)>,
     /// Keys/lines the parser could not represent within the schema value
     /// domain. `render()` drops them, so callers writing pages back must
     /// check this list first.
@@ -71,15 +80,47 @@ impl Frontmatter {
                 continue;
             }
             if !inline.is_empty() {
-                let scalar = unquote(inline);
+                let mut scalar = unquote(inline);
+                // Plain multiline continuation: deeper-indented lines that
+                // are neither list items nor new keys fold into the scalar
+                // (single-space join, YAML plain-scalar folding). Without
+                // this the continuation lines land in `skipped` — the value
+                // loses its tail AND the PATCH endpoint rejects the whole
+                // page (W4 multi-line description fix, 2026-10-15).
+                let key_indent = indent_of(raw);
+                let mut original_lines = vec![raw.to_string()];
+                let mut folded = false;
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let next = lines[j];
+                    let next_trimmed = next.trim();
+                    if next_trimmed.is_empty()
+                        || indent_of(next) <= key_indent
+                        || next_trimmed.starts_with('-')
+                        || split_key_line(next_trimmed).is_some()
+                    {
+                        break;
+                    }
+                    if !scalar.is_empty() {
+                        scalar.push(' ');
+                    }
+                    scalar.push_str(next_trimmed);
+                    original_lines.push(next.to_string());
+                    folded = true;
+                    j += 1;
+                }
                 if scalar.is_empty() {
                     // A value that is only quotes/comment noise still marks
                     // the key present; treat as empty scalar for honesty.
                     fm.fields.push((key, Vec::new(), true));
                 } else {
+                    if folded {
+                        fm.folded
+                            .push((key.clone(), scalar.clone(), original_lines));
+                    }
                     fm.fields.push((key, vec![scalar], true));
                 }
-                i += 1;
+                i = j;
                 continue;
             }
             // `key:` with no inline value: either a block list, a nested
@@ -155,7 +196,26 @@ impl Frontmatter {
         for (key, values, is_scalar) in &self.fields {
             if *is_scalar && values.len() <= 1 {
                 match values.first() {
-                    Some(value) => out.push_str(&format!("{key}: {}\n", quote_scalar(value))),
+                    Some(value) => {
+                        // A folded multiline scalar whose value hasn't been
+                        // overwritten re-renders its original lines verbatim;
+                        // set_scalar clears the fold entry, so an updated
+                        // value falls through to the one-line form.
+                        if let Some((_, folded_value, original)) = self
+                            .folded
+                            .iter()
+                            .find(|(k, _, _)| k == key)
+                        {
+                            if folded_value == value {
+                                for line in original {
+                                    out.push_str(line);
+                                    out.push('\n');
+                                }
+                                continue;
+                            }
+                        }
+                        out.push_str(&format!("{key}: {}\n", quote_scalar(value)));
+                    }
                     None => out.push_str(&format!("{key}:\n")),
                 }
                 continue;
@@ -169,8 +229,10 @@ impl Frontmatter {
     }
 
     /// Replace or insert a scalar key, preserving the original position of
-    /// existing keys (new keys append).
+    /// existing keys (new keys append). An overwritten folded multiline
+    /// scalar drops its fold record and renders as one line.
     pub fn set_scalar(&mut self, key: &str, value: &str) {
+        self.folded.retain(|(k, _, _)| k != key);
         if let Some(entry) = self.fields.iter_mut().find(|(k, _, _)| k == key) {
             entry.1 = vec![value.to_string()];
             entry.2 = true;
@@ -200,6 +262,7 @@ impl Frontmatter {
 
     pub fn remove_key(&mut self, key: &str) {
         self.fields.retain(|(k, _, _)| k != key);
+        self.folded.retain(|(k, _, _)| k != key);
     }
 
     /// Frontmatter fields projected as ordered (key, values, is_scalar)
@@ -406,11 +469,282 @@ pub fn read_head(path: &Path, max_head_bytes: usize) -> std::io::Result<String> 
     }
 }
 
-/// Convenience wrapper: read the file head and parse its frontmatter.
-/// Returns Ok(None) for files without a well-formed block.
-pub fn load_head(path: &Path) -> std::io::Result<Option<Frontmatter>> {
-    let head = read_head(path, DEFAULT_HEAD_BYTES)?;
-    Ok(split_frontmatter(&head).map(|(_, block)| Frontmatter::parse(block)))
+// ---- per-project page-metadata cache (plan W6.1, 2026-10-14) ----------
+//
+// The search / pages-query collection phase spent its whole P95 on pure
+// metadata (probe, 21,558 pages, OS cache warm: walk 353ms + stat 449ms +
+// 16KB head read 770ms ≈ 1570ms); scoring the filtered candidates is
+// noise. The cache keeps one metadata walk per project — path plus
+// head-parsed frontmatter — with the exact invalidation semantics of the
+// graph snapshot cache: an order-independent mtime+size fingerprint, a 2s
+// trust window so cache hits do zero I/O, single-flight rebuilds, plus
+// proactive invalidation hooks on the wiki write paths.
+//
+// Red line: a cache hit must reproduce the uncached result
+// byte-identically. That is why `PageMeta` carries `head_read_ok` /
+// `head_closed`: the uncached consumers differ on those edges (search
+// drops a page whose full-text read errors and re-parses an over-16KB
+// frontmatter from the full text; pages/query keeps the page with an
+// empty frontmatter), so the flags are stored, not resolved here.
+
+/// Scan ceiling shared with the search walk — one definition so the cache
+/// and the (uncached) search ceiling can never drift apart.
+pub const MAX_META_SCAN_FILES: usize = 50_000;
+
+#[derive(Debug, Clone)]
+pub struct PageMeta {
+    /// Project-relative path with `/` separators, same shape
+    /// `relative_to_project` produces for the consumers.
+    pub rel_path: String,
+    /// Head-parse result. Empty when the head read errored OR the head
+    /// showed no closed frontmatter block — both mean "no frontmatter"
+    /// to pages/query; search re-parses the full text for unclosed heads.
+    pub frontmatter: Frontmatter,
+    /// False when the 16KB head read failed — search drops such pages
+    /// (its uncached pipeline surfaces the same failure on the full-text
+    /// read and returns None); pages/query keeps them.
+    pub head_read_ok: bool,
+    /// False when the head had no closing `---` — an over-16KB
+    /// frontmatter must not get a page erroneously filter-dropped, so
+    /// search re-parses the full text before filtering.
+    pub head_closed: bool,
+}
+
+pub struct PageMetaIndex {
+    entries: Vec<PageMeta>,
+}
+
+impl PageMetaIndex {
+    pub fn entries(&self) -> &[PageMeta] {
+        &self.entries
+    }
+}
+
+struct PageMetaCacheEntry {
+    fingerprint: u64,
+    index: std::sync::Arc<PageMetaIndex>,
+    fingerprint_at: std::time::Instant,
+}
+
+/// How long a verified fingerprint is trusted before the next cached
+/// request re-walks the metadata — the same trade-off the graph snapshot
+/// cache makes. Writes through this application invalidate proactively;
+/// the window only covers out-of-band edits, which are then reflected at
+/// worst TTL + one rebuild later.
+const META_FINGERPRINT_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+static PAGE_META_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, PageMetaCacheEntry>>,
+> = std::sync::OnceLock::new();
+static PAGE_META_BUILD_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+/// Order-independent fingerprint of the wiki tree: the commutative sum of
+/// per-file (path, mtime, size) hashes, so WalkDir iteration order never
+/// changes it. Same algorithm as the graph snapshot cache, except `.md`
+/// matching is case-insensitive to cover every file the scan ceiling
+/// admits (search's collection treats `.MD` as markdown too).
+pub fn wiki_tree_fingerprint(wiki_root: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut acc: u64 = 0;
+    for entry in walkdir::WalkDir::new(wiki_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file()
+            || !entry
+                .path()
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let mut hasher = DefaultHasher::new();
+        entry.path().to_string_lossy().hash(&mut hasher);
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        mtime.hash(&mut hasher);
+        meta.len().hash(&mut hasher);
+        acc = acc.wrapping_add(hasher.finish());
+    }
+    acc
+}
+
+/// One full metadata walk: collect the .md list (deterministic WalkDir
+/// order, same ceiling as the uncached search scan) and parse each head
+/// in parallel. Per-file failures degrade to flags, never abort the walk.
+fn build_page_meta_index(project_path: &str) -> std::sync::Arc<PageMetaIndex> {
+    let wiki_root = std::path::Path::new(project_path).join("wiki");
+    let mut files = Vec::new();
+    if wiki_root.exists() {
+        files = walkdir::WalkDir::new(&wiki_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            })
+            .take(MAX_META_SCAN_FILES)
+            .map(|entry| entry.path().to_path_buf())
+            .collect();
+        if files.len() >= MAX_META_SCAN_FILES {
+            eprintln!(
+                "[PageMeta] stopped scanning wiki after {MAX_META_SCAN_FILES} markdown files in {project_path}"
+            );
+        }
+    }
+    let entries: Vec<PageMeta> = files
+        .into_par_iter()
+        .map(|path| {
+            let rel_path = relative_to_project(project_path, &path);
+            match read_head(&path, DEFAULT_HEAD_BYTES) {
+                Ok(head) => match split_frontmatter(&head) {
+                    Some((_, block)) => PageMeta {
+                        rel_path,
+                        frontmatter: Frontmatter::parse(block),
+                        head_read_ok: true,
+                        head_closed: true,
+                    },
+                    None => PageMeta {
+                        rel_path,
+                        frontmatter: Frontmatter::default(),
+                        head_read_ok: true,
+                        head_closed: false,
+                    },
+                },
+                Err(_) => PageMeta {
+                    rel_path,
+                    frontmatter: Frontmatter::default(),
+                    head_read_ok: false,
+                    head_closed: false,
+                },
+            }
+        })
+        .collect();
+    std::sync::Arc::new(PageMetaIndex { entries })
+}
+
+/// Cached metadata index with graph-snapshot-cache semantics: trust a
+/// fingerprint verified within the TTL, re-verify it (one metadata walk)
+/// after that, rebuild on mismatch, single-flight concurrent rebuilds.
+pub fn page_meta_index_cached(project_path: &str) -> std::sync::Arc<PageMetaIndex> {
+    page_meta_index_cached_with_ttl(project_path, META_FINGERPRINT_TTL)
+}
+
+fn page_meta_index_cached_with_ttl(
+    project_path: &str,
+    ttl: std::time::Duration,
+) -> std::sync::Arc<PageMetaIndex> {
+    // Fast path: a fingerprint verified within the TTL is trusted as-is,
+    // skipping the metadata walk entirely.
+    let cache = PAGE_META_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if ttl > std::time::Duration::ZERO {
+        if let Ok(entries) = cache.lock() {
+            if let Some(entry) = entries.get(std::path::Path::new(project_path)) {
+                if entry.fingerprint_at.elapsed() < ttl {
+                    return entry.index.clone();
+                }
+            }
+        }
+    }
+
+    let fingerprint = wiki_tree_fingerprint(&std::path::Path::new(project_path).join("wiki"));
+    let try_hit = |cache: &std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, PageMetaCacheEntry>,
+    >| {
+        let mut entries = cache.lock().ok()?;
+        let entry = entries.get_mut(std::path::Path::new(project_path))?;
+        if entry.fingerprint != fingerprint {
+            return None;
+        }
+        entry.fingerprint_at = std::time::Instant::now();
+        Some(entry.index.clone())
+    };
+    if let Some(index) = try_hit(cache) {
+        return index;
+    }
+
+    // Miss. Per-project build lock: concurrent misses for one project
+    // don't each pay the full walk; the follower re-checks after winner.
+    let build_locks = PAGE_META_BUILD_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let build_lock = {
+        let mut locks = build_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(std::path::PathBuf::from(project_path))
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(index) = try_hit(cache) {
+        return index;
+    }
+
+    let index = build_page_meta_index(project_path);
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(
+            std::path::PathBuf::from(project_path),
+            PageMetaCacheEntry {
+                fingerprint,
+                index: index.clone(),
+                fingerprint_at: std::time::Instant::now(),
+            },
+        );
+    }
+    index
+}
+
+/// Proactive invalidation for the guarded wiki write paths (agent tools,
+/// pages/write, PATCH frontmatter): the very next search / pages-query
+/// request rebuilds, no TTL staleness for writes this app made itself.
+pub fn invalidate_page_meta_cache(project_path: &str) {
+    let Some(cache) = PAGE_META_CACHE.get() else { return };
+    if let Ok(mut entries) = cache.lock() {
+        entries.remove(std::path::Path::new(project_path));
+    }
+}
+
+/// Invalidation for the raw fs write commands, which only know an
+/// absolute path: drop the cache of every project whose `wiki/` tree the
+/// written markdown file lives under. Non-markdown writes return without
+/// touching the cache lock (ingest writes plenty of non-wiki files).
+pub fn invalidate_page_meta_cache_covering(abs_path: &Path) {
+    if abs_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_none_or(|ext| !ext.eq_ignore_ascii_case("md"))
+    {
+        return;
+    }
+    let Some(cache) = PAGE_META_CACHE.get() else { return };
+    let Ok(mut entries) = cache.lock() else { return };
+    let projects: Vec<std::path::PathBuf> = entries.keys().cloned().collect();
+    for project in projects {
+        let wiki_root = project.join("wiki");
+        if abs_path.starts_with(&wiki_root) {
+            entries.remove(&project);
+        }
+    }
+}
+
+/// Same shape as the private helpers in commands/search.rs and
+/// api_server.rs — the cached rel_path must be byte-identical to what
+/// those consumers produce on their uncached path.
+fn relative_to_project(project_path: &str, path: &Path) -> String {
+    let root = Path::new(project_path);
+    path.strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
 }
 
 /// Structured filter for search / pages-query. All conditions are ANDed;
@@ -577,6 +911,46 @@ mod tests {
         let fm2 = Frontmatter::parse("title: 正常\n裸文本行\n");
         assert_eq!(fm2.get("title"), Some(&["正常".to_string()][..]));
         assert_eq!(fm2.skipped_lines().len(), 1);
+    }
+
+    #[test]
+    fn parse_folds_plain_multiline_scalar() {
+        // Real production shape (portable 知识库 regulation page): a long
+        // description continued on deeper-indented lines. Before the fix
+        // the continuation lines went to `skipped` (value lost its tail,
+        // PATCH rejected the page with 422).
+        let block = "type: regulation\ndescription: 首行值，\n  续行一内容，\n  续行二内容。\nstatus: 现行有效\n";
+        let fm = Frontmatter::parse(block);
+        assert!(fm.skipped_lines().is_empty());
+        assert_eq!(
+            fm.get("description"),
+            Some(&["首行值， 续行一内容， 续行二内容。".to_string()][..])
+        );
+        assert_eq!(fm.get("status"), Some(&["现行有效".to_string()][..]));
+    }
+
+    #[test]
+    fn render_reproduces_folded_scalar_verbatim() {
+        let block = "type: regulation\ndescription: 首行值，\n  续行一内容，\n  续行二内容。\nstatus: 现行有效\n";
+        let fm = Frontmatter::parse(block);
+        // Untouched keys keep their byte form — PATCH must not reformat
+        // the folded description into one line.
+        assert_eq!(fm.render(), block);
+    }
+
+    #[test]
+    fn set_scalar_on_folded_key_renders_one_line() {
+        let block = "description: 首行值，\n  续行内容。\nstatus: 现行有效\n";
+        let mut fm = Frontmatter::parse(block);
+        fm.set_scalar("description", "新值一行");
+        assert_eq!(
+            fm.render(),
+            "description: 新值一行\nstatus: 现行有效\n"
+        );
+        // Removing the key drops the fold record with it.
+        let mut fm2 = Frontmatter::parse(block);
+        fm2.remove_key("description");
+        assert_eq!(fm2.render(), "status: 现行有效\n");
     }
 
     #[test]
@@ -766,5 +1140,104 @@ mod tests {
     fn single_quoted_doubled_quote_unescapes() {
         let fm = Frontmatter::parse("title: 'it''s fine'\n");
         assert_eq!(fm.get("title"), Some(&["it's fine".to_string()][..]));
+    }
+
+    // ---- page-metadata cache (W6.1) ------------------------------------
+
+    fn meta_cache_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-wiki-fm-meta-{}-{tag}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wiki = dir.join("wiki").join("cases");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::write(
+            wiki.join("normal.md"),
+            "---\ntype: case\ntitle: 正常\n---\n# 正文\n",
+        )
+        .unwrap();
+        std::fs::write(wiki.join("bare.md"), "# 没有 frontmatter\n").unwrap();
+        // Closed frontmatter well past the 16KB head budget: the head must
+        // report head_closed=false so search re-parses the full text.
+        let big = format!("---\ntitle: {}\n---\n正文", "长".repeat(10 * 1024));
+        std::fs::write(wiki.join("big.md"), big).unwrap();
+        dir
+    }
+
+    #[test]
+    fn meta_cache_build_parses_heads_and_flags_edges() {
+        let dir = meta_cache_fixture("build");
+        let project = dir.to_string_lossy().to_string();
+        let index = build_page_meta_index(&project);
+        let find = |suffix: &str| {
+            index
+                .entries()
+                .iter()
+                .find(|m| m.rel_path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing {suffix}"))
+        };
+        let normal = find("normal.md");
+        assert!(normal.head_read_ok && normal.head_closed);
+        assert_eq!(normal.frontmatter.get("type"), Some(&["case".to_string()][..]));
+        // Bare page: readable head, no frontmatter block, empty fields.
+        let bare = find("bare.md");
+        assert!(bare.head_read_ok && !bare.head_closed);
+        assert_eq!(bare.frontmatter.get("type"), None);
+        // Over-16KB frontmatter: head read ok but no closing delimiter in
+        // the head window — search must re-parse the full text.
+        let big = find("big.md");
+        assert!(big.head_read_ok && !big.head_closed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn meta_cache_ttl_hit_rebuild_and_invalidate_hooks() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let dir = meta_cache_fixture("ttl");
+        let project = dir.to_string_lossy().to_string();
+        let cached = || page_meta_index_cached_with_ttl(&project, Duration::from_secs(2));
+
+        // Build, then a TTL-window hit returns the SAME snapshot — zero
+        // rebuild, zero metadata I/O.
+        let first = cached();
+        let second = cached();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // Proactive invalidation drops the entry even inside the TTL
+        // window (guarded write paths rely on this).
+        invalidate_page_meta_cache(&project);
+        let third = cached();
+        assert!(!Arc::ptr_eq(&first, &third));
+
+        // Absolute-path invalidation: a markdown write under the
+        // project's wiki/ drops the entry …
+        let fourth = cached();
+        let md_abs = dir.join("wiki").join("cases").join("new.md");
+        std::fs::write(&md_abs, "---\ntype: case\n---\n新页").unwrap();
+        invalidate_page_meta_cache_covering(&md_abs);
+        let fifth = cached();
+        assert!(!Arc::ptr_eq(&fourth, &fifth));
+        assert!(fifth.entries().iter().any(|m| m.rel_path.ends_with("new.md")));
+
+        // … a non-markdown write must not.
+        let raw = dir.join("raw");
+        std::fs::create_dir_all(&raw).unwrap();
+        let pdf = raw.join("x.pdf");
+        std::fs::write(&pdf, b"pdf-bytes").unwrap();
+        invalidate_page_meta_cache_covering(&pdf);
+        let sixth = cached();
+        assert!(Arc::ptr_eq(&fifth, &sixth));
+
+        // Out-of-band edit (no hook): the fingerprint recheck after the
+        // TTL — ttl=0 forces it on this call — sees the changed tree and
+        // rebuilds, so staleness is bounded by TTL + one rebuild.
+        std::fs::write(&md_abs, "---\ntype: case\nyear: 2026\n---\n改写变长").unwrap();
+        let seventh = page_meta_index_cached_with_ttl(&project, Duration::ZERO);
+        assert!(!Arc::ptr_eq(&sixth, &seventh));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

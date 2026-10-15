@@ -581,14 +581,36 @@ pub(crate) async fn vector_page_revision_match(
     Ok((count > 0).then_some(count))
 }
 
+/// `page_id IN (...)` predicate for the pushed-down vector KNN filter.
+/// page_id values are validated upstream (no quotes/newlines/backslashes —
+/// see `validate_page_id_for_v2`), so the escaping here is belt-and-braces
+/// only, not the injection defense.
+fn page_id_in_predicate(page_ids: &[String]) -> String {
+    let quoted: Vec<String> = page_ids
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect();
+    format!("page_id IN ({})", quoted.join(", "))
+}
+
 /// Top-K chunk search. Returns every matching chunk's metadata + score
 /// (1 / (1 + distance), matching v1's convention for drop-in replacement
 /// at the TS layer). TS is responsible for grouping by page_id.
+///
+/// `page_ids` (W2 vector-lane fix, 2026-10-15): when Some, the KNN runs
+/// INSIDE that page set via a pushed-down `page_id IN (...)` predicate —
+/// "filter before scoring" for the vector lane too. Without it the lane
+/// takes a whole-library top-k first and maps hits back onto the filtered
+/// candidate set afterwards, so whenever the constraint covers a small
+/// slice of the library (e.g. one exact tag ≈ 1.5% of pages) the global
+/// top-k contains none of the target pages and the lane silently returns
+/// zero hits. An empty list is treated like None (no restriction).
 #[tauri::command]
 pub async fn vector_search_chunks(
     project_path: String,
     query_embedding: Vec<f32>,
     top_k: usize,
+    page_ids: Option<Vec<String>>,
 ) -> Result<Vec<ChunkSearchResult>, String> {
     run_guarded_async("vector_search_chunks", async move {
         let lock = vectorstore_v2_lock(&project_path);
@@ -615,9 +637,15 @@ pub async fn vector_search_chunks(
             .await
             .map_err(|e| format!("Open table error: {e}"))?;
 
-        let results_stream = table
+        let mut query = table
             .vector_search(query_embedding)
-            .map_err(|e| format!("Search error: {e}"))?
+            .map_err(|e| format!("Search error: {e}"))?;
+        if let Some(ids) = page_ids.as_deref() {
+            if !ids.is_empty() {
+                query = query.only_if(page_id_in_predicate(ids));
+            }
+        }
+        let results_stream = query
             .limit(top_k)
             .execute()
             .await
@@ -635,7 +663,7 @@ pub async fn vector_search_chunks(
                 .column_by_name("chunk_id")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>())
                 .ok_or("Missing chunk_id column")?;
-            let page_ids = batch
+            let page_id_col = batch
                 .column_by_name("page_id")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>())
                 .ok_or("Missing page_id column")?;
@@ -660,7 +688,7 @@ pub async fn vector_search_chunks(
                 let distance = distances.value(i);
                 out.push(ChunkSearchResult {
                     chunk_id: chunk_ids.value(i).to_string(),
-                    page_id: page_ids.value(i).to_string(),
+                    page_id: page_id_col.value(i).to_string(),
                     chunk_index: chunk_indexes.value(i),
                     chunk_text: chunk_texts.value(i).to_string(),
                     heading_path: heading_paths.value(i).to_string(),
@@ -1120,7 +1148,9 @@ mod tests_v2 {
             .unwrap();
 
         let query = fake_embedding(1, 16);
-        let results = vector_search_chunks(pp.clone(), query, 10).await.unwrap();
+        let results = vector_search_chunks(pp.clone(), query, 10, None)
+            .await
+            .unwrap();
         assert!(!results.is_empty());
         // Every result should carry page_id, chunk_id, chunk_text, heading_path.
         for r in &results {
@@ -1129,6 +1159,50 @@ mod tests_v2 {
             assert!(r.chunk_text.contains("chunk"));
             assert!(r.heading_path.starts_with("## Heading"));
         }
+    }
+
+    #[tokio::test]
+    async fn v2_search_pushed_down_page_ids_restricts_knn() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        vector_upsert_chunks(pp.clone(), "page-a".into(), make_chunks("page-a", 3, 16))
+            .await
+            .unwrap();
+        vector_upsert_chunks(pp.clone(), "page-b".into(), make_chunks("page-b", 3, 16))
+            .await
+            .unwrap();
+
+        let query = fake_embedding(1, 16);
+        // Unfiltered: both pages appear.
+        let all = vector_search_chunks(pp.clone(), query.clone(), 10, None)
+            .await
+            .unwrap();
+        let distinct: std::collections::BTreeSet<_> =
+            all.iter().map(|r| r.page_id.as_str()).collect();
+        assert_eq!(distinct.len(), 2);
+
+        // Pushed down to page-b only: every hit belongs to page-b even
+        // though page-a chunks rank higher for this query vector.
+        let only_b = vector_search_chunks(pp.clone(), query, 10, Some(vec!["page-b".into()]))
+            .await
+            .unwrap();
+        assert!(!only_b.is_empty());
+        for r in &only_b {
+            assert_eq!(r.page_id, "page-b");
+        }
+
+        // Empty list behaves like None (no restriction).
+        let empty = vector_search_chunks(pp.clone(), fake_embedding(2, 16), 10, Some(vec![]))
+            .await
+            .unwrap();
+        assert!(!empty.is_empty());
+    }
+
+    #[test]
+    fn page_id_predicate_quotes_values() {
+        let pred = page_id_in_predicate(&["questions/a".into(), "it's".into()]);
+        assert_eq!(pred, "page_id IN ('questions/a', 'it''s')");
     }
 
     #[tokio::test]
@@ -1154,7 +1228,7 @@ mod tests_v2 {
         let pp = p.to_string_lossy().to_string();
 
         let query = fake_embedding(1, 16);
-        let results = vector_search_chunks(pp, query, 10).await.unwrap();
+        let results = vector_search_chunks(pp, query, 10, None).await.unwrap();
         assert!(results.is_empty());
     }
 

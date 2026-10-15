@@ -2171,36 +2171,32 @@ fn pages_query_inner(project_path: &str, req: PagesQueryRequest) -> ApiResponse 
     if !wiki_root.exists() {
         return ok(json!({ "ok": true, "total": 0, "hasMore": false, "items": [] }));
     }
-    // F7 (G5): the per-page work (16KB head read + parse + filter match) is
-    // pure and independent — fan it out across the rayon pool like the
-    // search scan. The result order is fully determined by the sort below
-    // (path / title with a path tie-break), so parallel collection keeps
-    // the response byte-identical; only the wall time changes (the serial
-    // full-corpus head read was the >500ms bottleneck on 17k pages).
-    let files: Vec<std::path::PathBuf> = WalkDir::new(&wiki_root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry.path().extension().and_then(|s| s.to_str()) == Some("md")
+    // W6.1 (2026-10-14): metadata from the per-project cache — the 16KB
+    // head read per page was the whole latency (>450ms on 21.5k pages).
+    // pages/query keeps its own uncached edge semantics, re-applied here
+    // so a cache hit is byte-identical to the uncached response: an
+    // IO-failed or unclosed-head page still lists with an EMPTY
+    // frontmatter (only the filter can drop it — search drops the
+    // former; this endpoint never did), and the extension check is
+    // case-sensitive "md" (the search scan is case-insensitive).
+    // The cache build also clamps at MAX_META_SCAN_FILES (50k), which
+    // this endpoint's uncapped walk only diverges from past 50k pages.
+    let index = crate::frontmatter::page_meta_index_cached(project_path);
+    let mut entries: Vec<(String, crate::frontmatter::Frontmatter)> = index
+        .entries()
+        .iter()
+        .filter(|meta| {
+            Path::new(&meta.rel_path)
+                .extension()
+                .and_then(|s| s.to_str())
+                == Some("md")
         })
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
-    let mut entries: Vec<(String, crate::frontmatter::Frontmatter)> = files
-        .into_par_iter()
-        .filter_map(|path| {
-            let rel_path = relative_to_project(project_path, &path);
-            let fm = crate::frontmatter::load_head(&path)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            if let Some(filter) = &filter {
-                if !filter.matches(&fm, &rel_path) {
-                    return None;
-                }
-            }
-            Some((rel_path, fm))
+        .filter(|meta| {
+            filter
+                .as_ref()
+                .is_none_or(|f| f.matches(&meta.frontmatter, &meta.rel_path))
         })
+        .map(|meta| (meta.rel_path.clone(), meta.frontmatter.clone()))
         .collect();
     let total = entries.len();
     match order_by {
@@ -5093,6 +5089,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_filter_threads_into_vector_lane() {
+        // W2 vector-lane fix (2026-10-15): with a filter, the KNN must run
+        // INSIDE the surviving candidate pages. The fixture reproduces the
+        // production failure shape measured on the portable copy — the
+        // constrained target page is crowded out of the whole-library
+        // vector top-k by decoy chunks, so the legacy "global top-k, then
+        // map back onto the filtered set" starves the lane to
+        // vectorHits=0. With the pushed-down page_id predicate the lane
+        // finds the target page again.
+        let root = test_project_dir();
+        let questions = root.join("wiki").join("questions");
+        let concepts = root.join("wiki").join("concepts");
+        fs::create_dir_all(&questions).unwrap();
+        fs::create_dir_all(&concepts).unwrap();
+        fs::write(
+            questions.join("vec-target.md"),
+            "---\ntype: question\ntitle: 目标题\n---\n# 目标题\n\n收入确认 时点。",
+        )
+        .unwrap();
+        fs::write(
+            concepts.join("vec-decoy.md"),
+            "---\ntype: concept\ntitle: 诱饵\n---\n# 诱饵\n\n无关正文。",
+        )
+        .unwrap();
+
+        let dim = 16usize;
+        let query: Vec<f32> = (0..dim).map(|i| ((i * 7) as f32 * 0.13).sin()).collect();
+        let far: Vec<f32> = (0..dim).map(|i| ((i * 13 + 5) as f32 * 0.29).cos()).collect();
+        let near = |i: usize| -> Vec<f32> {
+            query
+                .iter()
+                .enumerate()
+                .map(|(j, v)| v + ((i + j) as f32) * 1e-6)
+                .collect()
+        };
+        let chunk = |embedding: Vec<f32>, idx: u32| commands::vectorstore::ChunkUpsertInput {
+            chunk_index: idx,
+            chunk_text: format!("chunk {idx}"),
+            heading_path: String::new(),
+            embedding,
+        };
+        let path = root.to_string_lossy().to_string();
+        commands::vectorstore::vector_upsert_chunks(
+            path.clone(),
+            "questions/vec-target".into(),
+            vec![chunk(far.clone(), 0), chunk(far.clone(), 1)],
+        )
+        .await
+        .unwrap();
+        // 35 near-query decoy chunks: the vector lane fetches
+        // (window.max(10) * 3).max(30) = 30 chunks, so the target page
+        // never makes it into the unfiltered global top-k.
+        let decoys: Vec<_> = (0..35u32).map(|i| chunk(near(i as usize), i)).collect();
+        commands::vectorstore::vector_upsert_chunks(
+            path.clone(),
+            "concepts/vec-decoy".into(),
+            decoys,
+        )
+        .await
+        .unwrap();
+
+        let out = commands::search::search_project_inner(
+            path.clone(),
+            "收入确认".into(),
+            5,
+            false,
+            Some(query.clone()),
+            Some(SearchFilter {
+                r#type: Some("question".to_string()),
+                ..Default::default()
+            }),
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.vector_hits > 0,
+            "vector lane starved under filter: {out:?}"
+        );
+        assert!(!out.results.is_empty());
+        for r in &out.results {
+            assert!(
+                r.path.ends_with("questions/vec-target.md"),
+                "unfiltered page leaked into results: {}",
+                r.path
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn search_filter_field_eq_year() {
         let root = test_project_dir();
         write_search_fixture(&root);
@@ -5361,6 +5448,55 @@ mod tests {
     }
 
     #[test]
+    fn patch_accepts_page_with_folded_multiline_description() {
+        // W4 multi-line description fix (2026-10-15): production pages
+        // (portable 知识库, 11 pages) carry long descriptions continued on
+        // deeper-indented lines. The parser used to route the continuation
+        // lines into `skipped` and the PATCH endpoint rejected the whole
+        // page with 422. Now the value folds (content complete) and the
+        // untouched key keeps its original multi-line form byte-for-byte.
+        let root = test_project_dir();
+        let page = root.join("wiki").join("regulation").join("购置税法.md");
+        fs::create_dir_all(page.parent().unwrap()).unwrap();
+        let original = "---\ntype: regulation\ntitle: 购置税法\ndescription: 首行说明，\n  续行内容一，\n  续行内容二。\ntags:\n  - \"domain:税法\"\n---\n\n## 正文\n条文。";
+        fs::write(&page, original).unwrap();
+        let path_str = root.to_string_lossy().to_string();
+
+        let resp = patch_frontmatter_inner(
+            &path_str,
+            patch_req(
+                "wiki/regulation/购置税法.md",
+                &[],
+                &[("tags", vec!["reg-nature:法律"])],
+                &[],
+            ),
+        );
+        assert_eq!(resp.status, 200, "folded description must not 422: {}", resp.body);
+        assert_eq!(resp.body["changed"], json!(true));
+        let after = fs::read_to_string(&page).unwrap();
+        assert!(
+            after.contains("description: 首行说明，\n  续行内容一，\n  续行内容二。"),
+            "untouched folded key keeps its original form: {after}"
+        );
+        assert!(after.contains("- \"reg-nature:法律\""));
+
+        // Rerun: idempotent, nothing changes.
+        let resp2 = patch_frontmatter_inner(
+            &path_str,
+            patch_req(
+                "wiki/regulation/购置税法.md",
+                &[],
+                &[("tags", vec!["reg-nature:法律"])],
+                &[],
+            ),
+        );
+        assert_eq!(resp2.status, 200);
+        assert_eq!(resp2.body["changed"], json!(false));
+        assert_eq!(fs::read_to_string(&page).unwrap(), after);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn patch_set_overwrites_and_preserves_other_keys() {
         let root = test_project_dir();
         let page = root.join("wiki").join("cases").join("A.md");
@@ -5539,6 +5675,159 @@ mod tests {
         assert_eq!(items2[0]["fields"]["type"], json!("case"));
         // No page content ever leaves the endpoint.
         assert!(serde_json::to_string(&page2.body).unwrap().find("寄售").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- W6.1 metadata cache: hit equivalence + write invalidation ----
+
+    #[tokio::test]
+    async fn search_and_pages_query_cache_hits_are_byte_identical() {
+        let root = test_project_dir();
+        write_search_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        // Add an over-16KB-frontmatter page so the head_closed=false path
+        // (full-text re-parse inside the scoring pipeline) is exercised on
+        // the cached path too.
+        let big = format!("---\ntype: case\ntitle: 超长\nnote: {}\n---\n寄售模式 超长 frontmatter", "x".repeat(20 * 1024));
+        fs::write(root.join("wiki").join("cases").join("big.md"), big).unwrap();
+
+        // First call builds the metadata cache, second hits it inside the
+        // TTL window. Red line (plan W6.1): cache hits only change wall
+        // time — responses must serialize byte-identically.
+        let run = |filter: Option<SearchFilter>| {
+            let path = path.clone();
+            async move {
+                commands::search::search_project_inner(
+                    path,
+                    "寄售模式".to_string(),
+                    10,
+                    false,
+                    None,
+                    filter,
+                    0,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        for filter in [
+            Some(SearchFilter {
+                r#type: Some("case".to_string()),
+                ..Default::default()
+            }),
+            Some(SearchFilter {
+                tags_all: Some(vec!["topic:收入确认*".to_string()]),
+                ..Default::default()
+            }),
+            None,
+        ] {
+            let first = run(filter.clone()).await;
+            let second = run(filter.clone()).await;
+            assert_eq!(
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap(),
+                "cached search response must be byte-identical"
+            );
+        }
+        // The over-16KB page survived filtering through the full-text
+        // fallback rather than being dropped by its truncated head.
+        let with_big = run(Some(SearchFilter {
+            r#type: Some("case".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(with_big.total_filtered, 4);
+
+        // pages/query: same equivalence on its own response body.
+        let query = || {
+            pages_query_inner(
+                &path,
+                PagesQueryRequest {
+                    filter: Some(SearchFilter {
+                        r#type: Some("case".to_string()),
+                        ..Default::default()
+                    }),
+                    fields: Some(vec!["title".to_string(), "tags".to_string()]),
+                    order_by: Some("path".to_string()),
+                    limit: Some(3),
+                    offset: Some(1),
+                },
+            )
+        };
+        let q1 = query();
+        let q2 = query();
+        assert_eq!(q1.status, 200);
+        assert_eq!(
+            serde_json::to_string(&q1.body).unwrap(),
+            serde_json::to_string(&q2.body).unwrap(),
+            "cached pages/query response must be byte-identical"
+        );
+        // Deliberate divergence from search's total_filtered=4 above:
+        // pages/query's uncached semantics decided inclusion on the 16KB
+        // head only, so an over-16KB frontmatter page never matched its
+        // filter — the cache must preserve that, not "fix" it.
+        assert_eq!(q1.body["total"], json!(3));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn guarded_wiki_write_invalidates_meta_cache_immediately() {
+        let root = test_project_dir();
+        write_search_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        let filter = || {
+            Some(SearchFilter {
+                tags_all: Some(vec!["topic:新产品".to_string()]),
+                ..Default::default()
+            })
+        };
+        // Prime the cache.
+        let before = commands::search::search_project_inner(
+            path.clone(),
+            "寄售模式".to_string(),
+            10,
+            false,
+            None,
+            filter(),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.total_filtered, 0);
+
+        // Guarded write through the exact path batch tagging uses. The
+        // invalidation hook must make the new tag visible on the very
+        // next request — no waiting out the 2s TTL window.
+        let patch = patch_frontmatter_inner(
+            &path,
+            PatchFrontmatterRequest {
+                path: "wiki/cases/a.md".to_string(),
+                set: None,
+                merge_tags: Some(std::collections::BTreeMap::from([(
+                    "tags".to_string(),
+                    vec!["topic:新产品".to_string()],
+                )])),
+                remove_keys: None,
+            },
+        );
+        assert_eq!(patch.status, 200, "patch must succeed");
+
+        let after = commands::search::search_project_inner(
+            path.clone(),
+            "寄售模式".to_string(),
+            10,
+            false,
+            None,
+            filter(),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            after.total_filtered, 1,
+            "write-path invalidation must beat the TTL window"
+        );
+        assert!(after.results[0].path.ends_with("cases/a.md"));
         let _ = fs::remove_dir_all(root);
     }
 }

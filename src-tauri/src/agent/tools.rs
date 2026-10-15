@@ -750,6 +750,12 @@ pub(crate) fn write_wiki_page_with_activity(
         });
     }
     crate::commands::file_history::record_file_version(&path, "agent", "wiki.write_page");
+    // W6.1: a guarded wiki write proactively drops the project's
+    // page-metadata cache — the next search / pages-query rebuilds
+    // instead of serving pre-write metadata for up to the TTL window.
+    // Covers agent page writes, the API pages/write endpoint and the
+    // frontmatter PATCH, which all land through this function.
+    crate::frontmatter::invalidate_page_meta_cache(project_path);
     Ok(WikiWriteOutput {
         reference: AgentReference {
             title: extract_markdown_title(&content).unwrap_or_else(|| {

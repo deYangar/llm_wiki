@@ -28,10 +28,20 @@ const SEARCH_EMBEDDING_TIMEOUT_SECS: u64 = 8;
 // 10_000 dropped every wiki/questions/ page, so `type:question` filters
 // returned zero while pages/query and /graph saw them all). 50k keeps the
 // runaway-file guard while covering the corpus with headroom.
-const MAX_SEARCH_FILES: usize = 50_000;
+// Single source with the page-metadata cache build (W6.1): the cached
+// scan and the (former) per-request walk must admit the same file set.
+const MAX_SEARCH_FILES: usize = crate::frontmatter::MAX_META_SCAN_FILES;
 const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
 const MAX_GRAPH_RESULT_RATIO: f64 = 0.30;
 const MAX_GRAPH_SEEDS: usize = 20;
+// Ceiling for the pushed-down `page_id IN (...)` vector KNN filter. Above
+// this the predicate string (and DataFusion's planning of it) costs more
+// than the whole-library scan it would save, while the candidate set at
+// that size nearly covers the library, so the legacy top-k + post-filter
+// mapping is semantically equivalent. Typical constrained queries sit far
+// below (exact-tag ≈ 320 pages, type=question ≈ 1,156 on the 21.5k-page
+// portable copy).
+const MAX_VECTOR_FILTER_IDS: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -380,34 +390,44 @@ pub async fn search_project_inner(
 
     let wiki_root = Path::new(&project_path).join("wiki");
     if wiki_root.exists() {
-        // F7-a (2026-10-12 审查): collect the scan list first (deterministic
-        // WalkDir order, same MAX_SEARCH_FILES ceiling as the sequential
-        // version), then fan the per-file work — full-text read, frontmatter
-        // filter, tokenize scoring, graph-link extraction — out across the
-        // rayon pool. The per-file pipeline is pure, and results fold back
-        // in walk order, so the (score, path) ranking tie-breaks keep the
-        // sequential semantics exactly; only the elapsed wall time changes
-        // (the single-threaded full-corpus lowercasing/scoring was the
-        // P95 bottleneck).
-        let files: Vec<std::path::PathBuf> = WalkDir::new(&wiki_root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry.file_type().is_file()
-                    && entry
-                        .path()
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        // W6.1 (2026-10-14, plan B): the collection phase — walk + the
+        // per-file 16KB head reads the filter needs — comes from the
+        // per-project metadata cache. The probe measured ~1570ms of the
+        // P95 request entirely in this phase (walk 353 + stat 449 + head
+        // read 770ms on 21.5k pages, OS cache warm); scoring the filtered
+        // candidates is noise. The candidate list reproduces the uncached
+        // per-file semantics exactly:
+        //   * head_read_ok=false → dropped (the uncached pipeline hit the
+        //     same IO error on its full-text read and returned None);
+        //   * head_closed=false → the 16KB head could not decide an
+        //     over-16KB frontmatter, so the full-text parse below still
+        //     filters it (never an erroneous drop);
+        //   * otherwise the cached head frontmatter already decided.
+        // Scoring, RRF fusion and graph blending below are untouched.
+        let index = crate::frontmatter::page_meta_index_cached(&project_path);
+        let candidates: Vec<(std::path::PathBuf, bool, String)> = index
+            .entries()
+            .iter()
+            .filter_map(|meta| {
+                if !meta.head_read_ok {
+                    return None;
+                }
+                let head_decided = match (&filter, meta.head_closed) {
+                    (Some(filter), true) => {
+                        if !filter.matches(&meta.frontmatter, &meta.rel_path) {
+                            return None;
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                Some((
+                    Path::new(&project_path).join(&meta.rel_path),
+                    head_decided,
+                    meta.rel_path.clone(),
+                ))
             })
-            .take(MAX_SEARCH_FILES)
-            .map(|entry| entry.path().to_path_buf())
             .collect();
-        if files.len() >= MAX_SEARCH_FILES {
-            eprintln!(
-                "[Search] stopped scanning wiki after {MAX_SEARCH_FILES} markdown files in {project_path}"
-            );
-        }
         struct ScannedPage {
             relative_path: String,
             title: String,
@@ -415,39 +435,22 @@ pub async fn search_project_inner(
             content: String,
             hit: Option<ProjectSearchResult>,
         }
-        let scanned: Vec<Option<ScannedPage>> = files
+        let scanned: Vec<Option<ScannedPage>> = candidates
             .into_par_iter()
-            .map(|path| {
-                // With a filter, a 16KB head read decides inclusion before
-                // the full-text read — pages the filter drops never pay for
-                // content IO. A head that shows no closed frontmatter block
-                // falls through to the full read: an over-16KB frontmatter
-                // must not get a page erroneously filter-dropped.
-                let mut head_verified = false;
-                if let Some(filter) = &filter {
-                    if let Ok(Some(fm)) = crate::frontmatter::load_head(&path) {
-                        let rel = relative_to_project(&project_path, &path);
-                        if !filter.matches(&fm, &rel) {
-                            return None;
-                        }
-                        head_verified = true;
-                    }
-                }
+            .map(|(path, head_decided, relative_path)| {
                 let content = match fs::read_to_string(&path) {
                     Ok(content) => content,
                     Err(_) => return None,
                 };
-                let relative_path = relative_to_project(&project_path, &path);
                 // FILTER BEFORE SCORING: pages failing the frontmatter/path
                 // filter never enter any retrieval lane (token scoring,
                 // vector materialization, graph blending) and never count
                 // toward tokenHits/vectorHits — the constraint threads
                 // through the whole recall chain, it doesn't post-filter
-                // a top-k. The full-text parse only runs when the head
-                // could not parse a closed block (>16KB frontmatter); a
-                // verified head already decided against the identical
-                // bytes.
-                if !head_verified {
+                // a top-k. Cached heads already decided most pages above;
+                // an unclosed head (over-16KB frontmatter) still parses
+                // the full text here — identical to the uncached fallback.
+                if !head_decided {
                     if let Some(filter) = &filter {
                         let fm = split_frontmatter(&content)
                             .map(|(_, block)| Frontmatter::parse(block))
@@ -532,13 +535,41 @@ pub async fn search_project_inner(
     let mut vector_hits = 0;
     if let Some(embedding) = query_embedding {
         if !embedding.is_empty() {
-            match search_by_embedding(&project_path, embedding, window.max(10)).await {
+            // W2 vector-lane fix (2026-10-15): with a filter, the KNN runs
+            // inside the surviving candidate pages (page_ids pushed down to
+            // LanceDB). Taking a whole-library top-k first and mapping back
+            // afterwards — the previous behavior — starves the lane
+            // whenever the constraint covers a small slice of the library:
+            // the global top-k holds none of the target pages and
+            // vectorHits collapses to 0 (measured on the portable copy:
+            // bare search vectorHits=10, same query + type=question → 0).
+            // Above MAX_VECTOR_FILTER_IDS the pushed-down IN list costs
+            // more to plan than it saves; at that size the candidate set
+            // nearly covers the library, so the legacy whole-library top-k
+            // + post-filter mapping below is semantically equivalent.
+            let candidate_page_ids: Option<Vec<String>> = if filter.is_some() {
+                let mut ids: Vec<String> = page_paths_by_vector_id.keys().cloned().collect();
+                ids.extend(legacy_page_paths.keys().cloned());
+                (!ids.is_empty() && ids.len() <= MAX_VECTOR_FILTER_IDS).then_some(ids)
+            } else {
+                None
+            };
+            match search_by_embedding(
+                &project_path,
+                embedding,
+                window.max(10),
+                candidate_page_ids,
+            )
+            .await
+            {
                 Ok(vector_results) => {
                     // The vector lane must honor the same constraint: keep
                     // only hits that map back onto a page surviving the
                     // filter (page_paths_by_vector_id / legacy_page_paths
                     // are populated strictly from filtered files). Dropped
-                    // hits don't count toward vectorHits either.
+                    // hits don't count toward vectorHits either. With the
+                    // pushed-down predicate this is a no-op belt-and-braces;
+                    // for oversized candidate sets it is the only filter.
                     let vector_results = if filter.is_some() {
                         vector_results
                             .into_iter()
@@ -925,11 +956,13 @@ async fn search_by_embedding(
     project_path: &str,
     query_embedding: Vec<f32>,
     top_k: usize,
+    candidate_page_ids: Option<Vec<String>>,
 ) -> Result<Vec<PageVectorResult>, String> {
     let raw_chunks = vectorstore::vector_search_chunks(
         project_path.to_string(),
         query_embedding,
         (top_k * 3).max(30),
+        candidate_page_ids,
     )
     .await?;
     if raw_chunks.is_empty() {
