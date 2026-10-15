@@ -543,14 +543,27 @@ pub async fn search_project_inner(
             // the global top-k holds none of the target pages and
             // vectorHits collapses to 0 (measured on the portable copy:
             // bare search vectorHits=10, same query + type=question → 0).
-            // Above MAX_VECTOR_FILTER_IDS the pushed-down IN list costs
-            // more to plan than it saves; at that size the candidate set
-            // nearly covers the library, so the legacy whole-library top-k
-            // + post-filter mapping below is semantically equivalent.
+            //
+            // Budget accounting (2026-10-15 same-day fix): the legacy stem
+            // ids exist only for v1-migration rows and never match a v2
+            // table's page_id — putting them in the IN list burns budget
+            // without ever hitting. type=question (1,156 pages) measured
+            // 1,156 qualified + ~1,100 stems > MAX_VECTOR_FILTER_IDS, which
+            // silently disabled the pushdown entirely. Qualified ids get
+            // the budget first; stems only fill what's left. Above the
+            // ceiling the pushed-down IN list costs more to plan than it
+            // saves, and at that size the candidate set nearly covers the
+            // library, so the legacy whole-library top-k + post-filter
+            // mapping below is semantically equivalent.
             let candidate_page_ids: Option<Vec<String>> = if filter.is_some() {
                 let mut ids: Vec<String> = page_paths_by_vector_id.keys().cloned().collect();
-                ids.extend(legacy_page_paths.keys().cloned());
-                (!ids.is_empty() && ids.len() <= MAX_VECTOR_FILTER_IDS).then_some(ids)
+                if ids.len() <= MAX_VECTOR_FILTER_IDS {
+                    let budget = MAX_VECTOR_FILTER_IDS - ids.len();
+                    ids.extend(legacy_page_paths.keys().take(budget).cloned());
+                    Some(ids)
+                } else {
+                    None
+                }
             } else {
                 None
             };

@@ -1205,6 +1205,53 @@ mod tests_v2 {
         assert_eq!(pred, "page_id IN ('questions/a', 'it''s')");
     }
 
+    // 诊断 v2（2026-10-15）：本地合成 1156 规律短 id 全过，但生产实例
+    // type=question（1156 真实 id）挂——直读生产库拿真实报错，区分
+    // 数量 / id 长度 / 索引形态。只读查询，不动库。
+    // 跑法：cargo test --lib diag_prod_predicate -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "需要本机便携版生产库在场（C:/Users/Yang/llm-wiki-portable）"]
+    async fn diag_prod_predicate_real_ids() {
+        let project = "C:/Users/Yang/llm-wiki-portable/data/wiki";
+        let mut ids: Vec<String> = Vec::new();
+        let dir = std::path::Path::new(project).join("wiki/questions");
+        for entry in walkdir::WalkDir::new(&dir)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let rel = p.strip_prefix(std::path::Path::new(project).join("wiki"))
+                .unwrap();
+            let id = rel.to_string_lossy().replace('\\', "/");
+            ids.push(id.trim_end_matches(".md").to_string());
+        }
+        ids.sort();
+        let total = ids.len();
+        let longest = ids.iter().max_by_key(|i| i.len()).unwrap();
+        println!("real question ids: {total}; longest ({} chars): {}", longest.len(), longest);
+        let dim = 2048usize;
+        for n in [total, total / 2, 300] {
+            let n = n.min(total);
+            let sub: Vec<String> = ids[..n].to_vec();
+            let vec: Vec<f32> = (0..dim).map(|i| ((i % 97) as f32) / 97.0).collect();
+            match vector_search_chunks(project.to_string(), vec, 10, Some(sub)).await {
+                Ok(v) => println!("prefix n={n} => Ok({} hits)", v.len()),
+                Err(e) => println!("prefix n={n} => Err: {}", &e[..e.len().min(400)]),
+            }
+        }
+        // 全量但每 id 截短到 10 字符——区分「数量」与「id 内容/长度」。
+        // 截短 id 库里不存在（必然 0 命中），只看查询是否报错。
+        let short: Vec<String> = ids.iter().map(|i| i.chars().take(10).collect()).collect();
+        let vec: Vec<f32> = (0..dim).map(|i| ((i % 89) as f32) / 89.0).collect();
+        match vector_search_chunks(project.to_string(), vec, 10, Some(short)).await {
+            Ok(v) => println!("shortened-all n={total} => Ok({} hits)", v.len()),
+            Err(e) => println!("shortened-all => Err: {}", &e[..e.len().min(400)]),
+        }
+    }
+
     #[tokio::test]
     async fn v2_empty_upsert_is_a_noop_not_an_error() {
         let p = tmp_project();
