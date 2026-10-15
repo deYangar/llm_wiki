@@ -65,6 +65,7 @@ import {
   cleanupWrittenFiles,
   getQueue,
   getQueueSummary,
+  queueFingerprint,
   restoreQueue,
   pauseProcessing,
   resumeProcessing,
@@ -1446,5 +1447,41 @@ describe("cleanupWrittenFiles — page cascade", () => {
       "C:/proj",
       "C:/proj/wiki\\concepts\\rope.md",
     )
+  })
+})
+
+describe("queueFingerprint", () => {
+  it("is stable while nothing changes and differs once a task mutates", async () => {
+    const deferred = createDeferred<string[]>()
+    mockAutoIngest.mockImplementation(() => deferred.promise)
+
+    await enqueueIngest(TEST_ID, `${TEST_PATH}/raw/sources/fp-a.pdf`)
+    await flushMicrotasks(20)
+
+    const before = queueFingerprint()
+    expect(queueFingerprint()).toBe(before)
+
+    const taskId = getQueue()[0].id
+    await cancelTask(taskId)
+    await flushMicrotasks(20)
+
+    expect(queueFingerprint()).not.toBe(before)
+  })
+
+  it("reflects summary inputs that live outside the task array", async () => {
+    const deferred = createDeferred<string[]>()
+    mockAutoIngest.mockImplementation(() => deferred.promise)
+
+    await enqueueIngest(TEST_ID, `${TEST_PATH}/raw/sources/fp-b.pdf`)
+    await flushMicrotasks(20)
+
+    const before = queueFingerprint()
+    // completedSinceIdle is part of getQueueSummary().total; it must move
+    // the fingerprint even though the task itself left the array.
+    deferred.resolve(["wiki/sources/fp-b.md"])
+    await flushMicrotasks(20)
+
+    expect(getQueueSummary().completed).toBe(1)
+    expect(queueFingerprint()).not.toBe(before)
   })
 })

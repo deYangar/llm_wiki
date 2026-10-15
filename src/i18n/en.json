@@ -1105,6 +1105,7 @@
     "moveUp": "Move earlier",
     "moveDown": "Move later",
     "moreTasks": "{{count}} more tasks are retained in the queue",
+    "moreWrittenFiles": "{{count}} more files not shown",
     "fileSync": "File Sync",
     "rescan": "Rescan",
     "rescanTitle": "Scan project files for external changes",

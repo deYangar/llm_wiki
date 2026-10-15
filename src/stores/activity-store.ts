@@ -18,6 +18,13 @@ interface ActivityState {
   clearDone: () => void
 }
 
+// Unbounded growth here killed the WebView2 renderer during long batch
+// ingests: items accumulate per finished source file and each item renders
+// its full filesWritten list. Running items live at the head of the array
+// (addItem prepends, workers are single-digit), so a tail slice cannot
+// drop an in-flight task.
+const MAX_ACTIVITY_ITEMS = 100
+
 let counter = 0
 
 export const useActivityStore = create<ActivityState>((set) => ({
@@ -29,7 +36,7 @@ export const useActivityStore = create<ActivityState>((set) => ({
       items: [
         { ...item, id, createdAt: Date.now() },
         ...state.items,
-      ],
+      ].slice(0, MAX_ACTIVITY_ITEMS),
     }))
     return id
   },

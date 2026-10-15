@@ -722,6 +722,25 @@ export function getQueue(): readonly IngestTask[] {
 }
 
 /**
+ * Cheap content signature covering every field the UI renders from the
+ * queue (id/status/retryCount/error per task, plus the summary inputs
+ * paused / blockedOnLlmConfig / completedSinceIdle). Task records are
+ * mutated in place all over this module, so a mutation counter would be
+ * trivially missed; hashing the rendered fields cannot go stale. Pollers
+ * compare fingerprints and only re-render on change — a 1s poll over a
+ * multi-thousand-task queue used to force a full-panel reconcile every
+ * tick for the whole duration of a batch ingest.
+ */
+export function queueFingerprint(): string {
+  const parts = new Array<string>(queue.length)
+  for (let i = 0; i < queue.length; i++) {
+    const task = queue[i]
+    parts[i] = `${task.id}:${task.status}:${task.retryCount}:${task.error ?? ""}`
+  }
+  return `${paused ? 1 : 0}/${blockedOnLlmConfig ? 1 : 0}/${completedSinceIdle}/${parts.join("|")}`
+}
+
+/**
  * Get queue summary.
  */
 export function getQueueSummary(): {

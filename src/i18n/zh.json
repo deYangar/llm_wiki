@@ -1105,6 +1105,7 @@
     "moveUp": "提前",
     "moveDown": "延后",
     "moreTasks": "队列中还保留 {{count}} 个任务",
+    "moreWrittenFiles": "还有 {{count}} 个文件未显示",
     "fileSync": "文件同步",
     "rescan": "重新扫描",
     "rescanTitle": "扫描项目文件的外部变更",

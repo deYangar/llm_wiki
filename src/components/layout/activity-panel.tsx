@@ -14,6 +14,7 @@ import { normalizePath, getFileName, isAbsolutePath } from "@/lib/path-utils"
 import {
   getQueue,
   getQueueSummary,
+  queueFingerprint,
   retryTask,
   retryAllStoppedTasks,
   retryTasks,
@@ -60,6 +61,9 @@ const WIKI_TYPE_ICON_KEYS: Record<string, keyof typeof FILE_TYPE_ICONS> = {
 }
 
 const MAX_VISIBLE_QUEUE_TASKS = 300
+// qa-split sources can write 100+ pages each; rendering every path of
+// every completed item is what ballooned the DOM during batch ingests.
+const MAX_VISIBLE_WRITTEN_FILES = 20
 
 function getFileTypeInfo(path: string): { icon: typeof FileText; typeKey: string } {
   const inferred = inferWikiTypeFromPath(path)
@@ -94,9 +98,15 @@ export function ActivityPanel() {
   const runningCount = items.filter((i) => i.status === "running").length
   const hasItems = items.length > 0
 
-  // Poll queue state
+  // Poll queue state. Fingerprint-gated: only re-render when something
+  // the panel actually displays changed, instead of forcing a full-panel
+  // reconcile on every 1s tick across a multi-thousand-task queue.
   useEffect(() => {
+    let lastFingerprint = queueFingerprint()
     const interval = setInterval(() => {
+      const next = queueFingerprint()
+      if (next === lastFingerprint) return
+      lastFingerprint = next
       setQueueTasks([...getQueue()])
     }, 1000)
     return () => clearInterval(interval)
@@ -625,7 +635,7 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
       {/* File list with types */}
       {item.filesWritten.length > 0 && item.status === "done" && (
         <div className="mt-1.5 ml-5 flex flex-col gap-0.5">
-          {item.filesWritten.map((filePath) => {
+          {item.filesWritten.slice(0, MAX_VISIBLE_WRITTEN_FILES).map((filePath) => {
             const { icon: Icon, typeKey } = getFileTypeInfo(filePath)
             const fileName = getFileName(filePath)
             return (
@@ -643,6 +653,11 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
               </button>
             )
           })}
+          {item.filesWritten.length > MAX_VISIBLE_WRITTEN_FILES && (
+            <div className="px-1 text-[10px] text-muted-foreground/70">
+              {t("activity.moreWrittenFiles", { count: item.filesWritten.length - MAX_VISIBLE_WRITTEN_FILES })}
+            </div>
+          )}
         </div>
       )}
     </div>

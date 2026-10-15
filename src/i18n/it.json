@@ -1105,6 +1105,7 @@
     "moveUp": "Sposta prima",
     "moveDown": "Sposta dopo",
     "moreTasks": "Altre {{count}} attività sono conservate in coda",
+    "moreWrittenFiles": "Altri {{count}} file non mostrati",
     "fileSync": "Sincronizzazione file",
     "rescan": "Riesamina",
     "rescanTitle": "Cerca modifiche esterne nei file del progetto",
