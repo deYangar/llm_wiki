@@ -5,6 +5,25 @@ import "./index.css";
 import "@/i18n";
 import { loadAndApplyTheme, watchSystemTheme } from "@/lib/theme";
 import { AppDialogHost } from "@/components/app-dialog-host";
+import { invoke } from "@tauri-apps/api/core";
+
+// Desktop only: tell the Rust watchdog the renderer is alive. A renderer
+// killed by an OOM crash during long batch ingests leaves a permanently
+// white window and freezes the ingest scheduler; once the beat stops the
+// watchdog reloads the webview and the persisted queue resumes on its
+// own. The interval stays coarse on purpose: Chromium throttles timers
+// on hidden pages to one wake per minute, and the watchdog threshold
+// already accounts for that.
+function startHeartbeat() {
+  const isTauri = "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
+  if (!isTauri) return;
+  setInterval(() => {
+    invoke("heartbeat").catch(() => {
+      // A rejected invoke usually means the renderer is tearing down
+      // (reload/quit) — nothing to do here; the watchdog owns recovery.
+    });
+  }, 5000);
+}
 
 function applyPlatformClass() {
   const isTauri = "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
@@ -19,6 +38,7 @@ async function initApp() {
     applyPlatformClass();
     await loadAndApplyTheme();
     watchSystemTheme();
+    startHeartbeat();
 
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>

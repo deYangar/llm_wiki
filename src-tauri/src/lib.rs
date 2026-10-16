@@ -4,6 +4,7 @@ mod clip_server;
 mod commands;
 mod cors;
 mod frontmatter;
+mod heartbeat;
 mod panic_guard;
 mod proxy;
 mod server_bind;
@@ -601,6 +602,13 @@ pub fn run() {
             app.manage(agent::cancel::AgentCancellationRegistry::default());
             app.manage(CloseBehaviorState(Mutex::new("minimize".to_string())));
             app.manage(TrayAvailabilityState(Mutex::new(false)));
+            // Webview-crash self-recovery: the frontend beats every few
+            // seconds; a dead or hung renderer stops beating and the
+            // watchdog reloads the main webview (see src/heartbeat.rs).
+            // On reload the frontend restores the persisted ingest queue,
+            // so an unattended batch import survives a renderer crash.
+            app.manage(heartbeat::HeartbeatState::default());
+            heartbeat::start_watchdog(app.handle().clone());
             // Start the API before optional desktop integrations so the
             // backend is reachable if tray setup or another integration fails.
             clip_server::start_clip_server(app.handle().clone());
@@ -664,6 +672,7 @@ pub fn run() {
             clip_server_status,
             api_server_status,
             api_server_reload_config,
+            heartbeat::heartbeat,
             agent_start_turn,
             agent_start_turn_stream,
             agent_cancel_turn,
