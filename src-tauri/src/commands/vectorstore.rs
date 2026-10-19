@@ -644,14 +644,16 @@ pub async fn vector_search_chunks(
             .map_err(|e| format!("Search error: {e}"))?;
         if let Some(ids) = page_ids.as_deref() {
             if !ids.is_empty() {
-                // The pushed-down lane must keep its exact pre-filter flat
-                // scan (the semantics the W2 vector-lane fix measured): an
-                // approximate index retrieving-then-filtering could starve
-                // narrow candidate sets again. Index acceleration applies
-                // only to the whole-library KNN (no page_ids).
-                query = query
-                    .only_if(page_id_in_predicate(ids))
-                    .bypass_vector_index();
+                // Filtered KNN keeps "filter before scoring" semantics:
+                // LanceDB prefilters by default (the filter is applied
+                // before the vector search; the starving post-filter path
+                // only exists behind an explicit .postfilter() we never
+                // call). Measured on the full library (2026-10-20 probe):
+                // index+prefilter returns the identical top-10/distances
+                // of an exact bypassed scan at 477ms vs 2,023ms, and the
+                // whole-library indexed KNN runs in ~11ms where the
+                // pre-index flat scan cost seconds.
+                query = query.only_if(page_id_in_predicate(ids));
             }
         }
         let results_stream = query

@@ -1151,6 +1151,22 @@ fn build_vector_snippet(result: &PageVectorResult) -> String {
     }
 }
 
+/// A char that carries case — lowering or uppercasing it (in either
+/// direction) yields something else. Needles made only of caseless chars
+/// (CJK, digits, punctuation) match identically against raw and
+/// lowercased content, so the whole-content lowercase pass can be skipped
+/// for them. Note the check must look BOTH directions: 'r' lowercases to
+/// itself but uppercase 'R' in the content still needs folding.
+fn needle_needs_case_fold(s: &str) -> bool {
+    s.chars().any(|c| {
+        let mut lo = c.to_lowercase();
+        let lo_same = lo.len() == 1 && lo.next() == Some(c);
+        let mut up = c.to_uppercase();
+        let up_same = up.len() == 1 && up.next() == Some(c);
+        !(lo_same && up_same)
+    })
+}
+
 fn score_file(
     project_path: &str,
     path: &Path,
@@ -1164,15 +1180,36 @@ fn score_file(
     let title = extract_title(content, file_name);
     let title_text = format!("{title} {file_name}");
     let title_lower = title_text.to_lowercase();
-    let content_lower = content.to_lowercase();
+    // One shared matching view of the content. When every needle (phrase +
+    // tokens) is case-invariant — the norm for Chinese queries — the raw
+    // content matches identically and the lowercase allocation is skipped
+    // entirely; otherwise a single lowercase pass is shared by every
+    // component below (the old form lowercased again inside
+    // token_match_score, doubling the per-file cost on wide scans).
+    let fold_needed =
+        needle_needs_case_fold(query_phrase) || tokens.iter().any(|t| needle_needs_case_fold(t));
+    let content_folded: String;
+    let content_lower: &str = if fold_needed {
+        content_folded = content.to_lowercase();
+        content_folded.as_str()
+    } else {
+        content
+    };
     let stem = file_name.trim_end_matches(".md").to_lowercase();
 
     let filename_exact = !query_phrase.is_empty() && stem == query_phrase;
     let title_has_phrase = !query_phrase.is_empty() && title_lower.contains(query_phrase);
-    let content_phrase_occ =
-        count_occurrences(&content_lower, query_phrase).min(MAX_PHRASE_OCC_COUNTED);
-    let title_token_score = token_match_score(&title_text, tokens);
-    let content_token_score = token_match_score(content, tokens);
+    // contains() short-circuits; counting only runs on files that actually
+    // hold the phrase, so zero-hit candidates skip the full match_indices
+    // scan entirely.
+    let content_phrase_occ = if !query_phrase.is_empty() && content_lower.contains(query_phrase)
+    {
+        count_occurrences(&content_lower, query_phrase).min(MAX_PHRASE_OCC_COUNTED)
+    } else {
+        0
+    };
+    let title_token_score = token_match_score_lower(&title_lower, tokens);
+    let content_token_score = token_match_score_lower(&content_lower, tokens);
 
     if !filename_exact
         && !title_has_phrase
@@ -1326,11 +1363,13 @@ fn trim_query_punctuation(value: &str) -> String {
     value.trim_matches(is_query_separator).to_string()
 }
 
-fn token_match_score(text: &str, tokens: &[String]) -> usize {
-    let lower = text.to_lowercase();
+/// Count how many distinct query tokens occur in `lowered` (already
+/// lowercased by the caller — the per-file lowercase is shared across all
+/// scoring components, see score_file).
+fn token_match_score_lower(lowered: &str, tokens: &[String]) -> usize {
     tokens
         .iter()
-        .filter(|token| lower.contains(token.as_str()))
+        .filter(|token| lowered.contains(token.as_str()))
         .count()
 }
 
@@ -2008,6 +2047,49 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn score_file_cjk_fast_path_and_ascii_fold_both_match() {
+        // 纯 CJK needle 走免折叠快路、含大小写 ASCII needle 走折叠路，
+        // 两条路都必须命中并给出正向分。
+        let dir = std::env::temp_dir();
+        let path = dir.join("score fold probe.md");
+        let content = "---\ntitle: 探针\n---\nRevenue Recognition 与 收入确认 的表述\n";
+        std::fs::write(&path, content).unwrap();
+        let hit_cjk = score_file(
+            dir.to_str().unwrap(),
+            &path,
+            content,
+            &["收入".to_string(), "确认".to_string()],
+            "收入确认",
+            "收入确认",
+            false,
+        )
+        .expect("pure-CJK fast path must match");
+        assert!(hit_cjk.score > 0.0);
+        let hit_ascii = score_file(
+            dir.to_str().unwrap(),
+            &path,
+            content,
+            &["revenue".to_string()],
+            "revenue recognition",
+            "Revenue Recognition",
+            false,
+        )
+        .expect("ASCII fold path must match case-insensitively");
+        assert!(hit_ascii.score > 0.0);
+        let miss = score_file(
+            dir.to_str().unwrap(),
+            &path,
+            content,
+            &["不存在的词组".to_string()],
+            "不存在的短语",
+            "不存在的短语",
+            false,
+        );
+        assert!(miss.is_none(), "zero-hit file must drop out");
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn query_embedding_cache_roundtrip_and_eviction() {
