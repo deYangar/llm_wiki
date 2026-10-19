@@ -1,11 +1,11 @@
-import { useState, useEffect, useCallback, useMemo } from "react"
+import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import {
   FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, TrendingUp, Target, ChevronRight, ChevronDown, Layout, Globe, Trash2,
 } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Button } from "@/components/ui/button"
 import { useWikiStore } from "@/stores/wiki-store"
-import { readFile, listDirectory } from "@/commands/fs"
+import { listDirectory, listWikiPageMeta } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
@@ -14,7 +14,6 @@ import { inferWikiTypeFromPath, wikiTypeLabel } from "@/lib/wiki-page-types"
 import { filterRawSourceTree } from "@/lib/source-filter"
 import { useTranslation } from "react-i18next"
 import { useAppDialog } from "@/stores/app-dialog-store"
-import { parseSources } from "@/lib/sources-merge"
 import { filterPagesBySource, listPageSourceIdentities } from "@/lib/knowledge-source-filter"
 import { flattenFilesNaturally } from "@/lib/file-tree-order"
 
@@ -60,43 +59,55 @@ export function KnowledgeTree() {
   const [armedPath, setArmedPath] = useState<string | null>(null)
   const [deletingPath, setDeletingPath] = useState<string | null>(null)
 
+  const loadGeneration = useRef(0)
+
+  // One invoke served from the Rust-side PageMetaIndex cache. The old
+  // loader pulled the whole recursive wiki tree (media images included)
+  // and then read every page's full content in JS on each data-version
+  // bump — overlapping full-library re-reads during batch imports OOM'd
+  // the renderer (partition-alloc abort 0xE0000008).
   const loadPages = useCallback(async () => {
     if (!project) return
-    const pp = normalizePath(project.path)
+    const generation = ++loadGeneration.current
     try {
-      const wikiTree = await listDirectory(`${pp}/wiki`)
-      const mdFiles = flattenMdFiles(wikiTree)
-
-      const pageInfos: WikiPageInfo[] = []
-      for (const file of mdFiles) {
-        // Skip index.md and log.md
-        if (file.name === "index.md" || file.name === "log.md") continue
-        try {
-          const content = await readFile(file.path)
-          const info = parsePageInfo(file.path, file.name, content)
-          pageInfos.push(info)
-        } catch {
-          pageInfos.push({
-            path: file.path,
-            title: file.name.replace(".md", "").replace(/-/g, " "),
-            type: "other",
-            tags: [],
-            sources: [],
-          })
-        }
-      }
-
-      setPages(pageInfos)
+      const rows = await listWikiPageMeta(normalizePath(project.path))
+      if (generation !== loadGeneration.current) return
+      setPages(
+        rows.map((row): WikiPageInfo => {
+          const fileName = row.path.slice(row.path.lastIndexOf("/") + 1)
+          const type =
+            row.type === "other"
+              ? (inferWikiTypeFromPath(row.path, fileName) ?? "other")
+              : row.type
+          return {
+            path: row.path,
+            title: row.title,
+            type,
+            tags: row.tags,
+            origin: row.origin ?? undefined,
+            sources: row.sources,
+          }
+        }),
+      )
     } catch {
-      setPages([])
+      if (generation === loadGeneration.current) setPages([])
     }
   }, [project])
 
-  // Reload when wiki data changes. Do not key this off the visible
+  // Reload when the project changes. Do not key this off the visible
   // sidebar file tree: lazy directory expansion mutates that tree and
-  // should not force a full wiki metadata re-parse.
+  // should not force a wiki metadata re-parse.
   useEffect(() => {
-    loadPages()
+    void loadPages()
+  }, [loadPages])
+
+  // dataVersion churn is debounced: batch imports bump it per write and
+  // the sidebar does not need per-write freshness. The trailing reload
+  // lands after the burst; the generation counter drops stale runs, so
+  // loads never overlap.
+  useEffect(() => {
+    const timer = setTimeout(() => void loadPages(), 3000)
+    return () => clearTimeout(timer)
   }, [loadPages, dataVersion])
 
   useEffect(() => {
@@ -356,45 +367,6 @@ function RawSourcesSection() {
   )
 }
 
-function parsePageInfo(path: string, fileName: string, content: string): WikiPageInfo {
-  let type = "other"
-  let title = fileName.replace(".md", "").replace(/-/g, " ")
-  const tags: string[] = []
-  let origin: string | undefined
-
-  // Parse YAML frontmatter
-  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
-  if (fmMatch) {
-    const fm = fmMatch[1]
-    const typeMatch = fm.match(/^type:\s*(.+)$/m)
-    if (typeMatch) type = typeMatch[1].trim().toLowerCase()
-
-    const titleMatch = fm.match(/^title:\s*["']?(.+?)["']?\s*$/m)
-    if (titleMatch) title = titleMatch[1].trim()
-
-    const tagsMatch = fm.match(/^tags:\s*\[(.+?)\]/m)
-    if (tagsMatch) {
-      tags.push(...tagsMatch[1].split(",").map((t) => t.trim().replace(/["']/g, "")))
-    }
-
-    const originMatch = fm.match(/^origin:\s*(.+)$/m)
-    if (originMatch) origin = originMatch[1].trim()
-  }
-
-  // Fallback: try first heading if no frontmatter title
-  if (title === fileName.replace(".md", "").replace(/-/g, " ")) {
-    const headingMatch = content.match(/^#\s+(.+)$/m)
-    if (headingMatch) title = headingMatch[1].trim()
-  }
-
-  // Fallback: infer type from path
-  if (type === "other") {
-    type = inferWikiTypeFromPath(path, fileName) ?? "other"
-  }
-
-  return { path, title, type, tags, origin, sources: parseSources(content) }
-}
-
 /**
  * Two-stage delete affordance for a single page row. Default state =
  * subtle ghost trash icon. Armed state = solid red Confirm pill so a
@@ -461,16 +433,4 @@ function DeleteButton({
       <Trash2 className="h-3 w-3" />
     </Button>
   )
-}
-
-function flattenMdFiles(nodes: FileNode[]): FileNode[] {
-  const files: FileNode[] = []
-  for (const node of nodes) {
-    if (node.is_dir && node.children) {
-      files.push(...flattenMdFiles(node.children))
-    } else if (!node.is_dir && node.name.endsWith(".md")) {
-      files.push(node)
-    }
-  }
-  return files
 }

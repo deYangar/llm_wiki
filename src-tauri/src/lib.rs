@@ -644,6 +644,7 @@ pub fn run() {
             commands::file_history::set_file_history_settings,
             commands::file_history::clear_file_history,
             commands::fs::list_directory,
+            commands::fs::list_wiki_page_meta,
             commands::fs::copy_file,
             commands::fs::copy_directory,
             commands::fs::preprocess_file,

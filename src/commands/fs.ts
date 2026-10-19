@@ -289,3 +289,22 @@ export async function apiServerReloadConfig(): Promise<string> {
 export async function mcpServerEntryPath(): Promise<string> {
   return invoke<string>("mcp_server_entry_path")
 }
+
+export interface WikiPageMetaRow {
+  path: string
+  title: string
+  type: string
+  tags: string[]
+  origin?: string | null
+  sources: string[]
+}
+
+/**
+ * Compact page metadata for the knowledge tree, served from the
+ * Rust-side PageMetaIndex cache (see list_wiki_page_meta in fs.rs).
+ * Replaces the old loader that pulled the whole recursive tree and
+ * read every page's content in JS on each data-version bump.
+ */
+export async function listWikiPageMeta(projectPath: string): Promise<WikiPageMetaRow[]> {
+  return invoke<WikiPageMetaRow[]>("list_wiki_page_meta", { projectPath })
+}

@@ -1661,6 +1661,135 @@ fn build_tree(
     Ok(nodes)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WikiPageMetaRow {
+    /// Absolute path with `/` separators — same shape `list_directory`
+    /// produced, so preview/read callers need no changes.
+    pub path: String,
+    pub title: String,
+    #[serde(rename = "type")]
+    pub wiki_type: String,
+    pub tags: Vec<String>,
+    pub origin: Option<String>,
+    pub sources: Vec<String>,
+}
+
+/// First `#` heading (one hash, then whitespace) — mirrors the old TS
+/// `parsePageInfo` regex `^#\s+(.+)$/m`. Callers pass head-sized
+/// buffers, which always cover the document top.
+fn first_heading(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            continue;
+        };
+        let Some(after_ws) = rest.strip_prefix(|c: char| c.is_whitespace()) else {
+            continue;
+        };
+        let title = after_ws.trim();
+        if !title.is_empty() {
+            return Some(title.to_string());
+        }
+    }
+    None
+}
+
+/// Map one page's frontmatter to the row the knowledge tree renders,
+/// keeping the old TS `parsePageInfo` fallback ladder: frontmatter title
+/// → first heading (via `heading_probe`, consulted only when the
+/// frontmatter has no title) → filename; type → lowercase frontmatter
+/// value → "other" (the TS layer re-infers "other" from the path).
+fn wiki_page_meta_row(
+    project_path: &str,
+    rel_path: &str,
+    frontmatter: &crate::frontmatter::Frontmatter,
+    heading_probe: impl FnOnce() -> Option<String>,
+) -> WikiPageMetaRow {
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let default_title = name.strip_suffix(".md").unwrap_or(name).replace('-', " ");
+    let fm_first = |key: &str| {
+        frontmatter
+            .get(key)
+            .and_then(|values| values.first())
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    WikiPageMetaRow {
+        path: format!("{}/{}", project_path.trim_end_matches('/'), rel_path),
+        title: fm_first("title")
+            .map(str::to_string)
+            .or_else(heading_probe)
+            .unwrap_or(default_title),
+        wiki_type: fm_first("type")
+            .map(|v| v.to_lowercase())
+            .unwrap_or_else(|| "other".to_string()),
+        tags: frontmatter.get("tags").map(|v| v.to_vec()).unwrap_or_default(),
+        origin: fm_first("origin").map(str::to_string),
+        sources: frontmatter.get("sources").map(|v| v.to_vec()).unwrap_or_default(),
+    }
+}
+
+/// One 1MB re-read for the rare page whose frontmatter did not close
+/// inside the 16KB head read (known generated-page failure shape); the
+/// old TS loader parsed these from the full file.
+fn recover_large_frontmatter(abs_path: &str) -> crate::frontmatter::Frontmatter {
+    const LARGE_HEAD_BYTES: usize = 1024 * 1024;
+    crate::frontmatter::read_head(Path::new(abs_path), LARGE_HEAD_BYTES)
+        .ok()
+        .and_then(|text| {
+            crate::frontmatter::split_frontmatter(&text)
+                .map(|(_, block)| crate::frontmatter::Frontmatter::parse(block))
+        })
+        .unwrap_or_default()
+}
+
+/// Compact metadata rows for the knowledge-tree sidebar.
+///
+/// Replaces the old TS loader, which pulled the whole recursive wiki
+/// tree (media included — ~250k image nodes in the production library)
+/// and then `read_file`d every page's full content on each
+/// data-version bump. Batch imports bump the version continuously, so
+/// overlapping full-library re-reads OOM'd the renderer (partition-alloc
+/// abort 0xE0000008). Served here from the cached `PageMetaIndex`
+/// (fingerprint TTL + write-path invalidation), so steady-state reloads
+/// do zero page I/O and ship one compact payload instead.
+#[tauri::command]
+pub async fn list_wiki_page_meta(project_path: String) -> Result<Vec<WikiPageMetaRow>, String> {
+    require_absolute_path("list_wiki_page_meta", &project_path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("list_wiki_page_meta", || {
+            let index = crate::frontmatter::page_meta_index_cached(&project_path);
+            let project = project_path.trim_end_matches('/');
+            let mut rows = Vec::with_capacity(index.entries().len());
+            for meta in index.entries() {
+                let name = meta.rel_path.rsplit('/').next().unwrap_or("");
+                // index.md / log.md were skipped by the old TS loader too.
+                if name == "index.md" || name == "log.md" {
+                    continue;
+                }
+                let frontmatter = if meta.head_read_ok && !meta.head_closed {
+                    recover_large_frontmatter(&format!("{project}/{}", meta.rel_path))
+                } else {
+                    meta.frontmatter.clone()
+                };
+                let abs = format!("{project}/{}", meta.rel_path);
+                let probe = || {
+                    crate::frontmatter::read_head(
+                        Path::new(&abs),
+                        crate::frontmatter::DEFAULT_HEAD_BYTES,
+                    )
+                    .ok()
+                    .and_then(|head| first_heading(&head))
+                };
+                rows.push(wiki_page_meta_row(project, &meta.rel_path, &frontmatter, probe));
+            }
+            Ok(rows)
+        })
+    })
+    .await
+    .map_err(|e| format!("list_wiki_page_meta blocking task join error: {e}"))?
+}
+
 #[tauri::command]
 pub async fn copy_file(source: String, destination: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2113,6 +2242,49 @@ mod anydoc_benchmark;
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn wiki_meta_first_heading_matches_single_hash_only() {
+        assert_eq!(
+            first_heading("x\n#  Spaced Title \ny").as_deref(),
+            Some("Spaced Title")
+        );
+        assert_eq!(first_heading("## h2\n### h3"), None);
+        assert_eq!(first_heading("#\ttab heading").as_deref(), Some("tab heading"));
+        assert_eq!(first_heading(""), None);
+    }
+
+    #[test]
+    fn wiki_meta_row_maps_frontmatter_fields() {
+        let fm = crate::frontmatter::Frontmatter::parse(
+            "type: Concept\ntitle: \"Concept Page\"\norigin: web-clip\ntags:\n  - \"topic:x\"\nsources:\n  - \"scheduled-import/a.pdf\"",
+        );
+        let row = wiki_page_meta_row(
+            "C:/lib/proj",
+            "wiki/concepts/my-page.md",
+            &fm,
+            || panic!("probe must not run when a title exists"),
+        );
+        assert_eq!(row.path, "C:/lib/proj/wiki/concepts/my-page.md");
+        assert_eq!(row.title, "Concept Page");
+        assert_eq!(row.wiki_type, "concept");
+        assert_eq!(row.tags, vec!["topic:x".to_string()]);
+        assert_eq!(row.sources, vec!["scheduled-import/a.pdf".to_string()]);
+        assert_eq!(row.origin.as_deref(), Some("web-clip"));
+    }
+
+    #[test]
+    fn wiki_meta_row_title_falls_back_to_heading_then_filename() {
+        let fm = crate::frontmatter::Frontmatter::parse("type: concept");
+        let heading =
+            wiki_page_meta_row("P", "wiki/concepts/a.md", &fm, || Some("From Heading".to_string()));
+        assert_eq!(heading.title, "From Heading");
+        let filename = wiki_page_meta_row("P", "wiki/concepts/my-page.md", &fm, || None);
+        assert_eq!(filename.title, "my page");
+        assert_eq!(filename.wiki_type, "concept");
+        assert_eq!(filename.origin, None);
+        assert!(filename.sources.is_empty());
+    }
 
     fn tmp_file_with_extension(extension: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
