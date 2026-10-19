@@ -2416,6 +2416,11 @@ export function updateBoundedRecentIndexSection(index: string, additions: string
   const lines = index.trimEnd().split("\n")
   const start = lines.findIndex((line) => line.trim() === section)
   const prefix = start >= 0 ? lines.slice(0, start) : lines
+  // 每次更新都在节标题前插一个空行；先压缩 prefix 尾部既有空行，否则
+  // 放量导入会让 section 前空行逐次 +1（实测上万次导入累积 3,500+ 行垫空）。
+  let prefixEnd = prefix.length
+  while (prefixEnd > 0 && prefix[prefixEnd - 1].trim() === "") prefixEnd -= 1
+  const boundedPrefix = prefix.slice(0, prefixEnd)
   const sectionEnd = start >= 0
     ? lines.findIndex((line, position) => position > start && /^##\s+/.test(line))
     : -1
@@ -2424,7 +2429,7 @@ export function updateBoundedRecentIndexSection(index: string, additions: string
     : []
   const suffix = sectionEnd >= 0 ? lines.slice(sectionEnd) : []
   const recent = Array.from(new Set([...additions, ...existing])).slice(0, 200)
-  return [...prefix, "", section, ...recent, ...(suffix.length ? ["", ...suffix] : []), ""].join("\n")
+  return [...boundedPrefix, "", section, ...recent, ...(suffix.length ? ["", ...suffix] : []), ""].join("\n")
 }
 
 function isValidSourceReference(source: string, activeSourceIdentity: string): boolean {

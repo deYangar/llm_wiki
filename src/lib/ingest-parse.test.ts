@@ -764,4 +764,32 @@ describe("application-managed aggregate boundaries", () => {
     expect(recent).toContain("[[new]]")
     expect(result).toContain("## Other\nKeep me")
   })
+
+  it("collapses blank-line padding before the recent section instead of accumulating", () => {
+    // 放量导入历史形态：section 前垫着上千空行（每次更新 +1 累积而成）。
+    const padded = [
+      "# Wiki Index",
+      "",
+      "## Synthesis",
+      ...Array.from({ length: 3536 }, () => ""),
+      "## Recently Updated",
+      "- [[a]] — A",
+    ].join("\n")
+    const result = updateBoundedRecentIndexSection(padded, ["- [[b]] — B"])
+    expect(result).toBe(
+      [
+        "# Wiki Index",
+        "",
+        "## Synthesis",
+        "",
+        "## Recently Updated",
+        "- [[b]] — B",
+        "- [[a]] — A",
+        "",
+      ].join("\n"),
+    )
+    // 无 section 分支同样不残留尾空行（trimEnd 后再防御一次）。
+    const noSection = updateBoundedRecentIndexSection("# Wiki Index\n\n\n", ["- [[c]] — C"])
+    expect(noSection.startsWith("# Wiki Index\n\n## Recently Updated\n")).toBe(true)
+  })
 })
