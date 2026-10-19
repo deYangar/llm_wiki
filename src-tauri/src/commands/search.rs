@@ -321,6 +321,31 @@ fn resolve_reader_wikilink<'a>(
     })
 }
 
+/// Query-embedding memo cache (2026-10-19 search round). Attribution on the
+/// 49k-page library: the provider round-trip costs 1.7–2.7s per request —
+/// 80–95% of end-to-end P95 — while the retrieval body over a narrow filter
+/// runs in ~50ms (W6.1 cache). Embedding providers are deterministic for a
+/// given (endpoint, model, key, input), so repeated queries can reuse the
+/// vector instead of re-paying the network. FIFO eviction keeps it a plain
+/// bump-allocation of ~2MB at 512 entries × 1024-dim vectors; no TTL — a
+/// provider-side model swap ages out naturally as the cache turns over.
+const QUERY_EMBEDDING_CACHE_CAPACITY: usize = 512;
+
+static QUERY_EMBEDDING_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<(u64, Vec<f32>)>>,
+> = std::sync::OnceLock::new();
+
+fn query_embedding_cache_key(cfg: &SearchEmbeddingConfig, query: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    cfg.endpoint.hash(&mut hasher);
+    cfg.model.hash(&mut hasher);
+    cfg.api_key.hash(&mut hasher);
+    query.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub async fn resolve_query_embedding(
     query: &str,
     explicit_embedding: Option<Vec<f32>>,
@@ -335,13 +360,46 @@ pub async fn resolve_query_embedding(
     if !cfg.enabled || cfg.endpoint.trim().is_empty() || cfg.model.trim().is_empty() {
         return Ok(None);
     }
+    let key = query_embedding_cache_key(&cfg, query);
+    if let Some(hit) = lookup_query_embedding(key) {
+        return Ok(Some(hit));
+    }
     match fetch_embedding_with_retry(query, &cfg, 0).await {
-        Ok(embedding) => validate_query_embedding(embedding).map(Some),
+        Ok(embedding) => {
+            let embedding = validate_query_embedding(embedding)?;
+            store_query_embedding(key, &embedding);
+            Ok(Some(embedding))
+        }
         Err(err) => {
             eprintln!("[Search] embedding disabled for this request: {err}");
             Ok(None)
         }
     }
+}
+
+fn lookup_query_embedding(key: u64) -> Option<Vec<f32>> {
+    let cache = QUERY_EMBEDDING_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(idx) = guard.iter().position(|(k, _)| *k == key) {
+        // Re-queue the hit so repeated popular queries resist eviction.
+        let entry = guard.remove(idx)?;
+        let vector = entry.1.clone();
+        guard.push_back(entry);
+        Some(vector)
+    } else {
+        None
+    }
+}
+
+fn store_query_embedding(key: u64, vector: &[f32]) {
+    let cache = QUERY_EMBEDDING_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= QUERY_EMBEDDING_CACHE_CAPACITY {
+        guard.pop_front();
+    }
+    guard.push_back((key, vector.to_vec()));
 }
 
 fn validate_query_embedding(embedding: Vec<f32>) -> Result<Vec<f32>, String> {
@@ -1950,6 +2008,47 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn query_embedding_cache_roundtrip_and_eviction() {
+        // 同 key 命中且重排队；异 key 不串；容量满 FIFO 淘汰最老。
+        let key = 0xfeed_u64;
+        store_query_embedding(key, &[1.0, 2.0]);
+        assert_eq!(lookup_query_embedding(key).as_deref(), Some(&[1.0f32, 2.0][..]));
+        assert_eq!(lookup_query_embedding(0xdead_u64), None);
+        for i in 0..QUERY_EMBEDDING_CACHE_CAPACITY as u64 {
+            store_query_embedding(0x1000 + i, &[i as f32]);
+        }
+        // 大量插入后，最早的测试 key 已被挤出（容量 ≤ 上限）
+        let cache = QUERY_EMBEDDING_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(guard.len() <= QUERY_EMBEDDING_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn query_embedding_cache_key_separates_configs() {
+        let base = SearchEmbeddingConfig {
+            enabled: true,
+            endpoint: "https://e.example/v1".into(),
+            api_key: "k1".into(),
+            model: "m".into(),
+            output_dimensionality: None,
+            extra_headers: None,
+            max_chunk_chars: None,
+            overlap_chunk_chars: None,
+        };
+        let mut other = base.clone();
+        other.model = "m2".into();
+        assert_ne!(
+            query_embedding_cache_key(&base, "收入确认"),
+            query_embedding_cache_key(&other, "收入确认")
+        );
+        assert_ne!(
+            query_embedding_cache_key(&base, "收入确认"),
+            query_embedding_cache_key(&base, "毛利率")
+        );
+    }
 
     fn tmp_project() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
