@@ -588,7 +588,7 @@ pub(crate) async fn vector_page_revision_match(
 /// page_id values are validated upstream (no quotes/newlines/backslashes —
 /// see `validate_page_id_for_v2`), so the escaping here is belt-and-braces
 /// only, not the injection defense.
-fn page_id_in_predicate(page_ids: &[String]) -> String {
+pub(crate) fn page_id_in_predicate(page_ids: &[String]) -> String {
     let quoted: Vec<String> = page_ids
         .iter()
         .map(|id| format!("'{}'", id.replace('\'', "''")))
@@ -616,36 +616,70 @@ pub async fn vector_search_chunks(
     page_ids: Option<Vec<String>>,
 ) -> Result<Vec<ChunkSearchResult>, String> {
     run_guarded_async("vector_search_chunks", async move {
-        let lock = vectorstore_v2_lock(&project_path);
-        let _guard = lock.read().await;
-
-        let db = connect(&db_path(&project_path))
-            .execute()
+        let predicate = page_ids.as_deref().and_then(|ids| {
+            (!ids.is_empty()).then(|| page_id_in_predicate(ids))
+        });
+        vector_search_chunks_predicate_inner(&project_path, query_embedding, top_k, predicate)
             .await
-            .map_err(|e| format!("DB connect error: {e}"))?;
+    })
+    .await
+}
 
-        let tables = db
-            .table_names()
-            .execute()
+/// Predicate-form entry for the Rust search pipeline: the caller supplies
+/// a ready `page_id` SQL predicate (IN-list and/or directory range terms,
+/// see `build_page_id_predicate` in commands::search). Semantics are the
+/// same constrained KNN as `page_ids` — the predicate form exists because
+/// whole-directory candidate sets (type=section ≈ 24k ids) make a literal
+/// IN-list megabytes long while an equivalent range term is ~40 chars.
+pub async fn vector_search_chunks_predicate(
+    project_path: String,
+    query_embedding: Vec<f32>,
+    top_k: usize,
+    predicate: String,
+) -> Result<Vec<ChunkSearchResult>, String> {
+    run_guarded_async("vector_search_chunks_predicate", async move {
+        vector_search_chunks_predicate_inner(&project_path, query_embedding, top_k, Some(predicate))
             .await
-            .map_err(|e| format!("List tables error: {e}"))?;
+    })
+    .await
+}
 
-        if !tables.contains(&TABLE_V2.to_string()) {
-            return Ok(vec![]);
-        }
+async fn vector_search_chunks_predicate_inner(
+    project_path: &str,
+    query_embedding: Vec<f32>,
+    top_k: usize,
+    predicate: Option<String>,
+) -> Result<Vec<ChunkSearchResult>, String> {
+    let lock = vectorstore_v2_lock(project_path);
+    let _guard = lock.read().await;
 
-        let table = db
-            .open_table(TABLE_V2)
-            .execute()
-            .await
-            .map_err(|e| format!("Open table error: {e}"))?;
+    let db = connect(&db_path(project_path))
+        .execute()
+        .await
+        .map_err(|e| format!("DB connect error: {e}"))?;
 
-        let mut query = table
-            .vector_search(query_embedding)
-            .map_err(|e| format!("Search error: {e}"))?;
-        if let Some(ids) = page_ids.as_deref() {
-            if !ids.is_empty() {
-                // Filtered KNN keeps "filter before scoring" semantics:
+    let tables = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(|e| format!("List tables error: {e}"))?;
+
+    if !tables.contains(&TABLE_V2.to_string()) {
+        return Ok(vec![]);
+    }
+
+    let table = db
+        .open_table(TABLE_V2)
+        .execute()
+        .await
+        .map_err(|e| format!("Open table error: {e}"))?;
+
+    let mut query = table
+        .vector_search(query_embedding)
+        .map_err(|e| format!("Search error: {e}"))?;
+    if let Some(predicate) = predicate.as_deref() {
+        if !predicate.is_empty() {
+            // Filtered KNN keeps "filter before scoring" semantics:
                 // LanceDB prefilters by default (the filter is applied
                 // before the vector search; the starving post-filter path
                 // only exists behind an explicit .postfilter() we never
@@ -654,7 +688,7 @@ pub async fn vector_search_chunks(
                 // of an exact bypassed scan at 477ms vs 2,023ms, and the
                 // whole-library indexed KNN runs in ~11ms where the
                 // pre-index flat scan cost seconds.
-                query = query.only_if(page_id_in_predicate(ids));
+                query = query.only_if(predicate.to_string());
             }
         }
         let results_stream = query
@@ -710,8 +744,6 @@ pub async fn vector_search_chunks(
         }
 
         Ok(out)
-    })
-    .await
 }
 
 /// Delete every chunk belonging to a page. Used when a source document

@@ -437,6 +437,7 @@ pub async fn search_project_inner(
     let mut legacy_stem_candidates = BTreeMap::<String, Vec<String>>::new();
     let mut graph_pages = BTreeMap::new();
     let mut total_filtered = 0usize;
+    let mut vector_pushdown_predicate: Option<String> = None;
 
     let wiki_root = Path::new(&project_path).join("wiki");
     if wiki_root.exists() {
@@ -560,6 +561,16 @@ pub async fn search_project_inner(
             }
         }
         total_filtered = graph_pages.len();
+        // Vector-lane pushdown predicate, built while `index` (the full
+        // page set) is still in scope: fully-covered directories become
+        // one BTree-friendly range term each, only partially-covered
+        // directories pay per-id IN entries. Exactly equivalent to an
+        // IN-list over the candidate ids — a page matches the predicate
+        // iff it is a final candidate (stem-only ids are excluded on
+        // purpose: they never match a v2 row).
+        if filter.is_some() {
+            vector_pushdown_predicate = build_page_id_predicate(&index, &page_paths_by_vector_id);
+        }
     }
     let legacy_page_paths = legacy_stem_candidates
         .into_iter()
@@ -596,18 +607,16 @@ pub async fn search_project_inner(
             // used to guard the IN-list became obsolete once the page_id
             // BTree scalar index landed: measured on the full library
             // 2026-10-20, 422 ids = 7ms, 2,000 = 30ms, 8,254 = 409ms
-            // (pre-index the same lists cost 0.8-25s). Legacy stem ids
-            // are deliberately excluded: they exist only for v1-migration
-            // rows, never match a v2 page_id, and each costs an index
-            // lookup that can never hit.
-            let candidate_page_ids: Option<Vec<String>> = filter.is_some().then(|| {
-                page_paths_by_vector_id.keys().cloned().collect()
-            });
+            // (pre-index the same lists cost 0.8-25s). The predicate is
+            // built as directory ranges + an IN-list for partially
+            // covered directories (see build_page_id_predicate) so
+            // whole-directory filters (type=section ≈ 24k ids) don't pay
+            // a megabyte-long IN-list.
             match search_by_embedding(
                 &project_path,
                 embedding,
                 window.max(10),
-                candidate_page_ids,
+                vector_pushdown_predicate.clone(),
             )
             .await
             {
@@ -1001,19 +1010,96 @@ struct PageVectorResult {
     heading_path: String,
 }
 
+/// Build the vector-lane pushdown predicate for the filtered candidate
+/// set. Directories whose every page (with a vector id) survived the
+/// filter collapse into a single `page_id >= 'dir/' AND page_id < 'dir0'`
+/// range term — the upper bound is the last byte of `dir/` (always ASCII
+/// '/') incremented, so nothing but `dir/...` strings can fall inside.
+/// Partially-covered directories contribute per-id IN entries. Stem-only
+/// ids (no '/') are skipped entirely: they exist only for v1-migration
+/// rows and never match a v2 page_id. Returns None when there are no
+/// qualified candidates (an empty IN-list is not valid SQL; the caller
+/// then runs unconstrained and the belt-and-braces post-map drops
+/// everything, same as before).
+fn build_page_id_predicate(
+    index: &crate::frontmatter::PageMetaIndex,
+    candidates: &BTreeMap<String, String>,
+) -> Option<String> {
+    // dir -> (any page seen, all pages are final candidates)
+    let mut by_dir: BTreeMap<String, bool> = BTreeMap::new();
+    for meta in index.entries() {
+        let Some(id) = vector_page_id(&meta.rel_path) else { continue };
+        let Some((dir, _)) = id.rsplit_once('/') else { continue };
+        let fully = by_dir.entry(dir.to_string()).or_insert(true);
+        if !candidates.contains_key(&id) {
+            *fully = false;
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut terms: Vec<String> = Vec::new();
+    let mut leftover: Vec<String> = Vec::new();
+    for id in candidates.keys() {
+        match id.rsplit_once('/') {
+            Some((dir, _)) => {
+                if !by_dir.get(dir).copied().unwrap_or(false) {
+                    leftover.push(id.clone());
+                }
+            }
+            None => {} // stem-only: never matches v2, excluded on purpose
+        }
+    }
+    for (dir, fully) in &by_dir {
+        if *fully {
+            let lower = format!("{dir}/");
+            let upper = format!("{}0", &lower[..lower.len() - 1]);
+            terms.push(format!(
+                "(page_id >= '{}' AND page_id < '{}')",
+                lower.replace('\'', "''"),
+                upper.replace('\'', "''")
+            ));
+        }
+    }
+    if !leftover.is_empty() {
+        terms.push(vectorstore::page_id_in_predicate(&leftover));
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    Some(if terms.len() == 1 {
+        terms.into_iter().next().unwrap_or_default()
+    } else {
+        format!("({})", terms.join(" OR "))
+    })
+}
+
 async fn search_by_embedding(
     project_path: &str,
     query_embedding: Vec<f32>,
     top_k: usize,
-    candidate_page_ids: Option<Vec<String>>,
+    page_id_predicate: Option<String>,
 ) -> Result<Vec<PageVectorResult>, String> {
-    let raw_chunks = vectorstore::vector_search_chunks(
-        project_path.to_string(),
-        query_embedding,
-        (top_k * 3).max(30),
-        candidate_page_ids,
-    )
-    .await?;
+    let raw_chunks = match page_id_predicate {
+        Some(predicate) => {
+            vectorstore::vector_search_chunks_predicate(
+                project_path.to_string(),
+                query_embedding,
+                (top_k * 3).max(30),
+                predicate,
+            )
+            .await?
+        }
+        None => {
+            vectorstore::vector_search_chunks(
+                project_path.to_string(),
+                query_embedding,
+                (top_k * 3).max(30),
+                None,
+            )
+            .await?
+        }
+    };
     if raw_chunks.is_empty() {
         return Ok(vec![]);
     }
