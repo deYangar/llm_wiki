@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
+import { refreshProjectFileTree, flushDeferredPathIndexRebuild } from "@/lib/project-file-tree-refresh"
 import { useWikiStore } from "@/stores/wiki-store"
 import type { FileNode, WikiProject } from "@/types/wiki"
 import { buildProjectPathIndexFromTree } from "@/lib/wiki-page-resolver"
@@ -305,5 +305,83 @@ describe("refreshProjectFileTree", () => {
     expect(useWikiStore.getState().fileTree).toEqual([])
     expect(useWikiStore.getState().projectPathIndex.byPath.size).toBe(0)
     expect(useWikiStore.getState().dataVersion).toBe(0)
+  })
+
+  it("defers the resolver-index rebuild on hot write paths and runs it after the idle window", async () => {
+    vi.useFakeTimers()
+    mocks.listDirectory.mockImplementation(async (_path: string, options?: { maxDepth?: number }) =>
+      options?.maxDepth === 2 ? shallowTree : fullTree
+    )
+    try {
+      await refreshProjectFileTree(project.path, {
+        projectId: project.id,
+        bumpDataVersion: true,
+        deferPathIndex: true,
+      })
+      await flushMicrotasks()
+
+      // Only the shallow display scan ran; the full resolver scan did not.
+      expect(mocks.listDirectory).toHaveBeenCalledTimes(1)
+      expect(mocks.listDirectory).toHaveBeenCalledWith(project.path, { maxDepth: 2 })
+      expect(useWikiStore.getState().projectPathIndex.byPath.size).toBe(0)
+      expect(useWikiStore.getState().fileTree).toEqual(shallowTree)
+      expect(useWikiStore.getState().dataVersion).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(30_000)
+      await flushMicrotasks()
+
+      const fullScanCalls = mocks.listDirectory.mock.calls.filter(
+        ([path, options]) => path === project.path && options === undefined,
+      )
+      expect(fullScanCalls).toHaveLength(1)
+      expect(useWikiStore.getState().projectPathIndex.byPath.has("/tmp/project/wiki/entities/alpha.md")).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("resets the idle timer on every deferred write so one rebuild serves the whole burst", async () => {
+    vi.useFakeTimers()
+    mocks.listDirectory.mockImplementation(async (_path: string, options?: { maxDepth?: number }) =>
+      options?.maxDepth === 2 ? shallowTree : fullTree
+    )
+    try {
+      await refreshProjectFileTree(project.path, { projectId: project.id, deferPathIndex: true })
+      await vi.advanceTimersByTimeAsync(20_000)
+      await refreshProjectFileTree(project.path, { projectId: project.id, deferPathIndex: true })
+
+      // 25s after the first write: still inside the second write's window.
+      await vi.advanceTimersByTimeAsync(5_000)
+      await flushMicrotasks()
+      expect(mocks.listDirectory.mock.calls.filter(([path, options]) => path === project.path && options === undefined)).toHaveLength(0)
+
+      // 50s after the first write (30s after the last one): exactly one rebuild.
+      await vi.advanceTimersByTimeAsync(25_000)
+      await flushMicrotasks()
+      expect(mocks.listDirectory.mock.calls.filter(([path, options]) => path === project.path && options === undefined)).toHaveLength(1)
+      expect(useWikiStore.getState().projectPathIndex.byPath.has("/tmp/project/wiki/entities/alpha.md")).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("flushes a pending deferred rebuild immediately", async () => {
+    mocks.listDirectory.mockImplementation(async (_path: string, options?: { maxDepth?: number }) =>
+      options?.maxDepth === 2 ? shallowTree : fullTree
+    )
+
+    await refreshProjectFileTree(project.path, { projectId: project.id, deferPathIndex: true })
+    await flushMicrotasks()
+    expect(mocks.listDirectory.mock.calls.filter(([path, options]) => path === project.path && options === undefined)).toHaveLength(0)
+
+    await flushDeferredPathIndexRebuild()
+
+    expect(mocks.listDirectory.mock.calls.filter(([path, options]) => path === project.path && options === undefined)).toHaveLength(1)
+    expect(useWikiStore.getState().projectPathIndex.byPath.has("/tmp/project/wiki/entities/alpha.md")).toBe(true)
+  })
+
+  it("flush is a no-op when nothing is deferred", async () => {
+    await flushDeferredPathIndexRebuild()
+    expect(mocks.listDirectory).not.toHaveBeenCalled()
   })
 })

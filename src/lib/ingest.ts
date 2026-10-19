@@ -1755,7 +1755,7 @@ async function autoIngestImpl(
 
   if (writtenPaths.length > 0) {
     try {
-      await refreshProjectFileTree(pp, { bumpDataVersion: true })
+      await refreshProjectFileTree(pp, { bumpDataVersion: true, deferPathIndex: true })
     } catch {
       // ignore
     }
@@ -2243,7 +2243,7 @@ async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]>
 
     if (writtenPaths.length > 0) {
       try {
-        await refreshProjectFileTree(pp, { bumpDataVersion: true })
+        await refreshProjectFileTree(pp, { bumpDataVersion: true, deferPathIndex: true })
       } catch {
         // ignore
       }

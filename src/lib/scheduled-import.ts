@@ -577,6 +577,7 @@ export async function scanAndImport(
       await refreshProjectFileTree(projectPath, {
         projectId: project.id,
         bumpDataVersion: true,
+        deferPathIndex: true,
       })
     }
 

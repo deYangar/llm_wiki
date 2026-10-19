@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useWikiStore } from "@/stores/wiki-store"
-import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
+import { refreshProjectFileTree, flushDeferredPathIndexRebuild } from "@/lib/project-file-tree-refresh"
 import { IconSidebar } from "./icon-sidebar"
 import { UpdateBanner } from "./update-banner"
 import { SidebarPanel } from "./sidebar-panel"
@@ -44,6 +44,17 @@ export function AppLayout({ onSwitchProject }: AppLayoutProps) {
   useEffect(() => {
     loadFileTree()
   }, [loadFileTree])
+
+  // Batch imports defer the resolver-index rebuild to idle; when the user
+  // comes back to the window, bring it current so link resolution sees any
+  // pages written while the window was in the background.
+  useEffect(() => {
+    const onWindowFocus = () => {
+      void flushDeferredPathIndexRebuild()
+    }
+    window.addEventListener("focus", onWindowFocus)
+    return () => window.removeEventListener("focus", onWindowFocus)
+  }, [])
 
   const startDrag = useCallback(
     (side: "left" | "right") => (e: React.MouseEvent) => {

@@ -6,6 +6,7 @@ import { hasUsableLlm } from "@/lib/has-usable-llm"
 import { getTaskLlmConfig } from "@/lib/llm-task-routing"
 import { IngestCommitCoordinator } from "@/lib/ingest-commit-coordinator"
 import { clampUserConcurrency } from "@/lib/concurrency-limits"
+import { flushDeferredPathIndexRebuild } from "@/lib/project-file-tree-refresh"
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -986,6 +987,11 @@ async function onQueueDrained(projectId: string, projectPath: string, epoch: num
   // would burn tokens analyzing the wrong project.
   if (currentProjectId !== projectId || queueEpoch !== epoch) return
   processedSinceDrain = false
+
+  // Per-write refreshes deferred the resolver-index rebuild; the queue is
+  // drained now, so bring the index current before the sweep (and the user)
+  // reads it.
+  void flushDeferredPathIndexRebuild()
 
   sweepAbortController = new AbortController()
   const signal = sweepAbortController.signal
