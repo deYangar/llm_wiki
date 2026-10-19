@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react"
+import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect, memo } from "react"
 import {
   FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, TrendingUp, Target, ChevronRight, ChevronDown, Layout, Globe, Trash2,
 } from "lucide-react"
@@ -16,6 +16,9 @@ import { useTranslation } from "react-i18next"
 import { useAppDialog } from "@/stores/app-dialog-store"
 import { filterPagesBySource, listPageSourceIdentities } from "@/lib/knowledge-source-filter"
 import { flattenFilesNaturally } from "@/lib/file-tree-order"
+import { buildRowOffsets, buildTreeListRows, findVisibleRowRange, treeRowHeight } from "@/lib/virtual-tree-rows"
+
+const VISIBLE_RANGE_OVERSCAN = 8
 
 interface WikiPageInfo {
   path: string
@@ -158,37 +161,84 @@ export function KnowledgeTree() {
     [appDialog, project, armedPath, loadPages, selectedFile, setSelectedFile],
   )
 
-  if (!project) {
-    return (
-      <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
-        No project open
-      </div>
+  // Group pages by type (memoized: the flatten/windowing below keys off
+  // these identities and must not recompute on scroll-driven renders).
+  const sortedGroups = useMemo(() => {
+    const grouped = new Map<string, WikiPageInfo[]>()
+    for (const page of visiblePages) {
+      const list = grouped.get(page.type) ?? []
+      list.push(page)
+      grouped.set(page.type, list)
+    }
+    return [...grouped.entries()].sort((a, b) => {
+      const orderA = typeConfig(a[0]).order
+      const orderB = typeConfig(b[0]).order
+      if (orderA === orderB) return wikiTypeLabel(a[0]).localeCompare(wikiTypeLabel(b[0]))
+      return orderA - orderB
+    })
+  }, [visiblePages])
+
+  // ~50k pages would otherwise live in the DOM at once and re-allocate on
+  // every data-version refresh; only the viewport slice is mounted.
+  const rows = useMemo(
+    () => buildTreeListRows(sortedGroups, expandedTypes),
+    [sortedGroups, expandedTypes],
+  )
+  const { offsets, totalHeight } = useMemo(() => buildRowOffsets(rows), [rows])
+
+  const listWrapperRef = useRef<HTMLDivElement>(null)
+  const [visibleRange, setVisibleRange] = useState<[number, number]>([0, 0])
+
+  const updateVisibleRange = useCallback(() => {
+    const wrapper = listWrapperRef.current
+    const scroller = wrapper?.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')
+    if (!wrapper || !scroller || rows.length === 0) {
+      setVisibleRange((prev) => (prev[0] === 0 && prev[1] === rows.length ? prev : [0, rows.length]))
+      return
+    }
+    const wrapperTop =
+      wrapper.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop
+    const [from, to] = findVisibleRowRange(
+      offsets,
+      scroller.scrollTop - wrapperTop,
+      scroller.scrollTop - wrapperTop + scroller.clientHeight,
+      VISIBLE_RANGE_OVERSCAN,
     )
-  }
+    setVisibleRange((prev) => (prev[0] === from && prev[1] === to ? prev : [from, to]))
+  }, [offsets, rows.length])
 
-  // Group pages by type
-  const grouped = new Map<string, WikiPageInfo[]>()
-  for (const page of visiblePages) {
-    const list = grouped.get(page.type) ?? []
-    list.push(page)
-    grouped.set(page.type, list)
-  }
+  useLayoutEffect(() => {
+    const wrapper = listWrapperRef.current
+    if (!wrapper) return
+    updateVisibleRange()
+    const scroller = wrapper.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')
+    if (!scroller) return
+    scroller.addEventListener("scroll", updateVisibleRange, { passive: true })
+    const observer = new ResizeObserver(() => updateVisibleRange())
+    observer.observe(scroller)
+    return () => {
+      scroller.removeEventListener("scroll", updateVisibleRange)
+      observer.disconnect()
+    }
+  }, [updateVisibleRange])
 
-  // Sort groups by configured order
-  const sortedGroups = [...grouped.entries()].sort((a, b) => {
-    const orderA = typeConfig(a[0]).order
-    const orderB = typeConfig(b[0]).order
-    if (orderA === orderB) return wikiTypeLabel(a[0]).localeCompare(wikiTypeLabel(b[0]))
-    return orderA - orderB
-  })
-
-  function toggleType(type: string) {
+  const toggleType = useCallback((type: string) => {
     setExpandedTypes((prev) => {
       const next = new Set(prev)
       if (next.has(type)) next.delete(type)
       else next.add(type)
       return next
     })
+  }, [])
+
+  const [rangeFrom, rangeTo] = visibleRange
+
+  if (!project) {
+    return (
+      <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
+        No project open
+      </div>
+    )
   }
 
   return (
@@ -223,76 +273,39 @@ export function KnowledgeTree() {
           </div>
         )}
 
-        {sortedGroups.map(([type, items]) => {
-          const config = typeConfig(type)
-          const Icon = config.icon
-          const isExpanded = expandedTypes.has(type)
-
-          return (
-            <div key={type} className="mb-1">
-              <button
-                onClick={() => toggleType(type)}
-                className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50"
+        <div ref={listWrapperRef} style={{ position: "relative", height: totalHeight }}>
+          {rows.slice(rangeFrom, rangeTo).map((row, i) => {
+            const index = rangeFrom + i
+            return (
+              <div
+                key={row.key}
+                className="absolute left-0 right-0"
+                style={{ top: offsets[index], height: treeRowHeight(row.kind) }}
               >
-                {isExpanded ? (
-                  <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                {row.kind === "header" ? (
+                  <TypeHeaderRow
+                    type={row.type}
+                    count={row.count}
+                    label={t(`sidebar.typeLabels.${row.type}`, { defaultValue: typeConfig(row.type).label })}
+                    icon={typeConfig(row.type).icon}
+                    color={typeConfig(row.type).color}
+                    isExpanded={expandedTypes.has(row.type)}
+                    onToggle={toggleType}
+                  />
                 ) : (
-                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <PageRow
+                    page={row.page}
+                    isSelected={selectedFile === row.page.path}
+                    isArmed={armedPath === row.page.path}
+                    isDeleting={deletingPath === row.page.path}
+                    onOpen={openPathInPreview}
+                    onDelete={handleDeleteClick}
+                  />
                 )}
-                <Icon className={`h-3.5 w-3.5 shrink-0 ${config.color}`} />
-                <span className="flex-1 text-left font-medium">
-                  {t(`sidebar.typeLabels.${type}`, { defaultValue: config.label })}
-                </span>
-                <span className="text-xs text-muted-foreground">{items.length}</span>
-              </button>
-
-              {isExpanded && (
-                <div className="ml-3">
-                  {items.map((page) => {
-                    const isSelected = selectedFile === page.path
-                    const isArmed = armedPath === page.path
-                    const isDeleting = deletingPath === page.path
-                    return (
-                      <div
-                        key={page.path}
-                        className={`group flex items-center gap-1 rounded-md ${
-                          isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
-                        }`}
-                      >
-                        <button
-                          onClick={() => openPathInPreview(page.path)}
-                          className={`flex flex-1 items-center gap-1.5 px-2 py-1 text-left text-sm min-w-0 ${
-                            isSelected
-                              ? "text-accent-foreground"
-                              : "text-muted-foreground group-hover:text-accent-foreground"
-                          }`}
-                          title={page.path}
-                        >
-                          {page.origin === "web-clip" && <Globe className="h-3 w-3 shrink-0 text-blue-400" />}
-                          <span className="truncate">{page.title}</span>
-                        </button>
-                        <DeleteButton
-                          armed={isArmed}
-                          deleting={isDeleting}
-                          // Visible on hover, when this row is armed,
-                          // or while deleting. Other rows fade out so
-                          // accidental clicks on a sibling don't pile up.
-                          className={`mr-1 transition-opacity ${
-                            isArmed || isDeleting
-                              ? "opacity-100"
-                              : "opacity-0 group-hover:opacity-100"
-                          }`}
-                          onClick={() => void handleDeleteClick(page.path)}
-                          name={page.title}
-                        />
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
-          )
-        })}
+              </div>
+            )
+          })}
+        </div>
 
         {/* Raw sources quick access */}
         <RawSourcesSection />
@@ -300,6 +313,93 @@ export function KnowledgeTree() {
     </ScrollArea>
   )
 }
+
+const TypeHeaderRow = memo(function TypeHeaderRow({
+  type,
+  count,
+  label,
+  icon: Icon,
+  color,
+  isExpanded,
+  onToggle,
+}: {
+  type: string
+  count: number
+  label: string
+  icon: typeof FileText
+  color: string
+  isExpanded: boolean
+  onToggle: (type: string) => void
+}) {
+  return (
+    <button
+      onClick={() => onToggle(type)}
+      className="flex h-8 w-full items-center gap-1.5 rounded-md px-2 text-sm hover:bg-accent/50"
+    >
+      {isExpanded ? (
+        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      ) : (
+        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      )}
+      <Icon className={`h-3.5 w-3.5 shrink-0 ${color}`} />
+      <span className="flex-1 text-left font-medium">{label}</span>
+      <span className="text-xs text-muted-foreground">{count}</span>
+    </button>
+  )
+})
+
+const PageRow = memo(function PageRow({
+  page,
+  isSelected,
+  isArmed,
+  isDeleting,
+  onOpen,
+  onDelete,
+}: {
+  page: WikiPageInfo
+  isSelected: boolean
+  isArmed: boolean
+  isDeleting: boolean
+  onOpen: (path: string) => void
+  onDelete: (pagePath: string) => Promise<void>
+}) {
+  return (
+    <div className="ml-3 h-full">
+      <div
+        className={`group flex h-7 items-center gap-1 rounded-md ${
+          isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
+        }`}
+      >
+        <button
+          onClick={() => onOpen(page.path)}
+          className={`flex h-full flex-1 items-center gap-1.5 px-2 text-left text-sm min-w-0 ${
+            isSelected
+              ? "text-accent-foreground"
+              : "text-muted-foreground group-hover:text-accent-foreground"
+          }`}
+          title={page.path}
+        >
+          {page.origin === "web-clip" && <Globe className="h-3 w-3 shrink-0 text-blue-400" />}
+          <span className="truncate">{page.title}</span>
+        </button>
+        <DeleteButton
+          armed={isArmed}
+          deleting={isDeleting}
+          // Visible on hover, when this row is armed,
+          // or while deleting. Other rows fade out so
+          // accidental clicks on a sibling don't pile up.
+          className={`mr-1 transition-opacity ${
+            isArmed || isDeleting
+              ? "opacity-100"
+              : "opacity-0 group-hover:opacity-100"
+          }`}
+          onClick={() => void onDelete(page.path)}
+          name={page.title}
+        />
+      </div>
+    </div>
+  )
+})
 
 function RawSourcesSection() {
   const { t } = useTranslation()
