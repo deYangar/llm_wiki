@@ -3152,9 +3152,24 @@ fn own_edges(nodes: &[ApiGraphNode], edges: Vec<ApiGraphEdge>) -> Vec<OwnedGraph
         .collect()
 }
 
+/// Per-file graph inputs extracted from one page, kept in the cache so a
+/// rebuild after a fingerprint change re-reads only the files whose
+/// (mtime, len) moved instead of the whole tree.
+#[derive(Clone)]
+struct ParsedPage {
+    id: String,
+    title: String,
+    node_type: String,
+    rel_path: String,
+    links: Vec<String>,
+    tags: Vec<String>,
+}
+
 struct GraphCacheEntry {
     fingerprint: u64,
     snapshot: Arc<GraphSnapshot>,
+    /// Per-file stats + parsed inputs from the last build, keyed by path.
+    parsed: Arc<std::collections::HashMap<PathBuf, (u128, u64, ParsedPage)>>,
     /// When the fingerprint was last verified. Re-checking walks the wiki
     /// tree metadata (~150ms for 17k files), so fresh fingerprints are
     /// trusted for FINGERPRINT_RECHECK_TTL instead of paying that on every
@@ -3177,10 +3192,19 @@ fn wiki_root_of(project_path: &str) -> PathBuf {
     Path::new(project_path).join("wiki")
 }
 
-fn graph_fingerprint(wiki_root: &Path) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut acc: u64 = 0;
+/// One md file as seen by the graph walk: its path plus the identity pair
+/// the fingerprint and the per-entry delta cache are both built from.
+struct WalkedFile {
+    path: PathBuf,
+    mtime_ns: u128,
+    len: u64,
+}
+
+/// Single metadata walk over the wiki tree collecting every `*.md` file.
+/// The same walk feeds the fingerprint and the rebuild, so a recheck or
+/// rebuild pays exactly one directory traversal instead of two.
+fn walk_wiki_md_files(wiki_root: &Path) -> Vec<WalkedFile> {
+    let mut files = Vec::new();
     for entry in WalkDir::new(wiki_root).into_iter().filter_map(Result::ok) {
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
@@ -3188,16 +3212,34 @@ fn graph_fingerprint(wiki_root: &Path) -> u64 {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        let mut hasher = DefaultHasher::new();
-        entry.path().to_string_lossy().hash(&mut hasher);
-        let mtime = meta
+        let mtime_ns = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        mtime.hash(&mut hasher);
-        meta.len().hash(&mut hasher);
+        files.push(WalkedFile {
+            path: entry.path().to_path_buf(),
+            mtime_ns,
+            len: meta.len(),
+        });
+    }
+    files
+}
+
+/// Fingerprint of a walked file list. Per-file hash inputs (path, mtime,
+/// len) and the commutative wrapping-sum accumulation are identical to the
+/// original streaming `graph_fingerprint`, so WalkDir order variance still
+/// cannot change the value.
+fn fingerprint_of_walked(files: &[WalkedFile]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut acc: u64 = 0;
+    for file in files {
+        let mut hasher = DefaultHasher::new();
+        file.path.to_string_lossy().hash(&mut hasher);
+        file.mtime_ns.hash(&mut hasher);
+        file.len.hash(&mut hasher);
         // Sum of per-file hashes: commutative, so WalkDir iteration order
         // (which the filesystem may vary) never changes the fingerprint.
         acc = acc.wrapping_add(hasher.finish());
@@ -3226,7 +3268,8 @@ fn build_graph_cached_with_ttl(
         }
     }
 
-    let fingerprint = graph_fingerprint(&wiki_root_of(project_path));
+    let files = walk_wiki_md_files(&wiki_root_of(project_path));
+    let fingerprint = fingerprint_of_walked(&files);
     // Verify + refresh + fetch under one lock; None means stale or missing.
     let try_hit = |cache: &Mutex<std::collections::HashMap<PathBuf, GraphCacheEntry>>| {
         let mut entries = cache.lock().ok()?;
@@ -3258,7 +3301,13 @@ fn build_graph_cached_with_ttl(
         return Ok(snapshot);
     }
 
-    let (nodes, edges) = build_graph(project_path)?;
+    // Delta input: the previous build's per-file parsed tuples (cheap Arc
+    // clone) feed the rebuild so untouched files skip the disk read.
+    let prev_parsed = cache
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(Path::new(project_path)).map(|e| e.parsed.clone()));
+    let (nodes, edges, parsed) = build_graph_from_walk(project_path, &files, prev_parsed.as_deref());
     let edges = own_edges(&nodes, edges);
     let snapshot = Arc::new(GraphSnapshot { nodes, edges });
     if let Ok(mut entries) = cache.lock() {
@@ -3267,6 +3316,7 @@ fn build_graph_cached_with_ttl(
             GraphCacheEntry {
                 fingerprint,
                 snapshot: snapshot.clone(),
+                parsed: Arc::new(parsed),
                 fingerprint_at: Instant::now(),
             },
         );
@@ -3274,50 +3324,77 @@ fn build_graph_cached_with_ttl(
     Ok(snapshot)
 }
 
-fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
-    let wiki_root = wiki_root_of(project_path);
-    // Collect the file list first (deterministic WalkDir order), then parse
-    // files in parallel — the CPU-heavy part (read + title/type/wikilink
-    // extraction) has no cross-file dependencies. Parsed results are folded
-    // back into the BTreeMap in the original order so duplicate stems keep
-    // the exact last-write-wins semantics of the sequential version.
-    let files: Vec<PathBuf> = WalkDir::new(&wiki_root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry.path().extension().and_then(|s| s.to_str()) == Some("md")
-        })
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
-    let parsed: Vec<Option<(String, String, String, String, Vec<String>, Vec<String>)>> = files
+/// Read one page and extract its graph inputs (id/title/type/path/links/
+/// tags). Returns None for unreadable or stem-less files — the caller folds
+/// those out, same as the sequential original.
+fn parse_graph_page(project_path: &str, path: &Path) -> Option<ParsedPage> {
+    let content = fs::read_to_string(path).ok()?;
+    let id = path.file_stem()?.to_str()?.to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let title = commands::search::extract_title(
+        &content,
+        path.file_name()?.to_string_lossy().as_ref(),
+    );
+    let node_type = extract_type(&content);
+    let rel_path = relative_to_project(project_path, path);
+    let links = commands::search::extract_graph_links(&content);
+    // Tags come from the same already-read content — no extra head
+    // read per page, so the graph build cost is unaffected.
+    let tags = crate::frontmatter::split_frontmatter(&content)
+        .map(|(_, block)| crate::frontmatter::Frontmatter::parse(block))
+        .and_then(|fm| fm.get("tags").map(|tags| tags.to_vec()))
+        .unwrap_or_default();
+    Some(ParsedPage {
+        id,
+        title,
+        node_type,
+        rel_path,
+        links,
+        tags,
+    })
+}
+
+/// Build the graph from a walked file list. Files whose (mtime, len) match
+/// an entry in `prev` reuse its parsed tuple instead of re-reading the
+/// page; changed/new files (and files that failed to parse last time) are
+/// read in parallel. Parsed results are folded back into the BTreeMap in
+/// the original walk order so duplicate stems keep the exact
+/// last-write-wins semantics of the sequential version. Also returns the
+/// per-file parsed map for the next delta rebuild.
+fn build_graph_from_walk(
+    project_path: &str,
+    files: &[WalkedFile],
+    prev: Option<&std::collections::HashMap<PathBuf, (u128, u64, ParsedPage)>>,
+) -> (Vec<ApiGraphNode>, Vec<ApiGraphEdge>, std::collections::HashMap<PathBuf, (u128, u64, ParsedPage)>) {
+    let empty = std::collections::HashMap::new();
+    let prev = prev.unwrap_or(&empty);
+    let parsed: Vec<Option<ParsedPage>> = files
         .par_iter()
-        .map(|path| {
-            let content = fs::read_to_string(path).ok()?;
-            let id = path.file_stem()?.to_str()?.to_string();
-            if id.is_empty() {
-                return None;
+        .map(|file| {
+            if let Some((mtime_ns, len, page)) = prev.get(&file.path) {
+                if *mtime_ns == file.mtime_ns && *len == file.len {
+                    return Some(page.clone());
+                }
             }
-            let title = commands::search::extract_title(
-                &content,
-                path.file_name()?.to_string_lossy().as_ref(),
-            );
-            let node_type = extract_type(&content);
-            let rel_path = relative_to_project(project_path, path);
-            let links = commands::search::extract_graph_links(&content);
-            // Tags come from the same already-read content — no extra head
-            // read per page, so the graph build cost is unaffected.
-            let tags = crate::frontmatter::split_frontmatter(&content)
-                .map(|(_, block)| crate::frontmatter::Frontmatter::parse(block))
-                .and_then(|fm| fm.get("tags").map(|tags| tags.to_vec()))
-                .unwrap_or_default();
-            Some((id, title, node_type, rel_path, links, tags))
+            parse_graph_page(project_path, &file.path)
         })
         .collect();
+    let mut by_path: std::collections::HashMap<PathBuf, (u128, u64, ParsedPage)> =
+        std::collections::HashMap::with_capacity(files.len());
     let mut raw: BTreeMap<String, (String, String, String, Vec<String>, Vec<String>)> =
         BTreeMap::new();
-    for (id, title, node_type, rel_path, links, tags) in parsed.into_iter().flatten() {
-        raw.insert(id, (title, node_type, rel_path, links, tags));
+    for (file, page) in files.iter().zip(parsed.into_iter()) {
+        let Some(page) = page else { continue };
+        by_path.insert(
+            file.path.clone(),
+            (file.mtime_ns, file.len, page.clone()),
+        );
+        raw.insert(
+            page.id,
+            (page.title, page.node_type, page.rel_path, page.links, page.tags),
+        );
     }
     let ids: BTreeSet<String> = raw.keys().cloned().collect();
     // Precomputed lookup tables for resolve_link. The original form ran a
@@ -3373,6 +3450,16 @@ fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdg
             tags,
         })
         .collect();
+    (nodes, edges, by_path)
+}
+
+/// Cold full build: walk the tree and parse every page from disk.
+/// Production code goes through `build_graph_cached_with_ttl`; this direct
+/// form is the from-scratch reference the cache tests compare against.
+#[cfg(test)]
+fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
+    let files = walk_wiki_md_files(&wiki_root_of(project_path));
+    let (nodes, edges, _) = build_graph_from_walk(project_path, &files, None);
     Ok((nodes, edges))
 }
 
@@ -4848,6 +4935,50 @@ mod tests {
         fs::remove_file(root.join("wiki").join("新增.md")).unwrap();
         let fourth = get();
         assert!(!fourth.nodes.iter().any(|n| n.id == "新增"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_cache_delta_rebuild_matches_cold_rebuild() {
+        // The per-entry (mtime, len) cache reuses parsed tuples for
+        // untouched files. A rebuild driven by that cache must produce the
+        // exact graph a full from-disk rebuild would — reuse only speeds
+        // the build, it never changes behavior.
+        let root = test_project_dir();
+        write_graph_fixture(&root);
+        let path = root.to_string_lossy().to_string();
+        let get = || build_graph_cached_with_ttl(&path, Duration::ZERO).unwrap();
+        let _first = get();
+
+        // One edited page + one brand-new page: the delta path covers both
+        // a stat mismatch and a cache miss.
+        fs::write(
+            root.join("wiki").join("gpu-cluster.md"),
+            "type: hardware\n\ntags: [topic:delta]\n\n# GPU 集群改\n[[检索]]\n",
+        )
+        .unwrap();
+        fs::write(root.join("wiki").join("delta-new.md"), "type: note\n\n[[检索]]\n").unwrap();
+        let delta = get();
+
+        let (cold_nodes, cold_edges) = build_graph(&path).unwrap();
+        let canon_nodes = |mut ns: Vec<ApiGraphNode>| {
+            ns.sort_by(|a, b| a.id.cmp(&b.id));
+            serde_json::to_value(&ns).unwrap()
+        };
+        let canon_edges = |mut es: Vec<ApiGraphEdge>| {
+            es.sort_by(|a, b| (a.source.clone() + &a.target).cmp(&(b.source.clone() + &b.target)));
+            serde_json::to_value(&es).unwrap()
+        };
+        assert_eq!(
+            canon_nodes(delta.nodes.clone()),
+            canon_nodes(cold_nodes),
+            "delta rebuild nodes must equal cold rebuild nodes"
+        );
+        assert_eq!(
+            canon_edges(delta.edges.iter().map(|e| e.edge.clone()).collect()),
+            canon_edges(cold_edges),
+            "delta rebuild edges must equal cold rebuild edges"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

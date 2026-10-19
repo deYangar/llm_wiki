@@ -1,7 +1,7 @@
 mod agent;
 mod api_server;
 mod clip_server;
-mod commands;
+pub mod commands;
 mod cors;
 mod frontmatter;
 mod heartbeat;
@@ -691,6 +691,7 @@ pub fn run() {
             commands::vectorstore::vector_count_chunks,
             commands::vectorstore::vector_clear_chunks,
             commands::vectorstore::vector_optimize_chunks,
+            commands::vectorstore::vector_ensure_index,
             commands::vectorstore::vector_legacy_row_count,
             commands::vectorstore::vector_drop_legacy,
             commands::claude_cli::claude_cli_detect,

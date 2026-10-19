@@ -5,6 +5,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use chrono::Duration;
 use lancedb::connect;
+use lancedb::index::vector::IvfFlatIndexBuilder;
+use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::{CompactionOptions, OptimizeAction};
 use serde::{Deserialize, Serialize};
@@ -642,7 +644,14 @@ pub async fn vector_search_chunks(
             .map_err(|e| format!("Search error: {e}"))?;
         if let Some(ids) = page_ids.as_deref() {
             if !ids.is_empty() {
-                query = query.only_if(page_id_in_predicate(ids));
+                // The pushed-down lane must keep its exact pre-filter flat
+                // scan (the semantics the W2 vector-lane fix measured): an
+                // approximate index retrieving-then-filtering could starve
+                // narrow candidate sets again. Index acceleration applies
+                // only to the whole-library KNN (no page_ids).
+                query = query
+                    .only_if(page_id_in_predicate(ids))
+                    .bypass_vector_index();
             }
         }
         let results_stream = query
@@ -814,10 +823,73 @@ pub async fn vector_clear_chunks(project_path: String) -> Result<(), String> {
     .await
 }
 
+/// Ensure the v2 chunk table has a vector index on the `vector` column.
+/// Without one every KNN is a flat brute-force scan over the whole table —
+/// on a full-size library that alone costs seconds per query. IvfFlat is
+/// chosen over IvfPq deliberately: distances stay exact (no PQ
+/// quantization loss); only the partition pruning is approximate. Rows
+/// appended after the index was built are still searched (LanceDB falls
+/// back to a flat scan over the unindexed fragments), so correctness never
+/// depends on re-running this. Returns "no-table", "exists" or "created".
+pub async fn ensure_vector_index_inner(project_path: &str) -> Result<String, String> {
+    let lock = vectorstore_v2_lock(project_path);
+    let _guard = lock.write().await;
+
+    let db = connect(&db_path(project_path))
+        .execute()
+        .await
+        .map_err(|e| format!("DB connect error: {e}"))?;
+
+    let tables = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(|e| format!("List tables error: {e}"))?;
+
+    if !tables.contains(&TABLE_V2.to_string()) {
+        return Ok("no-table".to_string());
+    }
+
+    let table = db
+        .open_table(TABLE_V2)
+        .execute()
+        .await
+        .map_err(|e| format!("Open table error: {e}"))?;
+
+    let indices = table
+        .list_indices()
+        .await
+        .map_err(|e| format!("List indices error: {e}"))?;
+    if indices
+        .iter()
+        .any(|cfg| cfg.columns.iter().any(|c| c == "vector"))
+    {
+        return Ok("exists".to_string());
+    }
+
+    table
+        .create_index(&["vector"], Index::IvfFlat(IvfFlatIndexBuilder::default()))
+        .execute()
+        .await
+        .map_err(|e| format!("Create vector index error: {e}"))?;
+    Ok("created".to_string())
+}
+
+/// Explicit idempotent trigger for building the vector index (backfill for
+/// tables written before indexing existed, or after a bulk re-index).
+#[tauri::command]
+pub async fn vector_ensure_index(project_path: String) -> Result<String, String> {
+    run_guarded_async("vector_ensure_index", async move {
+        ensure_vector_index_inner(&project_path).await
+    })
+    .await
+}
+
 /// Compact the v2 chunk table and prune old LanceDB versions after bulk
-/// embedding writes. This is intentionally a separate best-effort command so
-/// an already-successful rebuild is not reported as failed if maintenance hits
-/// a platform-specific LanceDB error.
+/// embedding writes, then make sure the vector index exists (so a rebuild
+/// ends indexed, not flat-scan slow). This is intentionally a separate
+/// best-effort command so an already-successful rebuild is not reported as
+/// failed if maintenance hits a platform-specific LanceDB error.
 #[tauri::command]
 pub async fn vector_optimize_chunks(project_path: String) -> Result<(), String> {
     run_guarded_async("vector_optimize_chunks", async move {
@@ -866,6 +938,15 @@ pub async fn vector_optimize_chunks(project_path: String) -> Result<(), String> 
             })
             .await
             .map_err(|e| format!("Prune old chunk versions error: {e}"))?;
+
+        // Index maintenance rides along so bulk writes (settings re-index,
+        // ingest batches) always leave the table searchable without a flat
+        // full scan. A failure here surfaces instead of silently leaving
+        // the table unindexed — search would stay correct but slow.
+        // The write guard is released first: ensure takes the same lock.
+        drop(_guard);
+        let index_status = ensure_vector_index_inner(&project_path).await?;
+        eprintln!("[VectorStore] vector index after optimize: {index_status}");
 
         Ok(())
     })
