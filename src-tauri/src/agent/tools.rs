@@ -756,6 +756,11 @@ pub(crate) fn write_wiki_page_with_activity(
     // Covers agent page writes, the API pages/write endpoint and the
     // frontmatter PATCH, which all land through this function.
     crate::frontmatter::invalidate_page_meta_cache(project_path);
+    // Same-immediacy contract for the /graph snapshot cache now that its
+    // trust window was raised to 30s: app-mediated writes (new pages,
+    // title/tag changes land here) drop the snapshot so the next request
+    // rebuilds instead of serving pre-write structure.
+    crate::api_server::invalidate_graph_cache(project_path);
     Ok(WikiWriteOutput {
         reference: AgentReference {
             title: extract_markdown_title(&content).unwrap_or_else(|| {

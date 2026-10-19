@@ -5,6 +5,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use chrono::Duration;
 use lancedb::connect;
+use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::index::vector::IvfFlatIndexBuilder;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -825,14 +826,20 @@ pub async fn vector_clear_chunks(project_path: String) -> Result<(), String> {
     .await
 }
 
-/// Ensure the v2 chunk table has a vector index on the `vector` column.
-/// Without one every KNN is a flat brute-force scan over the whole table —
-/// on a full-size library that alone costs seconds per query. IvfFlat is
-/// chosen over IvfPq deliberately: distances stay exact (no PQ
-/// quantization loss); only the partition pruning is approximate. Rows
-/// appended after the index was built are still searched (LanceDB falls
-/// back to a flat scan over the unindexed fragments), so correctness never
-/// depends on re-running this. Returns "no-table", "exists" or "created".
+/// Ensure the v2 chunk table has the indices search depends on:
+/// - IvfFlat on `vector`: without it every KNN is a flat brute-force scan
+///   over the whole table — on a full-size library that alone costs
+///   seconds per query. IvfFlat is chosen over IvfPq deliberately:
+///   distances stay exact (no PQ quantization loss); only the partition
+///   pruning is approximate.
+/// - BTree on `page_id`: the pushed-down `page_id IN (...)` prefilter
+///   otherwise evaluates per row over every chunk (measured 2026-10-20:
+///   422 ids = 776ms, 2,000 = 4.3s, 8,254 = 25s — linear in list size).
+///   With the scalar index the predicate resolves via index lookup.
+/// Rows appended after the indices were built are still searched (LanceDB
+/// falls back to flat scans over unindexed fragments), so correctness
+/// never depends on re-running this. Returns "no-table" or a
+/// comma-joined status per index ("exists,created").
 pub async fn ensure_vector_index_inner(project_path: &str) -> Result<String, String> {
     let lock = vectorstore_v2_lock(project_path);
     let _guard = lock.write().await;
@@ -862,19 +869,34 @@ pub async fn ensure_vector_index_inner(project_path: &str) -> Result<String, Str
         .list_indices()
         .await
         .map_err(|e| format!("List indices error: {e}"))?;
-    if indices
-        .iter()
-        .any(|cfg| cfg.columns.iter().any(|c| c == "vector"))
-    {
-        return Ok("exists".to_string());
-    }
+    let indexed_columns = |column: &str| {
+        indices
+            .iter()
+            .any(|cfg| cfg.columns.iter().any(|c| c == column))
+    };
 
-    table
-        .create_index(&["vector"], Index::IvfFlat(IvfFlatIndexBuilder::default()))
-        .execute()
-        .await
-        .map_err(|e| format!("Create vector index error: {e}"))?;
-    Ok("created".to_string())
+    let mut statuses: Vec<String> = Vec::new();
+    if !indexed_columns("vector") {
+        table
+            .create_index(&["vector"], Index::IvfFlat(IvfFlatIndexBuilder::default()))
+            .execute()
+            .await
+            .map_err(|e| format!("Create vector index error: {e}"))?;
+        statuses.push("created(vector)".to_string());
+    } else {
+        statuses.push("exists(vector)".to_string());
+    }
+    if !indexed_columns("page_id") {
+        table
+            .create_index(&["page_id"], Index::BTree(BTreeIndexBuilder::default()))
+            .execute()
+            .await
+            .map_err(|e| format!("Create page_id scalar index error: {e}"))?;
+        statuses.push("created(page_id-btree)".to_string());
+    } else {
+        statuses.push("exists(page_id-btree)".to_string());
+    }
+    Ok(statuses.join(","))
 }
 
 /// Explicit idempotent trigger for building the vector index (backfill for

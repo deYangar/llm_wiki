@@ -530,8 +530,13 @@ struct PageMetaCacheEntry {
 /// request re-walks the metadata — the same trade-off the graph snapshot
 /// cache makes. Writes through this application invalidate proactively;
 /// the window only covers out-of-band edits, which are then reflected at
-/// worst TTL + one rebuild later.
-const META_FINGERPRINT_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// worst TTL + one rebuild later. Raised 2s → 30s at the 50k-page library:
+/// the metadata walk grew from ~150ms (4k pages, where 2s amortized well)
+/// to ~600ms, so a 2s window made every request slower than the window
+/// pay the full walk — the amortization inverted. 30s restores it; the
+/// only behavior change is that raw-filesystem edits (scripts bypassing
+/// the app) become visible up to 30s later.
+const META_FINGERPRINT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 static PAGE_META_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, PageMetaCacheEntry>>,

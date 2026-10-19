@@ -34,14 +34,6 @@ const MAX_SEARCH_FILES: usize = crate::frontmatter::MAX_META_SCAN_FILES;
 const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
 const MAX_GRAPH_RESULT_RATIO: f64 = 0.30;
 const MAX_GRAPH_SEEDS: usize = 20;
-// Ceiling for the pushed-down `page_id IN (...)` vector KNN filter. Above
-// this the predicate string (and DataFusion's planning of it) costs more
-// than the whole-library scan it would save, while the candidate set at
-// that size nearly covers the library, so the legacy top-k + post-filter
-// mapping is semantically equivalent. Typical constrained queries sit far
-// below (exact-tag ≈ 320 pages, type=question ≈ 1,156 on the 21.5k-page
-// portable copy).
-const MAX_VECTOR_FILTER_IDS: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -593,38 +585,24 @@ pub async fn search_project_inner(
     let mut vector_hits = 0;
     if let Some(embedding) = query_embedding {
         if !embedding.is_empty() {
-            // W2 vector-lane fix (2026-10-15): with a filter, the KNN runs
-            // inside the surviving candidate pages (page_ids pushed down to
-            // LanceDB). Taking a whole-library top-k first and mapping back
-            // afterwards — the previous behavior — starves the lane
-            // whenever the constraint covers a small slice of the library:
-            // the global top-k holds none of the target pages and
-            // vectorHits collapses to 0 (measured on the portable copy:
-            // bare search vectorHits=10, same query + type=question → 0).
-            //
-            // Budget accounting (2026-10-15 same-day fix): the legacy stem
-            // ids exist only for v1-migration rows and never match a v2
-            // table's page_id — putting them in the IN list burns budget
-            // without ever hitting. type=question (1,156 pages) measured
-            // 1,156 qualified + ~1,100 stems > MAX_VECTOR_FILTER_IDS, which
-            // silently disabled the pushdown entirely. Qualified ids get
-            // the budget first; stems only fill what's left. Above the
-            // ceiling the pushed-down IN list costs more to plan than it
-            // saves, and at that size the candidate set nearly covers the
-            // library, so the legacy whole-library top-k + post-filter
-            // mapping below is semantically equivalent.
-            let candidate_page_ids: Option<Vec<String>> = if filter.is_some() {
-                let mut ids: Vec<String> = page_paths_by_vector_id.keys().cloned().collect();
-                if ids.len() <= MAX_VECTOR_FILTER_IDS {
-                    let budget = MAX_VECTOR_FILTER_IDS - ids.len();
-                    ids.extend(legacy_page_paths.keys().take(budget).cloned());
-                    Some(ids)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            // Filtered KNN (W2 vector-lane fix 2026-10-15, ceiling removed
+            // 2026-10-20): with a filter, the FULL candidate page set is
+            // pushed down — LanceDB prefilters, so the constraint applies
+            // before the vector search and the lane ranks within the
+            // candidates. The previous whole-library-top-k-then-map-back
+            // form starved the lane whenever the constraint covered a
+            // small slice of the library (one exact tag ≈ 1.5% of pages
+            // measured vectorHits 10 → 0), and the 2,000-id ceiling that
+            // used to guard the IN-list became obsolete once the page_id
+            // BTree scalar index landed: measured on the full library
+            // 2026-10-20, 422 ids = 7ms, 2,000 = 30ms, 8,254 = 409ms
+            // (pre-index the same lists cost 0.8-25s). Legacy stem ids
+            // are deliberately excluded: they exist only for v1-migration
+            // rows, never match a v2 page_id, and each costs an index
+            // lookup that can never hit.
+            let candidate_page_ids: Option<Vec<String>> = filter.is_some().then(|| {
+                page_paths_by_vector_id.keys().cloned().collect()
+            });
             match search_by_embedding(
                 &project_path,
                 embedding,

@@ -3180,13 +3180,30 @@ struct GraphCacheEntry {
 
 /// How long a verified fingerprint is trusted before the next /graph
 /// request re-walks the metadata. The recheck cost is amortized to at most
-/// one walk per project per TTL window.
-const FINGERPRINT_RECHECK_TTL: Duration = Duration::from_secs(2);
+/// one walk per project per TTL window. Raised 2s → 30s together with the
+/// search metadata cache: the walk now costs ~600ms at 50k pages, and a 2s
+/// window inverted the amortization (every request paid the walk). App
+/// writes invalidate the graph cache proactively
+/// (write_wiki_page_with_activity); the window only delays raw-filesystem
+/// edits.
+const FINGERPRINT_RECHECK_TTL: Duration = Duration::from_secs(30);
 
 static GRAPH_CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, GraphCacheEntry>>> =
     OnceLock::new();
 static GRAPH_BUILD_LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>> =
     OnceLock::new();
+
+/// Drop the cached graph snapshot for a project. Called by the guarded
+/// wiki-write path so app-mediated writes (new pages, title/tag edits)
+/// show up in /graph immediately instead of after the trust window; the
+/// window now only covers raw-filesystem edits.
+pub fn invalidate_graph_cache(project_path: &str) {
+    if let Some(cache) = GRAPH_CACHE.get() {
+        if let Ok(mut entries) = cache.lock() {
+            entries.remove(Path::new(project_path));
+        }
+    }
+}
 
 fn wiki_root_of(project_path: &str) -> PathBuf {
     Path::new(project_path).join("wiki")
