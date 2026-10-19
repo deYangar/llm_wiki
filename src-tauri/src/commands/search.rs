@@ -34,6 +34,10 @@ const MAX_SEARCH_FILES: usize = crate::frontmatter::MAX_META_SCAN_FILES;
 const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
 const MAX_GRAPH_RESULT_RATIO: f64 = 0.30;
 const MAX_GRAPH_SEEDS: usize = 20;
+/// Candidate-id ceiling for the literal `page_id IN (...)` pushdown form.
+/// Above it the SQL string grows megabytes long; the directory-range form
+/// takes over (see `build_page_id_predicate`).
+const PAGE_ID_IN_LIST_MAX: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,7 +85,12 @@ pub struct ProjectSearchResponse {
 struct GraphPage {
     path: String,
     title: String,
-    content: String,
+    /// Only the reader/page-links path retains content (it needs snippets
+    /// for every neighbor). The search pipeline leaves it None — holding
+    /// every candidate's full text cost ~570MB of allocator churn per
+    /// wide-candidate request (measured 2026-10-20); graph-neighbor
+    /// materialization re-reads from disk instead.
+    content: Option<String>,
     links: Vec<String>,
 }
 
@@ -227,7 +236,7 @@ fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinks
                 path,
                 title,
                 links: extract_graph_links(&content),
-                content,
+                content: Some(content),
             },
         );
     }
@@ -272,7 +281,10 @@ fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinks
             backlinks.push(PageLinkEntry {
                 title: page.title.clone(),
                 path: Some(page.path.clone()),
-                snippet: Some(build_snippet(&page.content, &current.title)),
+                snippet: Some(build_snippet(
+                    page.content.as_deref().unwrap_or_default(),
+                    &current.title,
+                )),
             });
         }
     }
@@ -438,6 +450,7 @@ pub async fn search_project_inner(
     let mut graph_pages = BTreeMap::new();
     let mut total_filtered = 0usize;
     let mut vector_pushdown_predicate: Option<String> = None;
+    let perf_t0 = std::time::Instant::now();
 
     let wiki_root = Path::new(&project_path).join("wiki");
     if wiki_root.exists() {
@@ -483,7 +496,6 @@ pub async fn search_project_inner(
             relative_path: String,
             title: String,
             links: Vec<String>,
-            content: String,
             hit: Option<ProjectSearchResult>,
         }
         let scanned: Vec<Option<ScannedPage>> = candidates
@@ -529,7 +541,6 @@ pub async fn search_project_inner(
                     relative_path,
                     title,
                     links,
-                    content,
                     hit,
                 })
             })
@@ -552,8 +563,8 @@ pub async fn search_project_inner(
                 GraphPage {
                     path: page.relative_path.clone(),
                     title: page.title,
+                    content: None,
                     links: page.links,
-                    content: page.content,
                 },
             );
             if let Some(hit) = page.hit {
@@ -576,6 +587,7 @@ pub async fn search_project_inner(
         .into_iter()
         .filter_map(|(stem, paths)| (paths.len() == 1).then(|| (stem, paths[0].clone())))
         .collect::<BTreeMap<_, _>>();
+    eprintln!("[perf] scan+score phase: {}ms (candidates={total_filtered})", perf_t0.elapsed().as_millis());
 
     let mut token_sorted = (0..results.len()).collect::<Vec<_>>();
     token_sorted.sort_by(|a, b| {
@@ -671,6 +683,7 @@ pub async fn search_project_inner(
             &legacy_page_paths,
         );
     }
+    eprintln!("[perf] vector phase: {}ms", perf_t0.elapsed().as_millis());
 
     results.sort_by(|a, b| {
         b.score
@@ -684,6 +697,7 @@ pub async fn search_project_inner(
         window,
         vector_hits,
         include_content,
+        &project_path,
     );
 
     // Final page slice: skip `offset` ranked results AFTER fusion, so
@@ -693,6 +707,7 @@ pub async fn search_project_inner(
         results.drain(..skip);
         results.truncate(limit);
     }
+    eprintln!("[perf] graph blend phase: {}ms", perf_t0.elapsed().as_millis());
 
     Ok(ProjectSearchResponse {
         mode: search_mode(token_rank.is_empty(), vector_hits, graph_hits).to_string(),
@@ -769,6 +784,7 @@ fn blend_graph_results(
     limit: usize,
     vector_hits: usize,
     include_content: bool,
+    project_path: &str,
 ) -> usize {
     if ranked_results.is_empty() || pages.is_empty() {
         ranked_results.truncate(limit);
@@ -887,6 +903,13 @@ fn blend_graph_results(
             .into_iter()
             .collect::<Vec<_>>();
         let related = related_titles.join(", ");
+        // Content is NOT retained on GraphPage (holding every candidate's
+        // full text cost ~570MB of allocator churn per wide-candidate
+        // request, measured 2026-10-20); the handful of graph-neighbor
+        // pages materialized here re-read from disk instead — OS-cache
+        // hot, microseconds each.
+        let content =
+            std::fs::read_to_string(Path::new(project_path).join(&page.path)).unwrap_or_default();
         base_results.push(ProjectSearchResult {
             path: page.path.clone(),
             title: page.title.clone(),
@@ -894,8 +917,8 @@ fn blend_graph_results(
             title_match: false,
             score: graph_score / (RRF_K + 1.0),
             vector_score: None,
-            images: extract_image_refs(&page.content),
-            content: include_content.then(|| page.content.clone()),
+            images: extract_image_refs(&content),
+            content: include_content.then_some(content),
             graph_related_to: related_titles,
         });
     }
@@ -1011,10 +1034,19 @@ struct PageVectorResult {
 }
 
 /// Build the vector-lane pushdown predicate for the filtered candidate
-/// set. Directories whose every page (with a vector id) survived the
-/// filter collapse into a single `page_id >= 'dir/' AND page_id < 'dir0'`
-/// range term — the upper bound is the last byte of `dir/` (always ASCII
-/// '/') incremented, so nothing but `dir/...` strings can fall inside.
+/// set, choosing the form by scale (measured on the full library
+/// 2026-10-20, page_id BTree scalar index in place):
+/// - IN-list while the candidate id count is modest (≤ 10k): the BTree
+///   resolves it and LanceDB flat-scans the matching rows — 422 ids =
+///   7ms, 8,254 = 409ms.
+/// - Above that the IN-list string itself grows megabytes long
+///   (type=section ≈ 24k ids ≈ 2MB of SQL), so fully-covered directories
+///   collapse into `page_id >= 'dir/' AND page_id < 'dir0'` range terms
+///   (the upper bound is the last byte of `dir/` — always ASCII '/' —
+///   incremented, so nothing but `dir/...` strings can fall inside).
+///   Note the range form plans differently (IVF + eligibility mask
+///   instead of pre-materialized rows) and measured ~1s at half-library
+///   coverage — it exists for the oversized case only, not as a speedup.
 /// Partially-covered directories contribute per-id IN entries. Stem-only
 /// ids (no '/') are skipped entirely: they exist only for v1-migration
 /// rows and never match a v2 page_id. Returns None when there are no
@@ -1025,7 +1057,21 @@ fn build_page_id_predicate(
     index: &crate::frontmatter::PageMetaIndex,
     candidates: &BTreeMap<String, String>,
 ) -> Option<String> {
-    // dir -> (any page seen, all pages are final candidates)
+    if candidates.is_empty() {
+        return None;
+    }
+    let qualified: Vec<&String> = candidates
+        .keys()
+        .filter(|id| id.rsplit_once('/').is_some())
+        .collect();
+    if qualified.is_empty() {
+        return None;
+    }
+    if qualified.len() <= PAGE_ID_IN_LIST_MAX {
+        let owned: Vec<String> = qualified.into_iter().cloned().collect();
+        return Some(vectorstore::page_id_in_predicate(&owned));
+    }
+    // dir -> every page (with a vector id) under it survived the filter
     let mut by_dir: BTreeMap<String, bool> = BTreeMap::new();
     for meta in index.entries() {
         let Some(id) = vector_page_id(&meta.rel_path) else { continue };
@@ -1035,19 +1081,13 @@ fn build_page_id_predicate(
             *fully = false;
         }
     }
-    if candidates.is_empty() {
-        return None;
-    }
     let mut terms: Vec<String> = Vec::new();
     let mut leftover: Vec<String> = Vec::new();
-    for id in candidates.keys() {
-        match id.rsplit_once('/') {
-            Some((dir, _)) => {
-                if !by_dir.get(dir).copied().unwrap_or(false) {
-                    leftover.push(id.clone());
-                }
+    for id in &qualified {
+        if let Some((dir, _)) = id.rsplit_once('/') {
+            if !by_dir.get(dir).copied().unwrap_or(false) {
+                leftover.push((*id).clone());
             }
-            None => {} // stem-only: never matches v2, excluded on purpose
         }
     }
     for (dir, fully) in &by_dir {
