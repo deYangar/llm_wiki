@@ -255,6 +255,177 @@ const H1_SAMPLE = `## Page 1
 
 一、本次募投项目符合产业政策。`
 
+// ── T4: 中介机构「序数大节」体（2026-10-19 第三梯队；实库形态：中贝通信
+//    7-2 会计师回复意见——目录「一、关于XX」点线行 + 正文裸行大节 + 节内
+//    「## N、」阿拉伯小节，节序每题重启，全文无「回复：」独立块） ─────────
+const T4_ACCOUNTANT_SAMPLE = `## Page 1
+
+目 录
+一、关于融资规模与效益预测……第1—26页
+二、关于收入……第26—48页
+三、关于成本与毛利率情况……第48—62页
+
+## Page 2
+
+一、关于融资规模与效益预测
+
+根据问询函要求，发行人说明了本次融资规模的测算依据及效益预测过程。
+
+## 1、募集资金总额
+
+本次募集资金总额不超过十亿元，全部用于主营项目建设。
+
+## 2、效益预测
+
+效益预测基于现有产能利用率与在手订单测算得出。
+
+二、关于收入
+
+发行人补充披露了收入确认政策与主要客户构成情况。
+
+## 1、收入构成
+
+报告期各期营业收入保持持续增长态势。
+
+## 2、客户集中度
+
+前五大客户收入占比保持在合理区间。
+
+三、关于成本与毛利率情况
+
+发行人量化分析了主要产品毛利率变动的原因及未来趋势。
+
+## 1、单位成本
+
+主要原材料采购价格回落带动单位成本下降。
+
+## 2、毛利率
+
+毛利率变动与同行业可比公司变动趋势一致。`
+
+/** T4B 题干直述档（方正科技 7-2 实测形态：大节标题=完整问询题干长句，
+ *  不带「关于」；节内阿拉伯顿号小节）。 */
+const T4_DIRECT_STEM_SAMPLE = `某会计师事务所关于某公司审核问询函的专项说明
+
+一、建筑工程费、设备购置及安装费等具体内容及测算过程，建筑面积、建筑单价、设备购置数量的确定依据及合理性
+
+发行人逐项说明了建筑工程费与设备购置费的测算过程。
+
+## 1、建筑工程费
+
+建筑面积按规划许可载明的面积确定。
+
+二、本次募集资金用于非资本性支出的规模及占比，是否存在置换董事会前投入的情形说明
+
+发行人披露了非资本性支出占比及置换情况核查结论。
+
+## 1、非资本性支出
+
+本次募集资金不涉及非资本性支出项目。`
+
+/** 标准章节体红线（《编报规则 12 号》法律意见书骨架：序数递增但节标题
+ *  不带「关于」且为短名词短语——益坤电气实测形态，绝不可拆）。 */
+const T4_STANDARD_CHAPTER_SAMPLE = `某律师事务所关于某公司首次公开发行股票的法律意见书
+
+一、本次发行上市的批准和授权
+
+本所律师核查了发行人本次发行上市的批准与授权程序。
+
+二、发行人本次发行上市的主体资格
+
+发行人为依法设立且合法存续的股份有限公司。
+
+三、发行人的独立性
+
+发行人在业务、资产、人员、机构、财务方面独立。
+
+四、募集资金的运用
+
+募集资金将用于主营业务相关的项目建设。`
+
+/** 「第X部分」层结构（千岸科技实测：T4B 的长题干节撞第二部分标准章节，
+ *  必须让位——第一部分已由 H3/H5 正确拆解）。 */
+const T4_PART_STRUCTURE_SAMPLE = `第一部分 《审核问询函》回复 ……6
+《审核问询函》问题1. 关于经营合法合规性……6
+第二部分 《律师工作报告》《法律意见书》更新内容……38
+
+《审核问询函》问题1. 关于经营合法合规性
+
+回复：
+
+发行人报告期内合法合规经营，不存在重大违法行为。
+
+一、报告期内是否存在重大违法行为的详细说明及依据、相关主管部门出具的证明
+
+发行人取得了主管部门出具的合规证明文件。`
+
+/** T4A 接管路径（中贝通信实测形态）：顿号小节带佐证撞 H2 弱信号、序号每节
+ *  重启——此前 H2 把 6 节混成 1 题；接管后按大节切分。 */
+const T4_TAKEOVER_SAMPLE = `目 录
+一、关于融资规模与效益预测……第1—26页
+二、关于收入……第26—48页
+三、关于成本与毛利率情况……第48—62页
+
+一、关于融资规模与效益预测
+
+根据审核问询函，发行人说明如下。
+
+## 1、募投项目投资构成
+
+请发行人说明募投项目投资构成的测算依据。
+
+投资构成与建设进度相匹配。
+
+## 2、效益测算与持续盈利情况
+
+请发行人说明效益测算的谨慎性与可实现性。
+
+效益测算基于产能利用率。
+
+二、关于收入
+
+根据审核问询函，发行人说明如下。
+
+## 1、收入确认政策
+
+请发行人披露收入确认政策的执行情况。
+
+政策与合同约定一致。
+
+## 2、客户集中度
+
+请发行人补充披露主要客户合作稳定性。
+
+前五大客户占比稳定。
+
+三、关于成本与毛利率情况
+
+根据审核问询函，发行人说明如下。
+
+## 1、单位成本
+
+请发行人量化分析单位成本变动原因。
+
+原材料价格回落。`
+
+/** 「一、关于《审核问询函》问题N」律师函形态（山高环能实测）：序数+关于+
+ *  函名+题号——归 H3/H5 域，T4A 不得收（防抢 H5 已拆对的文档）。 */
+const T4_QUESTION_REF_SAMPLE = `某律师事务所补充法律意见书
+
+## 一、关于《审核问询函》问题1.关于业绩波动
+
+本所律师就发行人业绩波动情况进行了核查。
+
+核查程序及结论如下。
+
+## 二、关于《审核问询函》问题2.关于关联交易
+
+本所律师核查了报告期内的关联交易情况。
+
+核查程序及结论如下。`
+
+
+
 describe("qa-split — cn2num", () => {
   it("converts digits and Chinese numerals (v4 mapping + single digits)", () => {
     expect(cn2num("42")).toBe(42)
@@ -569,6 +740,64 @@ describe("qa-split — splitQaDocument channels", () => {
   })
 })
 
+describe("qa-split — T4 中介机构序数大节通道（2026-10-19）", () => {
+  it("classify admits accountant letters with 一、关于XX major sections (was not-qa)", () => {
+    expect(classifyQaDocument(T4_ACCOUNTANT_SAMPLE)).toBe("reply")
+    expect(classifyQaDocument(T4_DIRECT_STEM_SAMPLE)).toBe("reply")
+  })
+
+  it("rejects standard-chapter legal opinions (编报规则 12 号骨架红线)", () => {
+    // 序数递增 + 短名词短语章节 + 不带「关于」/问询句式长题干 → not-qa
+    expect(classifyQaDocument(T4_STANDARD_CHAPTER_SAMPLE)).toBeNull()
+  })
+
+  it("splits marker-less accountant letters into 一、关于 major sections (H5 admission via classify)", () => {
+    const split = splitQaDocument(T4_ACCOUNTANT_SAMPLE, "reply")
+    expect(split.questions.length).toBe(3)
+    expect(split.questions[0].title).toContain("关于融资规模与效益预测")
+    expect(split.questions.map((q) => q.questionNo)).toEqual([1, 2, 3])
+  })
+
+  it("T4A takes over H2 when dun-numbered subsections restart per section (中贝通信混题治本)", () => {
+    const split = splitQaDocument(T4_TAKEOVER_SAMPLE, "reply")
+    expect(split.channel).toBe("T4")
+    expect(split.questions.length).toBe(3)
+    // 题干区不含论证小节（题目/回复分界落在「## 1、」阿拉伯小节上）
+    expect(split.questions[0].replyText).toContain("## 1、募投项目投资构成")
+    expect(split.questions[0].questionText).not.toContain("募投项目投资构成")
+  })
+
+  it("T4B catches direct-stem major sections (方正科技族) as the last structural fallback", () => {
+    const split = splitQaDocument(T4_DIRECT_STEM_SAMPLE, "reply")
+    expect(split.channel).toBe("T4")
+    expect(split.questions.length).toBe(2)
+    expect(split.questions[0].title).toContain("建筑工程费")
+  })
+
+  it("T4B yields to 第X部分 layered documents (千岸科技形态)", () => {
+    const split = splitQaDocument(T4_PART_STRUCTURE_SAMPLE, "reply")
+    expect(split.channel).not.toBe("T4")
+    // 第一部分由回复块通道兜住，不被部分结构的直述长节拆坏
+    expect(split.questions.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it("T4A ignores 一、关于《函名》问题N reference lines (山高环能形态，归 H3/H5 域)", () => {
+    const split = splitQaDocument(T4_QUESTION_REF_SAMPLE, "reply")
+    expect(split.channel).not.toBe("T4")
+    expect(split.questions.length).toBe(2)
+  })
+
+  it("keeps title verbatim slices as raw-md substrings (verbatim红线)", () => {
+    const split = splitQaDocument(T4_TAKEOVER_SAMPLE, "reply")
+    for (const q of split.questions) {
+      expect(T4_TAKEOVER_SAMPLE.replace(/\r\n/g, "\n").includes(q.questionText)).toBe(true)
+      if (q.replyText) {
+        expect(T4_TAKEOVER_SAMPLE.replace(/\r\n/g, "\n").includes(q.replyText)).toBe(true)
+      }
+    }
+  })
+})
+
 describe("qa-split — extractRoundMeta", () => {
   it("reads round from the body issuance sentence, not the filename", () => {
     // 千分一泛名文件实测形态：文件名无轮次，正文出具句直接带「第三轮」
@@ -582,11 +811,15 @@ describe("qa-split — extractRoundMeta", () => {
     expect(meta.basis).toContain("正文出具句")
   })
 
-  it("never treats 首次公开发行 as round 1 (SSE first-round letters carry no round marker)", () => {
+  it("defaults marker-less 审核问询函 to round 1 without misreading 首次公开发行 as a round", () => {
     const body = `贵所于 2025 年 11 月 27 日出具的《关于泉州嘉德利电子材料股份公司首次公开发行股票并在沪市主板上市申请文件的审核问询函》已收悉。`
-    // 正文无轮次字样（「首次」修饰公开发行）；文件名也不带轮次 → 如实 null
-    expect(extractRoundMeta(body, "8-1 发行人及中介机构关于审核问询函的回复.pdf").roundNo).toBeNull()
-    // 文件名带「首轮」上下文 → 回退识别为第 1 轮
+    // 正文无轮次字样（「首次」修饰公开发行，不是轮次）；2026-10-19 定案：
+    // 审核问询函族无轮次标记 = 首轮（上交所首轮函制度性无「第N轮」字样）
+    const meta = extractRoundMeta(body, "8-1 发行人及中介机构关于审核问询函的回复.pdf")
+    expect(meta.roundNo).toBe(1)
+    expect(meta.basis).toContain("首轮默认")
+    expect(meta.basis).not.toContain("文件名轮次")
+    // 文件名带「首轮」上下文 → 回退识别（basis 标弱参考，非默认）
     expect(extractRoundMeta(body, "8-1 发行人及中介机构关于首轮审核问询函的回复.pdf").roundNo).toBe(1)
   })
 
@@ -603,10 +836,19 @@ describe("qa-split — extractRoundMeta", () => {
     expect(meta.roundNo).toBe(1)
     expect(meta.basis).toBe("文件名弱参考")
   })
-  it("reports unidentified honestly instead of inventing round 1", () => {
+  it("keeps 落实函/注册反馈 honest (no round invention) while 审核问询函 defaults to 1", () => {
+    // 无关文本 + 泛名文件：函类判为审核问询函族 → 首轮默认 1（制度性形态）
     const meta = extractRoundMeta("无关文本。", "发行人及中介机构回复意见.pdf")
-    expect(meta.roundNo).toBeNull()
-    expect(meta.basis).toContain("未识别")
+    expect(meta.roundNo).toBe(1)
+    expect(meta.basis).toContain("首轮默认")
+    // 落实函/注册反馈识别不出轮次保持 null——落实函对应第N轮问询的落实，
+    // 轮次不可默认（如实省略）
+    const impl = extractRoundMeta(
+      "贵所于 2025 年 9 月 10 日出具的《关于某公司向特定对象发行股票的审核中心意见落实函》已收悉。",
+      "7-3 落实函回复.pdf",
+    )
+    expect(impl.roundKind).toBe("落实函")
+    expect(impl.roundNo).toBeNull()
   })
 })
 

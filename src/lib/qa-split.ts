@@ -93,9 +93,40 @@ const H4_LINE = /^\s*#{0,4}\s*[【\[]?(?:(?:回复|答复)(?:如下|意见)?|(?:
  *  （红板科技实测 2026-10-10：无「问题N」字样、无 ## 标题，序数+关键词即题）。 */
 const H5_LINE = new RegExp(`^[一二三四五六七八九十]{1,3}\\s*、\\s*(${H2_KEYWORDS})`)
 
+// ---- T4: 中介机构「序数大节」体（2026-10-19 第三梯队，探针报告定案） ----
+// 会计师/评估/律师逐题文件：题边界=「一、**关于**XX」递增大节，无「问题N」
+// 题号、无「回复：」块——classify 判 not-qa、split 时 H5 的「题数=回复块数」
+// 校验必挂，整族进归纳式，题目层丢失（2026-10-14 探针：not-qa 139 的主体）。
+// 判据三件套（探针 §四.1）：序数构成递增序列 + 节标题紧邻「关于」（挡标准
+// 章节体红线——《编报规则 12 号》法律意见书 16 章骨架节标题不带「关于」）+
+// 节长下限（挡目录行，点线行先剔除）。
+const T4A_LINE = /^#{0,4}\s*([一二三四五六七八九十]{1,3})\s*、\s*关于/
+/** T4A 行内含「问题N」题号结构（「一、关于《审核问询函》问题1.」律师函形态，
+ *  山高环能实测）= 函题号引用，归 H3/H5 域——T4A 不收，防抢 H5 已拆对的文档。 */
+const T4_QUESTION_REF = /问题\s*(?:[0-9]{1,3}|[一二三四五六七八九十]{1,3})/
+/** T4B 题干直述档（方正科技实测）：大节标题不带「关于」，是完整问询题干
+ *  长句（「一、建筑工程费、设备购置及安装费等具体内容及测算过程，…合理性」）。
+ *  与标准章节体的区分：≥T4B_MIN_TITLE 字的长句 + 问询句式词；短名词短语
+ *  （「本次发行上市的批准和授权」）= 章节体，不收。 */
+const T4B_LINE = /^#{0,4}\s*([一二三四五六七八九十]{1,3})\s*、\s*(.{8,})$/
+const T4B_MIN_TITLE = 25
+const T4_INQUIRY_WORDS =
+  /说明|披露|合理性|依据|是否存在|测算|情况|过程|原因|影响|规模|占比|构成/
+/** 「第X部分」层结构（千岸科技实测：第一部分=问询回复、第二部分=意见书
+ *  更新）——T4B 的长题干节会撞第二部分的标准章节长行，误抢拆坏；此类
+ *  文档 H5/H3 已能拆第一部分，T4B 整体让位。 */
+const T4_PART_STRUCTURE = /第\s*[一二三四五六七八九十]{1,2}\s*部分/
+/** 节长下限（行）：真大节正文成块；目录残留/孤立引用行不成块。 */
+const T4_MIN_SECTION_LINES = 5
+/** 首边界位置上限：大节组织必须从文档前部开始（封面/目录容差）——
+ *  8-1 主回复的回复正文里也遍在「一、关于」递增小节（全库实测 810/1650
+ *  qa 命中朴素判据），但它们起于第一题回复区；T4 只兜「无题号形态」的
+ *  文档（H1/H2/H3 拆不出时才轮到），此处 30% 是文档级组织性校验。 */
+const T4_HEAD_RATIO = 0.3
+
 const MAX_QUESTION_NO = 299
 
-export type SplitChannel = "H1" | "H2" | "H3" | "H4" | "H5" | "L6"
+export type SplitChannel = "H1" | "H2" | "H3" | "H4" | "H5" | "T4" | "L6"
 
 /** qa 文档形态：回复函（含回复块）或问询函原件（只有题目清单）。 */
 export type QaDocumentKind = "reply" | "letter"
@@ -110,7 +141,8 @@ export interface QaPathMeta {
 }
 
 export interface QaRoundMeta {
-  /** null = 正文与文件名都无法识别轮次（如实省略，不造 1）。 */
+  /** 轮次。审核问询函族无轮次标记时默认 1（上交所首轮函制度性无「第N轮」
+   *  字样，2026-10-19 定案）；落实函/注册反馈识别不出保持 null（不造数）。 */
   roundNo: number | null
   /** 审核问询函 | 落实函 | 注册反馈 */
   roundKind: "审核问询函" | "落实函" | "注册反馈"
@@ -212,6 +244,10 @@ export function classifyQaDocument(text: string): QaDocumentKind | null {
     return "reply"
   }
   if (hasQuestionStructure) return hasReplyMarker(text) ? "reply" : "letter"
+  // T4 签名（2026-10-19）：中介机构「序数大节」体——会计师/评估/律师逐题
+  // 文件无「问题N」题号也无「回复：」块，此前整族判 not-qa 走归纳式，
+  // 题目层丢失。判据组织性校验见 validateT4Structure。
+  if (hasT4Signature(text)) return "reply"
   // 回复块兜底：泛名回复文件（519 份「发行人及中介机构回复意见.pdf」）
   // 无题号标记也无标准封面句式，但 2+ 个独立「回复：」行已是问询回复的
   // 特异结构（普通文档/法规不会出现）——交给 H4 拆题。
@@ -220,6 +256,14 @@ export function classifyQaDocument(text: string): QaDocumentKind | null {
     return "reply"
   }
   return null
+}
+
+/** T4 签名：T4A（紧邻「关于」）或 T4B（题干直述，排除「第X部分」层结构）。 */
+function hasT4Signature(text: string): boolean {
+  const lines = text.split(/\r?\n/)
+  if (validateT4Structure(lines, collectT4Markers(lines, "A")) !== null) return true
+  if (T4_PART_STRUCTURE.test(text.slice(0, 4000))) return false
+  return validateT4Structure(lines, collectT4Markers(lines, "B")) !== null
 }
 
 function hasReplyMarker(text: string): boolean {
@@ -239,6 +283,59 @@ function countHeadingMarkers(text: string, pattern: RegExp): number {
     if (pattern.test(line.trimEnd())) count += 1
   }
   return count
+}
+
+/**
+ * T4 大节候选收集（T4A 紧邻「关于」主判据；T4B 题干直述档可选启用）。
+ * 目录点线行排除；T4A 排除行内「问题N」引用形态（归 H3/H5 域）。
+ */
+function collectT4Markers(lines: string[], variant: "A" | "B"): LineMarker[] {
+  const out: LineMarker[] = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim()
+    if (TOC_DOT_LEADER.test(trimmed)) continue
+    if (variant === "A") {
+      const m = T4A_LINE.exec(trimmed)
+      if (!m || T4_QUESTION_REF.test(trimmed)) continue
+      const no = cn2num(m[1])
+      if (no > 0 && no <= 99) out.push({ line: i, no })
+    } else {
+      const m = T4B_LINE.exec(trimmed)
+      if (!m) continue
+      const title = m[2]
+      if (title.slice(0, 4).includes("关于")) continue // T4A 域
+      if (title.length < T4B_MIN_TITLE) continue // 短名词短语=标准章节体
+      if (!T4_INQUIRY_WORDS.test(title)) continue
+      if (T4_QUESTION_REF.test(trimmed)) continue
+      const no = cn2num(m[1])
+      if (no > 0 && no <= 99) out.push({ line: i, no })
+    }
+  }
+  return out
+}
+
+/**
+ * T4 组织性校验：候选序数构成递增序列（≥2 节）+ 每节长度 ≥ 下限（挡目录
+ * 残留）+ 首边界在文档前部（文档级组织而非回复内小节）。返回通过的边界
+ * 集合；不满足返回 null。
+ */
+function validateT4Structure(
+  lines: string[],
+  candidates: LineMarker[],
+  opts: { requireHead?: boolean } = {},
+): LineMarker[] | null {
+  const { kept } = monotonicMarkers(candidates)
+  if (kept.length < 2) return null
+  let minGap = Infinity
+  for (let i = 0; i < kept.length; i += 1) {
+    const end = i + 1 < kept.length ? kept[i + 1].line : lines.length - 1
+    minGap = Math.min(minGap, end - kept[i].line)
+  }
+  if (minGap < T4_MIN_SECTION_LINES) return null
+  if ((opts.requireHead ?? true) && kept[0].line / Math.max(lines.length, 1) > T4_HEAD_RATIO) {
+    return null
+  }
+  return kept
 }
 
 interface LineMarker {
@@ -330,12 +427,32 @@ export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResu
   const h2 = [...headingChannel(H2_LINE), ...contextualH2Markers(lines)].sort(
     (a, b) => a.line - b.line,
   )
+  // T4A 接管资格（江淮汽车实测）：无回复块 + 大节组织（递增/节长/首边界
+  // 校验全过）且节数比 H2 保留的题数更多——H2 的顿号小节（序号每题重启）
+  // 是大节内的次级结构，此前 monotonic 砍剩的头几个被当题、多节混进一题。
+  // 8-1 主回复函不受影响：它们带「回复：」块（replyMarkers>0 即失格），
+  // 且真题数 ≥ 大节数（至信 17>5 / 马矿 15>10，全库实测）。
+  const t4aKept =
+    replyMarkers.length === 0
+      ? validateT4Structure(lines, collectT4Markers(lines, "A"))
+      : null
   if (h2.length >= 2) {
     const { kept, manualQueue } = monotonicMarkers(h2)
-    return {
-      kind, channel: "H2",
-      questions: cutQuestions(lines, kept, replyMarkers, "H2", opinionStyle),
-      tocNumbers: toc, manualQueue,
+    // H2 防误拆：候选 ≥2 但 monotonic 后只剩 1（序号重启=顿号小节形态，
+    // 中贝通信实测 6 节拆 1 题）——弱信号让位，续走 H3/T4/H5/H4。
+    if (kept.length >= 2) {
+      if (t4aKept && t4aKept.length > kept.length) {
+        return {
+          kind, channel: "T4",
+          questions: cutQuestions(lines, t4aKept, replyMarkers, "T4", true),
+          tocNumbers: toc, manualQueue: null,
+        }
+      }
+      return {
+        kind, channel: "H2",
+        questions: cutQuestions(lines, kept, replyMarkers, "H2", opinionStyle),
+        tocNumbers: toc, manualQueue,
+      }
     }
   }
 
@@ -352,11 +469,19 @@ export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResu
   // 序数在题内小节会重启（汇创达实测：题内小节同为「一、关于…」形态，
   // monotonic 砍到 2）——H5 题数必须与回复块数吻合（±2）才可信，
   // 否则序数是小节不是题，回退 H4 按回复块计。
+  // 2026-10-19 修目录盲区：会计师/律师文件的目录页同形态双出现
+  // （「一、关于融资规模……第1—26页」），此前目录行先进 monotonic、
+  // 正文边界被当重启砍掉，拆出的「题」只剩目录行自身（21 字题干）。
+  // 目录点线行与 bodyQuestionMarkers 同口径排除——目录行绝不是题边界。
   const h5: LineMarker[] = []
   for (let i = 0; i < lines.length; i += 1) {
     const trimmed = lines[i].trim()
-    if (!H5_LINE.test(trimmed)) continue
-    const cn = trimmed.match(/^([一二三四五六七八九十]{1,3})\s*、/)
+    if (TOC_DOT_LEADER.test(trimmed)) continue
+    // md 化的序数大节（山高环能实测「## 一、关于《审核问询函》问题1.」）
+    // 剥 ## 前缀后同形态收——MinerU 对律师函序数节输出 # 标题。
+    const stripped = trimmed.replace(/^#{1,4}\s*/, "")
+    if (!H5_LINE.test(stripped)) continue
+    const cn = stripped.match(/^([一二三四五六七八九十]{1,3})\s*、/)
     const num = cn ? cn2num(cn[1]) : 0
     if (num > 0 && num <= 99) h5.push({ line: i, no: num })
   }
@@ -379,6 +504,23 @@ export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResu
       kind, channel: "H4",
       questions: cutByReplyBlocks(lines, replyMarkers),
       tocNumbers: toc, manualQueue: null,
+    }
+  }
+
+  // T4B 题干直述档（方正科技族）：H1/H2/H3/H5/H4 全落空后的末位大节兜底。
+  // 「第X部分」层结构文档不进——千岸科技实测其长题干节撞判据，但 H5 已
+  // 把第一部分拆对，T4B 会拆坏。
+  // （T4A 无独立兜底位：「一、关于XX」⊆ H5_LINE 关键词集，无回复块的
+  //  ≥2 节大节文档已被 H5 的 blockDelta/无回复块分支接住——T4A 只在 H2
+  //  接管位出场，抢在顿号小节弱信号混题之前。）
+  if (!T4_PART_STRUCTURE.test(text.slice(0, 4000))) {
+    const t4bKept = validateT4Structure(lines, collectT4Markers(lines, "B"))
+    if (t4bKept) {
+      return {
+        kind, channel: "T4",
+        questions: cutQuestions(lines, t4bKept, replyMarkers, "T4", true),
+        tocNumbers: toc, manualQueue: null,
+      }
     }
   }
 
@@ -498,10 +640,13 @@ function cutQuestions(
       for (let i = start + 1; i <= end; i += 1) {
         // 意见书小节形态：裸「（一）」行（松发），或带 ## 前缀的
         // 「## （一）」/「## 一、」标题行（中贝 7-3 实测——MinerU 对意见书
-        // 论证小节输出 # 标题，只认裸行会把整个回复混进题目区）。
+        // 论证小节输出 # 标题，只认裸行会把整个回复混进题目区）；
+        // 「## 1、」阿拉伯序数小节（T4 会计师文件，方正科技实测——节内
+        // 论证小节是阿拉伯顿号形态，不认则题干区吞掉整个大节）。
         if (
           /^#{0,4}\s*[（(][一二三四五六七八九十]{1,3}[)）]\s*\S/.test(lines[i]) ||
-          /^#{1,4}\s*[一二三四五六七八九十]{1,3}\s*[、.．]\s*\S/.test(lines[i])
+          /^#{1,4}\s*[一二三四五六七八九十]{1,3}\s*[、.．]\s*\S/.test(lines[i]) ||
+          /^#{1,4}\s*[0-9]{1,3}\s*[、.．]\s*\S/.test(lines[i])
         ) {
           replyStart = i
           break
@@ -631,8 +776,16 @@ export function extractRoundMeta(text: string, fileName: string): QaRoundMeta {
     }
   }
 
-  const isFeedback = letterName.includes("注册环节反馈意见") || letterName.includes("反馈意见")
-  const isImplementation = letterName.includes("落实函") && !isFeedback
+  // 函类兜底（2026-10-19）：出具句无日期变体（「根据贵所出具的《…落实函》：」）
+  // 不命中 ROUND_SENTENCE 时 letterName 为空，落实函会被误判为审核问询函族、
+  // 再被首轮默认错给 roundNo=1——文件名的「落实函/反馈意见」字样做 kind 兜底
+  //（泛名文件无 kind 字样，不受影响）。
+  const isFeedback =
+    letterName.includes("注册环节反馈意见") ||
+    letterName.includes("反馈意见") ||
+    /反馈意见/.test(fileName)
+  const isImplementation =
+    (letterName.includes("落实函") || /落实函/.test(fileName)) && !isFeedback
   const roundKind: QaRoundMeta["roundKind"] = isFeedback
     ? "注册反馈"
     : isImplementation
@@ -642,6 +795,16 @@ export function extractRoundMeta(text: string, fileName: string): QaRoundMeta {
     isFeedback || /中国证券监督管理委员会|证监会/.test(sentence?.[1] ?? "")
       ? "证监会"
       : "交易所"
+
+  // 首轮默认（2026-10-19 第三梯队，探针报告定案）：审核问询函族函名/正文
+  // 均无轮次标记 = 首轮——上交所《审核问询函》首轮函通体无「第N轮」字样
+  // 是制度性形态（全库实测 1,009 份 roundNo=null）。落实函/注册反馈保持
+  // 如实 null（落实函对应的是第N轮问询的落实，轮次不可默认）。basis 记
+  // 「首轮默认」可溯源，与真实识别区分。
+  if (roundNo === null && roundKind === "审核问询函") {
+    roundNo = 1
+    basis = basis ? `${basis}+首轮默认` : "首轮默认（函名与正文均无轮次标记）"
+  }
 
   return {
     roundNo,
