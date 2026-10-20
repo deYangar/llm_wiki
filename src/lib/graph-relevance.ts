@@ -1,7 +1,4 @@
-import { readFile, listDirectory } from "@/commands/fs"
-import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
-import { parseFrontmatter } from "@/lib/frontmatter"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -26,8 +23,6 @@ export interface RetrievalGraph {
 // Constants
 // ---------------------------------------------------------------------------
 
-const WIKILINK_REGEX = /\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]/g
-const GRAPH_FILE_READ_CONCURRENCY = 16
 const MAX_CACHED_RETRIEVAL_GRAPHS = 2
 
 const WEIGHTS = {
@@ -55,135 +50,6 @@ const cachedGraphs = new Map<string, RetrievalGraph>()
 // Helpers (pure)
 // ---------------------------------------------------------------------------
 
-function flattenMdFiles(nodes: readonly FileNode[]): FileNode[] {
-  const files: FileNode[] = []
-  for (const node of nodes) {
-    if (node.is_dir && node.children) {
-      files.push(...flattenMdFiles(node.children))
-    } else if (!node.is_dir && node.name.endsWith(".md")) {
-      files.push(node)
-    }
-  }
-  return files
-}
-
-async function mapWithConcurrency<T, R>(
-  values: readonly T[],
-  limit: number,
-  mapper: (value: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(values.length)
-  let cursor = 0
-  const workers = Array.from({ length: Math.min(limit, values.length) }, async () => {
-    while (cursor < values.length) {
-      const index = cursor++
-      results[index] = await mapper(values[index])
-    }
-  })
-  await Promise.all(workers)
-  return results
-}
-
-function fileNameToId(fileName: string): string {
-  return fileName.replace(/\.md$/, "")
-}
-
-function extractFrontmatter(content: string): { title: string; type: string; sources: string[]; related: string[] } {
-  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
-  const fm = fmMatch ? fmMatch[1] : ""
-
-  const titleMatch = fm.match(/^title:\s*["']?(.+?)["']?\s*$/m)
-  const typeMatch = fm.match(/^type:\s*["']?(.+?)["']?\s*$/m)
-
-  // Parse sources array from YAML frontmatter
-  const sources: string[] = []
-  const related: string[] = []
-  const sourcesBlockMatch = fm.match(/^sources:\s*\n((?:\s+-\s+.+\n?)*)/m)
-  if (sourcesBlockMatch) {
-    const lines = sourcesBlockMatch[1].split("\n")
-    for (const line of lines) {
-      const itemMatch = line.match(/^\s+-\s+["']?(.+?)["']?\s*$/)
-      if (itemMatch) {
-        sources.push(itemMatch[1])
-      }
-    }
-  } else {
-    // Single-line: sources: ["a.pdf", "b.pdf"] or sources: [a.pdf]
-    const inlineMatch = fm.match(/^sources:\s*\[([^\]]*)\]/m)
-    if (inlineMatch) {
-      const items = inlineMatch[1].split(",")
-      for (const item of items) {
-        const trimmed = item.trim().replace(/^["']|["']$/g, "")
-        if (trimmed) sources.push(trimmed)
-      }
-    }
-  }
-
-  const parsedRelated = parseFrontmatter(content).frontmatter?.related
-  if (Array.isArray(parsedRelated)) {
-    for (const item of parsedRelated) {
-      if (typeof item !== "string") continue
-      const normalized = item
-        .trim()
-        .replace(/^\[\[|\]\]$/g, "")
-        .split("|")[0]
-        .split("#")[0]
-        .replace(/\\/g, "/")
-        .split("/")
-        .pop()
-        ?.replace(/\.md$/i, "") ?? ""
-      if (normalized) related.push(normalized)
-    }
-  }
-
-  let title = titleMatch ? titleMatch[1].trim() : ""
-  if (!title) {
-    const headingMatch = content.match(/^#\s+(.+)$/m)
-    title = headingMatch ? headingMatch[1].trim() : ""
-  }
-
-  return {
-    title,
-    type: typeMatch ? typeMatch[1].trim().toLowerCase() : "other",
-    sources,
-    related,
-  }
-}
-
-function extractWikilinks(content: string): string[] {
-  const links: string[] = []
-  const regex = new RegExp(WIKILINK_REGEX.source, "g")
-  let match: RegExpExecArray | null
-  while ((match = regex.exec(content)) !== null) {
-    links.push(match[1].trim())
-  }
-  return links
-}
-
-interface TargetResolver {
-  readonly nodeIds: ReadonlySet<string>
-  readonly aliases: ReadonlyMap<string, string>
-}
-
-function normalizeLinkKey(value: string): string {
-  return value.toLowerCase().replace(/\s+/g, "-")
-}
-
-function buildTargetResolver(nodeIds: ReadonlySet<string>): TargetResolver {
-  const aliases = new Map<string, string>()
-  for (const id of nodeIds) {
-    const normalized = normalizeLinkKey(id)
-    // Preserve the original directory-listing order for alias collisions.
-    if (!aliases.has(normalized)) aliases.set(normalized, id)
-  }
-  return { nodeIds, aliases }
-}
-
-function resolveTarget(raw: string, resolver: TargetResolver): string | null {
-  if (resolver.nodeIds.has(raw)) return raw
-  return resolver.aliases.get(normalizeLinkKey(raw)) ?? null
-}
-
 function getNeighbors(node: RetrievalNode): ReadonlySet<string> {
   const neighbors = new Set<string>()
   for (const id of node.outLinks) neighbors.add(id)
@@ -199,99 +65,65 @@ function getNodeDegree(node: RetrievalNode): number {
 // Core API
 // ---------------------------------------------------------------------------
 
-export async function buildRetrievalGraph(
+/** Minimal node view of the Rust graph snapshot this builder consumes. */
+export interface GraphSnapshotNodeInput {
+  id: string
+  title: string
+  type: string
+  path: string
+  sources: readonly string[]
+}
+
+/**
+ * Build the retrieval graph from a `wiki_graph_snapshot` payload instead
+ * of reading every file in the library (the old buildRetrievalGraph did a
+ * second full-library pass after wiki-graph.ts's own). `nodes` must
+ * already be query-filtered and `edges` must reference node ids in
+ * `nodes` — the wiki-graph mapping layer owns that filtering. Sources
+ * come from Rust frontmatter parsing, which is stricter than the old
+ * regex extraction; relevance weights may shift slightly (known,
+ * accepted: the snapshot parsing is the more accurate one).
+ */
+export function buildRetrievalGraphFromSnapshot(
   projectPath: string,
-  dataVersion: number = 0,
-): Promise<RetrievalGraph> {
+  dataVersion: number,
+  nodes: readonly GraphSnapshotNodeInput[],
+  edges: ReadonlyArray<{ source: string; target: string }>,
+): RetrievalGraph {
   const normalizedProjectPath = normalizePath(projectPath)
-  // Return cached if version matches
   const cachedGraph = cachedGraphs.get(normalizedProjectPath)
   if (cachedGraph?.dataVersion === dataVersion) {
     return cachedGraph
   }
 
-  const wikiRoot = `${normalizedProjectPath}/wiki`
-  let tree: FileNode[]
-  try {
-    tree = await listDirectory(wikiRoot)
-  } catch {
-    const emptyGraph: RetrievalGraph = { nodes: new Map(), dataVersion }
-    cacheRetrievalGraph(normalizedProjectPath, emptyGraph)
-    return emptyGraph
-  }
-
-  const mdFiles = flattenMdFiles(tree)
-
-  // First pass: read all files and build raw node data
-  type RawNode = {
-    id: string
-    title: string
-    type: string
-    path: string
-    sources: string[]
-    rawLinks: string[]
-    fileName: string
-  }
-
-  const parsedFiles = await mapWithConcurrency<FileNode, RawNode | null>(
-    mdFiles,
-    GRAPH_FILE_READ_CONCURRENCY,
-    async (file) => {
-      try {
-        const content = await readFile(file.path)
-        const fm = extractFrontmatter(content)
-        return {
-          id: fileNameToId(file.name),
-          title: fm.title || file.name.replace(/\.md$/, "").replace(/-/g, " "),
-          type: fm.type,
-          path: file.path,
-          sources: fm.sources,
-          rawLinks: Array.from(new Set([...extractWikilinks(content), ...fm.related])),
-          fileName: file.name,
-        }
-      } catch {
-        return null
-      }
-    },
-  )
-  const rawNodes = parsedFiles.filter((node): node is RawNode => node !== null)
-
-  const nodeIds = new Set(rawNodes.map((n) => n.id))
-  const targetResolver = buildTargetResolver(nodeIds)
-
-  // Second pass: resolve links and build graph nodes
   const outLinksMap = new Map<string, Set<string>>()
   const inLinksMap = new Map<string, Set<string>>()
-
-  for (const id of nodeIds) {
-    outLinksMap.set(id, new Set())
-    inLinksMap.set(id, new Set())
+  for (const node of nodes) {
+    outLinksMap.set(node.id, new Set())
+    inLinksMap.set(node.id, new Set())
+  }
+  for (const edge of edges) {
+    // Stale edges whose endpoints left the node set are ignored, matching
+    // the wiki-graph mapping layer's visibility filter.
+    if (!outLinksMap.has(edge.source) || !outLinksMap.has(edge.target)) continue
+    outLinksMap.get(edge.source)!.add(edge.target)
+    inLinksMap.get(edge.target)!.add(edge.source)
   }
 
-  for (const raw of rawNodes) {
-    for (const linkTarget of raw.rawLinks) {
-      const resolvedId = resolveTarget(linkTarget, targetResolver)
-      if (resolvedId === null || resolvedId === raw.id) continue
-      outLinksMap.get(raw.id)!.add(resolvedId)
-      inLinksMap.get(resolvedId)!.add(raw.id)
-    }
-  }
-
-  // Build immutable nodes map
-  const nodes = new Map<string, RetrievalNode>()
-  for (const raw of rawNodes) {
-    nodes.set(raw.id, {
-      id: raw.id,
-      title: raw.title,
-      type: raw.type,
-      path: raw.path,
-      sources: Object.freeze([...raw.sources]),
-      outLinks: Object.freeze(outLinksMap.get(raw.id) ?? new Set<string>()),
-      inLinks: Object.freeze(inLinksMap.get(raw.id) ?? new Set<string>()),
+  const nodesMap = new Map<string, RetrievalNode>()
+  for (const node of nodes) {
+    nodesMap.set(node.id, {
+      id: node.id,
+      title: node.title,
+      type: node.type,
+      path: node.path,
+      sources: Object.freeze([...node.sources]),
+      outLinks: Object.freeze(outLinksMap.get(node.id) ?? new Set<string>()),
+      inLinks: Object.freeze(inLinksMap.get(node.id) ?? new Set<string>()),
     })
   }
 
-  const graph: RetrievalGraph = { nodes, dataVersion }
+  const graph: RetrievalGraph = { nodes: nodesMap, dataVersion }
   cacheRetrievalGraph(normalizedProjectPath, graph)
   return graph
 }

@@ -4841,6 +4841,32 @@ mod tests {
         edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect()
     }
 
+    // §3.2 parity tooling: byte-exact dump of what wiki_graph_snapshot
+    // would return, feeding tools/graph-pipeline-parity. Manual only —
+    // set LLM_WIKI_PARITY_DUMP to a project path, optionally
+    // LLM_WIKI_PARITY_OUT for the target file, and run with -- --ignored.
+    // The library must be static (no concurrent writer session).
+    #[test]
+    #[ignore = "manual dump for tools/graph-pipeline-parity; needs LLM_WIKI_PARITY_DUMP=<project>"]
+    fn dump_graph_snapshot_for_parity() {
+        let project =
+            std::env::var("LLM_WIKI_PARITY_DUMP").expect("LLM_WIKI_PARITY_DUMP=<project>");
+        let snapshot = build_graph_cached(&project).expect("build_graph_cached");
+        let payload = serde_json::json!({
+            "nodes": snapshot.nodes,
+            "edges": snapshot.edges.iter().map(|owned| &owned.edge).collect::<Vec<_>>(),
+        });
+        let out = std::env::var("LLM_WIKI_PARITY_OUT")
+            .unwrap_or_else(|_| "graph-snapshot-dump.json".to_string());
+        std::fs::write(&out, serde_json::to_string(&payload).unwrap()).expect("write dump");
+        println!(
+            "dumped {} nodes / {} edges to {}",
+            snapshot.nodes.len(),
+            snapshot.edges.len(),
+            out
+        );
+    }
+
     fn graph_edge_pairs<'a>(r: &'a GraphQueryResult) -> Vec<(&'a str, &'a str)> {
         r.edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect()
     }

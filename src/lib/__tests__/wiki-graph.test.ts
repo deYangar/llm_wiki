@@ -1,156 +1,105 @@
 /**
- * wiki-graph.test.ts — regression tests for frontmatter-scoped title/type extraction
+ * wiki-graph.test.ts — mapping-layer semantics of the Rust-snapshot graph
+ * pipeline.
  *
- * extractTitle/extractType previously searched for `title:`/`type:` anywhere in the
- * whole file content, not just inside the `---...---` frontmatter block, because the
- * lazy `[\s\S]*?` in their regexes was never required to stop at the closing `---`.
- * A body line that merely starts with `title:` or `type:` (plain prose, not YAML)
- * could be misread as the frontmatter value.
+ * The build itself moved to the Rust wiki_graph_snapshot command (§3.2 of
+ * the 2026-10-20 cold-start/graph plan): frontmatter/wikilink extraction
+ * and link resolution now live in api_server's build pipeline, shared
+ * byte-for-byte with the HTTP /graph contract and covered by the Rust
+ * test suite (graph_fixture_* family). What remains frontend-owned — and
+ * what this file pins — is the snapshot→UI mapping: query hiding,
+ * dangling-edge removal, linkCount recomputation, path joining, caching.
  */
-import { describe, it, expect, vi } from "vitest"
-import type { FileNode } from "@/types/wiki"
+import { describe, it, expect, vi, beforeEach } from "vitest"
+import type { WikiGraphSnapshot } from "@/commands/fs"
 
-const mockListDirectory = vi.fn()
-const mockReadFile = vi.fn()
+const mockSnapshot = vi.fn<[], Promise<WikiGraphSnapshot>>()
 
 vi.mock("@/commands/fs", () => ({
-  listDirectory: (...args: unknown[]) => mockListDirectory(...args),
-  readFile: (...args: unknown[]) => mockReadFile(...args),
+  wikiGraphSnapshot: (...args: unknown[]) => mockSnapshot(...args),
 }))
 
-async function loadBuildWikiGraph() {
-  const mod = await import("../wiki-graph")
-  return mod.buildWikiGraph
+vi.mock("@/stores/wiki-store", () => ({
+  useWikiStore: { getState: () => ({ dataVersion: 42 }) },
+}))
+
+import { buildWikiGraph } from "../wiki-graph"
+
+function snapshotNode(id: string, nodeType = "entity"): WikiGraphSnapshot["nodes"][number] {
+  return { id, label: id.toUpperCase(), nodeType, path: `wiki/${id}.md`, linkCount: 0, tags: [], sources: [] }
 }
 
-function mdFile(name: string): FileNode {
-  return { name, path: `/project/wiki/${name}`, is_dir: false }
+function baseSnapshot(): WikiGraphSnapshot {
+  return {
+    nodes: [snapshotNode("a"), snapshotNode("b")],
+    edges: [{ source: "a", target: "b", weight: 1.0 }],
+  }
 }
 
-describe("buildWikiGraph frontmatter extraction", () => {
-  it("does not read a title: line from the document body as the frontmatter title", async () => {
-    const buildWikiGraph = await loadBuildWikiGraph()
-    mockListDirectory.mockResolvedValue([mdFile("page.md")])
-    mockReadFile.mockResolvedValue(
-      "---\ntype: entity\n---\n# Real Heading\n\nSome text.\ntitle: not-frontmatter-at-all\n",
-    )
+beforeEach(() => {
+  mockSnapshot.mockReset()
+  mockSnapshot.mockImplementation(async () => baseSnapshot())
+})
+
+describe("buildWikiGraph snapshot mapping", () => {
+  it("joins relative snapshot paths onto the project root", async () => {
+    const graph = await buildWikiGraph("/project")
+
+    expect(graph.nodes.map((n) => n.path)).toEqual(["/project/wiki/a.md", "/project/wiki/b.md"])
+  })
+
+  it("hides query nodes defensively and drops their dangling edges", async () => {
+    mockSnapshot.mockImplementation(async () => ({
+      nodes: [snapshotNode("a"), snapshotNode("b"), snapshotNode("c"), snapshotNode("q", "query")],
+      edges: [
+        { source: "a", target: "b", weight: 1.0 },
+        { source: "b", target: "q", weight: 1.0 },
+        { source: "q", target: "c", weight: 1.0 },
+      ],
+    }))
 
     const graph = await buildWikiGraph("/project")
 
-    expect(graph.nodes).toHaveLength(1)
-    expect(graph.nodes[0].label).toBe("Real Heading")
+    // Rust filters query nodes already; the frontend filter is double
+    // cover and must take the query-adjacent edges with it.
+    expect(graph.nodes.map((n) => n.id).sort()).toEqual(["a", "b", "c"])
   })
 
-  it("does not read a type: line from the document body as the frontmatter type", async () => {
-    const buildWikiGraph = await loadBuildWikiGraph()
-    mockListDirectory.mockResolvedValue([mdFile("page.md")])
-    mockReadFile.mockResolvedValue(
-      "---\ntitle: Real Page\n---\n# Real Page\n\nSome text.\ntype: query\nMore text.\n",
-    )
+  it("recomputes linkCount as in+out degree over visible nodes only", async () => {
+    mockSnapshot.mockImplementation(async () => ({
+      nodes: [snapshotNode("a"), snapshotNode("b"), snapshotNode("q", "query")],
+      // Raw Rust linkCount includes query neighbors; the mapping layer
+      // recomputes so node sizes keep the old visible-only semantics.
+      edges: [
+        { source: "a", target: "b", weight: 1.0 },
+        { source: "b", target: "q", weight: 1.0 },
+      ],
+    }))
 
     const graph = await buildWikiGraph("/project")
 
-    // A misread type of "query" would match HIDDEN_TYPES and silently drop the page.
-    expect(graph.nodes).toHaveLength(1)
-    expect(graph.nodes[0].type).toBe("other")
+    const linkCount = Object.fromEntries(graph.nodes.map((n) => [n.id, n.linkCount]))
+    expect(linkCount).toEqual({ a: 1, b: 1 })
   })
 
-  it("parses CRLF frontmatter consistently with the rest of the application", async () => {
-    const buildWikiGraph = await loadBuildWikiGraph()
-    mockListDirectory.mockResolvedValue([mdFile("page.md")])
-    mockReadFile.mockResolvedValue(
-      "---\r\ntitle: CRLF Page\r\ntype: entity\r\n---\r\n# Fallback Heading\r\n",
-    )
+  it("keeps the graph usable when the snapshot invoke fails", async () => {
+    mockSnapshot.mockRejectedValue(new Error("project gone"))
 
     const graph = await buildWikiGraph("/project")
 
-    expect(graph.nodes).toHaveLength(1)
-    expect(graph.nodes[0]).toMatchObject({ label: "CRLF Page", type: "entity" })
-  })
-
-  it("uses YAML parsing for quoted values that contain a colon", async () => {
-    const buildWikiGraph = await loadBuildWikiGraph()
-    mockListDirectory.mockResolvedValue([mdFile("page.md")])
-    mockReadFile.mockResolvedValue(
-      '---\ntitle: "Attention: Architecture"\ntype: "Concept"\n---\n# Fallback Heading\n',
-    )
-
-    const graph = await buildWikiGraph("/project")
-
-    expect(graph.nodes).toHaveLength(1)
-    expect(graph.nodes[0]).toMatchObject({ label: "Attention: Architecture", type: "concept" })
-  })
-
-  it("resolves case and space variants without dropping links", async () => {
-    const buildWikiGraph = await loadBuildWikiGraph()
-    mockListDirectory.mockResolvedValue([
-      mdFile("Source.md"),
-      mdFile("target-page.md"),
-    ])
-    mockReadFile.mockImplementation(async (path: string) =>
-      path.endsWith("Source.md")
-        ? "# Source\n\n[[Target Page]]"
-        : "# Target",
-    )
-
-    const graph = await buildWikiGraph("/project")
-
-    expect(graph.edges).toEqual([
-      expect.objectContaining({ source: "Source", target: "target-page" }),
-    ])
-  })
-
-  it("includes frontmatter related entries as graph edges", async () => {
-    const buildWikiGraph = await loadBuildWikiGraph()
-    mockListDirectory.mockResolvedValue([
-      mdFile("source.md"),
-      mdFile("target.md"),
-    ])
-    mockReadFile.mockImplementation(async (path: string) =>
-      path.endsWith("source.md")
-        ? "---\nrelated: [wiki/concepts/target.md]\n---\n# Source"
-        : "# Target",
-    )
-
-    const graph = await buildWikiGraph("/related-project")
-
-    expect(graph.edges).toEqual([
-      expect.objectContaining({ source: "source", target: "target" }),
-    ])
-  })
-
-  it("prefers an exact page id when case-folded aliases collide", async () => {
-    const buildWikiGraph = await loadBuildWikiGraph()
-    mockListDirectory.mockResolvedValue([
-      mdFile("source.md"),
-      mdFile("Foo.md"),
-      mdFile("foo.md"),
-    ])
-    mockReadFile.mockImplementation(async (path: string) =>
-      path.endsWith("source.md") ? "# Source\n\n[[foo]]" : "# Target",
-    )
-
-    const graph = await buildWikiGraph("/case-project")
-
-    expect(graph.edges).toEqual([
-      expect.objectContaining({ source: "source", target: "foo" }),
-    ])
+    expect(graph).toEqual({ nodes: [], edges: [], communities: [] })
   })
 
   it("reuses an unchanged graph by project data version", async () => {
-    const buildWikiGraph = await loadBuildWikiGraph()
-    mockListDirectory.mockClear()
-    mockReadFile.mockClear()
-    mockListDirectory.mockResolvedValue([mdFile("cached.md")])
-    mockReadFile.mockResolvedValue("# Cached")
-
     const first = await buildWikiGraph("/cached-project", 42)
     const second = await buildWikiGraph("/cached-project", 42)
 
     expect(second).toBe(first)
-    // The first graph build reads once for graph topology and once for
-    // relevance metadata; the second call is fully served by the cache.
-    expect(mockListDirectory).toHaveBeenCalledTimes(2)
-    expect(mockReadFile).toHaveBeenCalledTimes(2)
+    // One snapshot invoke total; the second call is fully served by the
+    // dataVersion cache.
+    expect(mockSnapshot).toHaveBeenCalledTimes(1)
+
+    await buildWikiGraph("/cached-project", 43)
+    expect(mockSnapshot).toHaveBeenCalledTimes(2)
   })
 })

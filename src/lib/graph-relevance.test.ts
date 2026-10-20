@@ -1,166 +1,135 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { FileNode } from "@/types/wiki"
+import { beforeEach, describe, expect, it } from "vitest"
+import {
+  buildRetrievalGraphFromSnapshot,
+  calculateRelevance,
+  clearGraphCache,
+  type GraphSnapshotNodeInput,
+} from "./graph-relevance"
 
-const { listDirectory, readFile } = vi.hoisted(() => ({
-  listDirectory: vi.fn(),
-  readFile: vi.fn(),
-}))
+function node(overrides: Partial<GraphSnapshotNodeInput> & { id: string }): GraphSnapshotNodeInput {
+  return {
+    title: overrides.id,
+    type: "concept",
+    path: `/project/wiki/${overrides.id}.md`,
+    sources: [],
+    ...overrides,
+  }
+}
 
-vi.mock("@/commands/fs", () => ({ listDirectory, readFile }))
-
-import { buildRetrievalGraph, clearGraphCache } from "./graph-relevance"
-
-function files(root: string, count: number): FileNode[] {
-  return Array.from({ length: count }, (_, index) => ({
-    name: `page-${index}.md`,
-    path: `${root}/wiki/page-${index}.md`,
-    is_dir: false,
-  }))
+function edge(source: string, target: string): { source: string; target: string } {
+  return { source, target }
 }
 
 beforeEach(() => {
   clearGraphCache()
-  listDirectory.mockReset()
-  readFile.mockReset()
 })
 
-describe("buildRetrievalGraph", () => {
-  it("reads wiki pages concurrently without exceeding the worker limit", async () => {
-    listDirectory.mockResolvedValue(files("/project", 40))
-    let active = 0
-    let peak = 0
-    readFile.mockImplementation(async () => {
-      active += 1
-      peak = Math.max(peak, active)
-      await new Promise((resolve) => setTimeout(resolve, 1))
-      active -= 1
-      return "---\ntype: concept\n---\n# Page"
-    })
-
-    const graph = await buildRetrievalGraph("/project", 1)
-
-    expect(graph.nodes.size).toBe(40)
-    expect(peak).toBeGreaterThan(1)
-    expect(peak).toBeLessThanOrEqual(16)
-  })
-
-  it("does not reuse a same-version cache entry across projects", async () => {
-    listDirectory.mockImplementation(async (root: string) => files(root.replace(/\/wiki$/, ""), 1))
-    readFile.mockImplementation(async (path: string) => `# ${path.includes("project-a") ? "A" : "B"}`)
-
-    const a = await buildRetrievalGraph("/project-a", 7)
-    const b = await buildRetrievalGraph("/project-b", 7)
-
-    expect(a.nodes.values().next().value?.title).toBe("A")
-    expect(b.nodes.values().next().value?.title).toBe("B")
-    expect(readFile).toHaveBeenCalledTimes(2)
-  })
-
-  it("includes frontmatter related entries in retrieval links", async () => {
-    listDirectory.mockResolvedValue([
-      ...files("/project", 2),
-    ])
-    readFile.mockImplementation(async (path: string) =>
-      path.endsWith("page-0.md")
-        ? "---\nrelated: [page-1]\n---\n# Source"
-        : "# Target",
+describe("buildRetrievalGraphFromSnapshot", () => {
+  it("builds bidirectional links from snapshot edges", () => {
+    const graph = buildRetrievalGraphFromSnapshot(
+      "/project",
+      1,
+      [node({ id: "a" }), node({ id: "b" }), node({ id: "c" })],
+      [edge("a", "b"), edge("c", "b")],
     )
 
-    const graph = await buildRetrievalGraph("/project", 2)
-
-    expect(graph.nodes.get("page-0")?.outLinks).toContain("page-1")
-    expect(graph.nodes.get("page-1")?.inLinks).toContain("page-0")
+    expect(graph.nodes.get("a")?.outLinks).toEqual(new Set(["b"]))
+    expect(graph.nodes.get("a")?.inLinks.size).toBe(0)
+    expect(graph.nodes.get("b")?.inLinks).toEqual(new Set(["a", "c"]))
+    expect(graph.nodes.get("b")?.outLinks.size).toBe(0)
   })
 
-  it("resolves case and whitespace aliases through the prebuilt index", async () => {
-    listDirectory.mockResolvedValue([
-      { name: "source.md", path: "/project/wiki/source.md", is_dir: false },
-      { name: "page-00042.md", path: "/project/wiki/page-00042.md", is_dir: false },
-    ])
-    readFile.mockImplementation(async (path: string) => path.endsWith("source.md")
-      ? "# Source\n\n[[Page 00042]]"
-      : "# Target")
+  it("carries title, type, path and frozen sources from the snapshot", () => {
+    const graph = buildRetrievalGraphFromSnapshot(
+      "/project",
+      1,
+      [node({ id: "a", title: "页面 A", type: "entity", sources: ["sources/x.pdf"] })],
+      [],
+    )
 
-    const graph = await buildRetrievalGraph("/project", 3)
-
-    expect(graph.nodes.get("source")?.outLinks).toEqual(new Set(["page-00042"]))
-    expect(graph.nodes.get("page-00042")?.inLinks).toEqual(new Set(["source"]))
+    const a = graph.nodes.get("a")
+    expect(a?.title).toBe("页面 A")
+    expect(a?.type).toBe("entity")
+    expect(a?.path).toBe("/project/wiki/a.md")
+    expect(a?.sources).toEqual(["sources/x.pdf"])
+    expect(Object.isFrozen(a?.sources)).toBe(true)
+    expect(Object.isFrozen(a?.outLinks)).toBe(true)
   })
 
-  it("keeps exact IDs ahead of normalized aliases", async () => {
-    listDirectory.mockResolvedValue([
-      { name: "source.md", path: "/project/wiki/source.md", is_dir: false },
-      { name: "Page 1.md", path: "/project/wiki/Page 1.md", is_dir: false },
-      { name: "page-1.md", path: "/project/wiki/page-1.md", is_dir: false },
-    ])
-    readFile.mockImplementation(async (path: string) => path.endsWith("source.md")
-      ? "# Source\n\n[[page-1]]"
-      : "# Target")
+  it("ignores edges whose endpoints left the node set", () => {
+    // Query-adjacent leftovers from the Rust build are dropped upstream;
+    // a stale edge must not resurrect a missing node's link sets.
+    const graph = buildRetrievalGraphFromSnapshot(
+      "/project",
+      1,
+      [node({ id: "a" })],
+      [edge("a", "ghost"), edge("ghost", "a")],
+    )
 
-    const graph = await buildRetrievalGraph("/project", 4)
-
-    expect(graph.nodes.get("source")?.outLinks).toEqual(new Set(["page-1"]))
+    expect(graph.nodes.get("a")?.outLinks.size).toBe(0)
+    expect(graph.nodes.get("a")?.inLinks.size).toBe(0)
+    expect(graph.nodes.has("ghost")).toBe(false)
   })
 
-  it.each([
-    [["foo-bar.md", "foo bar.md"], "foo-bar"],
-    [["foo bar.md", "foo-bar.md"], "foo bar"],
-  ] as const)("keeps the first listed node for ambiguous aliases in order %j", async (names, expected) => {
-    listDirectory.mockResolvedValue([
-      { name: "source.md", path: "/project/wiki/source.md", is_dir: false },
-      ...names.map((name) => ({ name, path: `/project/wiki/${name}`, is_dir: false })),
-    ])
-    readFile.mockImplementation(async (path: string) => path.endsWith("source.md")
-      ? "# Source\n\n[[FOO BAR]]"
-      : "# Target")
+  it("reuses the same-version cache entry within one project", () => {
+    const nodes = [node({ id: "a" })]
+    const first = buildRetrievalGraphFromSnapshot("/project", 1, nodes, [])
+    const second = buildRetrievalGraphFromSnapshot("/project", 1, nodes, [])
 
-    const graph = await buildRetrievalGraph("/project", 5)
-
-    expect(graph.nodes.get("source")?.outLinks).toEqual(new Set([expected]))
+    expect(second).toBe(first)
   })
 
-  it("collapses repeated whitespace and filters self-links resolved through aliases", async () => {
-    listDirectory.mockResolvedValue([
-      { name: "source-page.md", path: "/project/wiki/source-page.md", is_dir: false },
-      { name: "target-page.md", path: "/project/wiki/target-page.md", is_dir: false },
-    ])
-    readFile.mockImplementation(async (path: string) => path.endsWith("source-page.md")
-      ? "# Source\n\n[[SOURCE PAGE]] [[Target  Page]]"
-      : "# Target")
+  it("does not reuse a same-version cache entry across projects", () => {
+    const first = buildRetrievalGraphFromSnapshot("/project-a", 7, [node({ id: "a", title: "A" })], [])
+    const second = buildRetrievalGraphFromSnapshot("/project-b", 7, [node({ id: "a", title: "B" })], [])
 
-    const graph = await buildRetrievalGraph("/project", 6)
-
-    expect(graph.nodes.get("source-page")?.outLinks).toEqual(new Set(["target-page"]))
-    expect(graph.nodes.get("source-page")?.inLinks.size).toBe(0)
+    expect(second).not.toBe(first)
+    expect(second.nodes.get("a")?.title).toBe("B")
   })
 
-  it("resolves frontmatter related aliases and non-ASCII whitespace", async () => {
-    listDirectory.mockResolvedValue([
-      { name: "source-page.md", path: "/project/wiki/source-page.md", is_dir: false },
-      { name: "target-page.md", path: "/project/wiki/target-page.md", is_dir: false },
-    ])
-    readFile.mockImplementation(async (path: string) => path.endsWith("source-page.md")
-      ? "---\nrelated: [Target\u00a0Page]\n---\n# Source"
-      : "# Target")
+  it("rebuilds when the dataVersion moves", () => {
+    const nodes = [node({ id: "a" })]
+    const stale = buildRetrievalGraphFromSnapshot("/project", 1, nodes, [])
+    const fresh = buildRetrievalGraphFromSnapshot("/project", 2, nodes, [])
 
-    const graph = await buildRetrievalGraph("/project", 7)
-
-    expect(graph.nodes.get("source-page")?.outLinks).toEqual(new Set(["target-page"]))
-    expect(graph.nodes.get("target-page")?.inLinks).toEqual(new Set(["source-page"]))
+    expect(fresh).not.toBe(stale)
+    expect(fresh.dataVersion).toBe(2)
   })
 
-  it("does not create edges for many missing aliases", async () => {
-    listDirectory.mockResolvedValue([
-      { name: "source.md", path: "/project/wiki/source.md", is_dir: false },
-      ...files("/project", 1_000),
-    ])
-    readFile.mockImplementation(async (path: string) => path.endsWith("source.md")
-      ? `# Source\n\n${Array.from({ length: 1_000 }, (_, i) => `[[missing ${i}]]`).join(" ")}`
-      : "# Target")
+  it("clearGraphCache drops the cached entry", () => {
+    const nodes = [node({ id: "a" })]
+    const first = buildRetrievalGraphFromSnapshot("/project", 1, nodes, [])
+    clearGraphCache()
+    const second = buildRetrievalGraphFromSnapshot("/project", 1, nodes, [])
 
-    const graph = await buildRetrievalGraph("/project", 8)
+    expect(second).not.toBe(first)
+  })
+})
 
-    expect(graph.nodes.get("source")?.outLinks.size).toBe(0)
-    expect([...graph.nodes.values()].every((node) => node.inLinks.size === 0)).toBe(true)
+describe("calculateRelevance over snapshot-built graphs", () => {
+  it("scores direct links and source overlap", () => {
+    const graph = buildRetrievalGraphFromSnapshot(
+      "/project",
+      1,
+      [
+        node({ id: "a", type: "entity", sources: ["s1.pdf", "s2.pdf"] }),
+        node({ id: "b", type: "concept", sources: ["s1.pdf"] }),
+        node({ id: "c", type: "concept", sources: ["s9.pdf"] }),
+      ],
+      [edge("a", "b")],
+    )
+    const a = graph.nodes.get("a")!
+    const b = graph.nodes.get("b")!
+    const c = graph.nodes.get("c")!
+
+    const linked = calculateRelevance(a, b, graph)
+    const unlinked = calculateRelevance(a, c, graph)
+
+    // Direct link (3.0) + one shared source (4.0) + type affinity + common
+    // neighbors >= the same pair without the link or the shared source.
+    expect(linked).toBeGreaterThan(unlinked)
+    expect(linked).toBeGreaterThan(0)
+    // Symmetric over the undirected edge set.
+    expect(calculateRelevance(b, a, graph)).toBe(linked)
   })
 })

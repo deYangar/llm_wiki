@@ -49,3 +49,7 @@ pnpm-debug.log*
 # Brainstorm assets (not tracked in source control)
 .superpowers/
 .claude/
+
+# graph-pipeline-parity one-shot artifacts
+tools/graph-pipeline-parity/graph-snapshot-dump.json
+tools/graph-pipeline-parity/parity-report.json

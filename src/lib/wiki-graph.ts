@@ -1,8 +1,6 @@
-import { readFile, listDirectory } from "@/commands/fs"
-import type { FileNode } from "@/types/wiki"
-import { buildRetrievalGraph, calculateRelevance } from "./graph-relevance"
+import { wikiGraphSnapshot, type WikiGraphSnapshotNode } from "@/commands/fs"
+import { buildRetrievalGraphFromSnapshot, calculateRelevance } from "./graph-relevance"
 import { normalizePath } from "@/lib/path-utils"
-import { parseFrontmatter } from "@/lib/frontmatter"
 import { detectCommunities } from "./wiki-graph-analysis"
 
 export interface GraphNode {
@@ -34,7 +32,6 @@ export interface WikiGraphResult {
   communities: CommunityInfo[]
 }
 
-const GRAPH_FILE_READ_CONCURRENCY = 16
 const COMMUNITY_WORKER_THRESHOLD = 500
 const MAX_CACHED_PROJECT_GRAPHS = 2
 const graphCache = new Map<string, { dataVersion: number; result: WikiGraphResult }>()
@@ -69,102 +66,6 @@ async function analyzeCommunities(
     }
     worker.postMessage({ nodes, edges })
   })
-}
-
-const WIKILINK_REGEX = /\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]/g
-
-function flattenMdFiles(nodes: FileNode[]): FileNode[] {
-  const files: FileNode[] = []
-  for (const node of nodes) {
-    if (node.is_dir && node.children) {
-      files.push(...flattenMdFiles(node.children))
-    } else if (!node.is_dir && node.name.endsWith(".md")) {
-      files.push(node)
-    }
-  }
-  return files
-}
-
-function extractTitle(content: string, fileName: string): string {
-  const title = parseFrontmatter(content).frontmatter?.title
-  if (typeof title === "string" && title.trim()) return title.trim()
-
-  const headingMatch = content.match(/^#\s+(.+)$/m)
-  if (headingMatch) return headingMatch[1].trim()
-
-  return fileName.replace(/\.md$/, "").replace(/-/g, " ")
-}
-
-function extractType(content: string): string {
-  const type = parseFrontmatter(content).frontmatter?.type
-  if (typeof type === "string" && type.trim()) return type.trim().toLowerCase()
-  return "other"
-}
-
-function extractWikilinks(content: string): string[] {
-  const links: string[] = []
-  const regex = new RegExp(WIKILINK_REGEX.source, "g")
-  let match: RegExpExecArray | null
-  while ((match = regex.exec(content)) !== null) {
-    links.push(match[1].trim())
-  }
-  return links
-}
-
-function extractRelated(content: string): string[] {
-  const related = parseFrontmatter(content).frontmatter?.related
-  if (!Array.isArray(related)) return []
-  return related
-    .filter((value): value is string => typeof value === "string")
-    .map((value) => value.trim().replace(/^\[\[|\]\]$/g, ""))
-    .map((value) => value.split("|")[0].split("#")[0].replace(/\\/g, "/"))
-    .map((value) => value.split("/").pop()?.replace(/\.md$/i, "") ?? "")
-    .filter(Boolean)
-}
-
-function fileNameToId(fileName: string): string {
-  return fileName.replace(/\.md$/, "")
-}
-
-function targetAliases(value: string): string[] {
-  const lower = value.toLowerCase()
-  return [value, lower, lower.replace(/\s+/g, "-")]
-}
-
-function buildTargetIndex(nodeIds: Iterable<string>): Map<string, string> {
-  const ids = Array.from(nodeIds)
-  const index = new Map<string, string>()
-  // Exact IDs must win over case-folded aliases. On a case-sensitive
-  // filesystem, Foo.md and foo.md are distinct pages and [[foo]] must retain
-  // the reader's exact-match behavior.
-  for (const id of ids) index.set(id, id)
-  for (const id of ids) {
-    for (const alias of targetAliases(id).slice(1)) {
-      if (!index.has(alias)) index.set(alias, id)
-    }
-  }
-  return index
-}
-
-async function mapWithConcurrency<T, R>(
-  values: readonly T[],
-  limit: number,
-  mapper: (value: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(values.length)
-  let cursor = 0
-  const workers = Array.from(
-    { length: Math.min(limit, values.length) },
-    async () => {
-      while (cursor < values.length) {
-        const index = cursor
-        cursor += 1
-        results[index] = await mapper(values[index])
-      }
-    },
-  )
-  await Promise.all(workers)
-  return results
 }
 
 export async function buildWikiGraph(
@@ -203,106 +104,78 @@ export async function buildWikiGraph(
   return result
 }
 
-async function buildWikiGraphUncached(projectPath: string): Promise<WikiGraphResult> {
-  const wikiRoot = `${normalizePath(projectPath)}/wiki`
+// Query nodes (research results, saved chat answers) are intermediate
+// artifacts, not knowledge structure — the Rust build filters them from
+// nodes already; this is defensive double-cover on the mapping side.
+const HIDDEN_TYPES = new Set(["query"])
 
-  let tree: FileNode[]
+function mapSnapshotNode(
+  node: WikiGraphSnapshotNode,
+  projectRoot: string,
+  linkCount: number,
+): GraphNode {
+  return {
+    id: node.id,
+    label: node.label,
+    type: node.nodeType.toLowerCase(),
+    path: `${projectRoot}/${node.path}`,
+    linkCount,
+    community: 0,
+  }
+}
+
+async function buildWikiGraphUncached(projectPath: string): Promise<WikiGraphResult> {
+  const projectRoot = normalizePath(projectPath).replace(/\/+$/, "")
+
+  let snapshot
   try {
-    tree = await listDirectory(wikiRoot)
+    snapshot = await wikiGraphSnapshot(projectRoot)
   } catch {
     return { nodes: [], edges: [], communities: [] }
   }
 
-  const mdFiles = flattenMdFiles(tree)
-  if (mdFiles.length === 0) {
-    return { nodes: [], edges: [], communities: [] }
-  }
+  const visibleNodes = snapshot.nodes.filter((n) => !HIDDEN_TYPES.has(n.nodeType.toLowerCase()))
+  const nodeIds = new Set(visibleNodes.map((n) => n.id))
 
-  // Build a map of id -> node data
-  const nodeMap = new Map<
-    string,
-    { id: string; label: string; type: string; path: string; links: string[] }
-  >()
-
-  const parsedFiles = await mapWithConcurrency(
-    mdFiles,
-    GRAPH_FILE_READ_CONCURRENCY,
-    async (file) => {
-      try {
-        const content = await readFile(file.path)
-        const id = fileNameToId(file.name)
-        return {
-          id,
-          label: extractTitle(content, file.name),
-          type: extractType(content),
-          path: file.path,
-          links: Array.from(new Set([...extractWikilinks(content), ...extractRelated(content)])),
-        }
-      } catch {
-        return null
-      }
-    },
-  )
-  for (const parsed of parsedFiles) {
-    if (parsed) nodeMap.set(parsed.id, parsed)
-  }
-
-  // Filter out query nodes (research results, saved chat answers) — they are
-  // intermediate artifacts, not knowledge structure. The entities/concepts
-  // extracted from them via auto-ingest are what belong in the graph.
-  const HIDDEN_TYPES = new Set(["query"])
-  for (const [id, node] of nodeMap) {
-    if (HIDDEN_TYPES.has(node.type)) {
-      nodeMap.delete(id)
-    }
-  }
-
-  // Count link references
+  // The Rust build filters query nodes from `nodes` but keeps their
+  // adjacency in `edges` (the HTTP join layer drops those on the way out;
+  // the raw snapshot does not). Drop every edge whose endpoints are not
+  // both visible, then recompute linkCount so node sizes keep the old
+  // pipeline's in+out degree over visible nodes only.
+  const visibleEdges = snapshot.edges.filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target))
   const linkCounts = new Map<string, number>()
-  for (const [id] of nodeMap) {
-    linkCounts.set(id, 0)
+  for (const id of nodeIds) linkCounts.set(id, 0)
+  for (const edge of visibleEdges) {
+    linkCounts.set(edge.source, (linkCounts.get(edge.source) ?? 0) + 1)
+    linkCounts.set(edge.target, (linkCounts.get(edge.target) ?? 0) + 1)
   }
 
-  const rawEdges: GraphEdge[] = []
-  const targetIndex = buildTargetIndex(nodeMap.keys())
-
-  for (const [sourceId, nodeData] of nodeMap) {
-    for (const targetRaw of nodeData.links) {
-      // Normalize target: try matching by id (case-insensitive, hyphen/space)
-      const targetId = resolveTarget(targetRaw, targetIndex)
-      if (targetId === null) continue
-      if (targetId === sourceId) continue
-
-      rawEdges.push({ source: sourceId, target: targetId, weight: 1 })
-
-      linkCounts.set(sourceId, (linkCounts.get(sourceId) ?? 0) + 1)
-      linkCounts.set(targetId, (linkCounts.get(targetId) ?? 0) + 1)
-    }
-  }
-
-  // Deduplicate edges
-  const seenEdges = new Set<string>()
-  const dedupedEdges: { source: string; target: string }[] = []
-  for (const edge of rawEdges) {
-    const key = `${edge.source}:::${edge.target}`
-    const reverseKey = `${edge.target}:::${edge.source}`
-    if (!seenEdges.has(key) && !seenEdges.has(reverseKey)) {
-      seenEdges.add(key)
-      dedupedEdges.push(edge)
-    }
-  }
+  const nodes: GraphNode[] = visibleNodes.map((n) =>
+    mapSnapshotNode(n, projectRoot, linkCounts.get(n.id) ?? 0),
+  )
 
   // Calculate relevance weights using the retrieval graph
-  let retrievalGraph: Awaited<ReturnType<typeof buildRetrievalGraph>> | null = null
+  let retrievalGraph: Awaited<ReturnType<typeof buildRetrievalGraphFromSnapshot>> | null = null
   try {
     const { useWikiStore } = await import("@/stores/wiki-store")
     const dv = useWikiStore.getState().dataVersion
-    retrievalGraph = await buildRetrievalGraph(normalizePath(projectPath), dv)
+    retrievalGraph = buildRetrievalGraphFromSnapshot(
+      projectRoot,
+      dv,
+      visibleNodes.map((n) => ({
+        id: n.id,
+        title: n.label,
+        type: n.nodeType.toLowerCase(),
+        path: `${projectRoot}/${n.path}`,
+        sources: n.sources,
+      })),
+      visibleEdges,
+    )
   } catch {
     // Keep the graph available with neutral weights if relevance enrichment fails.
   }
 
-  const edges: GraphEdge[] = dedupedEdges.map((e) => {
+  const edges: GraphEdge[] = visibleEdges.map((e) => {
     let weight = 1
     if (retrievalGraph) {
       const nodeA = retrievalGraph.nodes.get(e.source)
@@ -315,35 +188,19 @@ async function buildWikiGraphUncached(projectPath: string): Promise<WikiGraphRes
   })
 
   // Build preliminary nodes for community detection
-  const prelimNodes = Array.from(nodeMap.values()).map((n) => ({
+  const prelimNodes = nodes.map((n) => ({
     id: n.id,
     label: n.label,
-    linkCount: linkCounts.get(n.id) ?? 0,
+    linkCount: n.linkCount,
   }))
 
   const { assignments, communities } = await analyzeCommunities(prelimNodes, edges).catch(
     () => detectCommunities(prelimNodes, edges),
   )
 
-  const nodes: GraphNode[] = Array.from(nodeMap.values()).map((n) => ({
-    id: n.id,
-    label: n.label,
-    type: n.type,
-    path: n.path,
-    linkCount: linkCounts.get(n.id) ?? 0,
-    community: assignments.get(n.id) ?? 0,
-  }))
+  for (const node of nodes) {
+    node.community = assignments.get(node.id) ?? 0
+  }
 
   return { nodes, edges, communities }
-}
-
-function resolveTarget(
-  raw: string,
-  targetIndex: ReadonlyMap<string, string>,
-): string | null {
-  for (const alias of targetAliases(raw)) {
-    const target = targetIndex.get(alias)
-    if (target) return target
-  }
-  return null
 }

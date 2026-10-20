@@ -325,3 +325,39 @@ export interface WikiPageTypeCountRow {
 export async function listWikiPageTypeCounts(projectPath: string): Promise<WikiPageTypeCountRow[]> {
   return invoke<WikiPageTypeCountRow[]>("list_wiki_page_type_counts", { projectPath })
 }
+
+/** Mirror of `api_server::ApiGraphNode` (Rust side, camelCase serde). */
+export interface WikiGraphSnapshotNode {
+  id: string
+  label: string
+  nodeType: string
+  /** Relative to the project root, forward slashes. */
+  path: string
+  /** In+out degree over the full Rust edge set (query neighbors included). */
+  linkCount: number
+  tags: string[]
+  sources: string[]
+}
+
+/** Mirror of `api_server::ApiGraphEdge` (Rust side). */
+export interface WikiGraphSnapshotEdge {
+  source: string
+  target: string
+  weight: number
+}
+
+/** Mirror of `commands::wiki_graph::WikiGraphSnapshotResult` (Rust side). */
+export interface WikiGraphSnapshot {
+  nodes: WikiGraphSnapshotNode[]
+  edges: WikiGraphSnapshotEdge[]
+}
+
+/**
+ * Whole-project graph in one invoke, served from the same Rust snapshot
+ * cache as the HTTP /graph endpoint (fingerprint walk + delta rebuild +
+ * 30s TTL). Replaces the frontend pipelines that read every file in the
+ * library twice (once for the graph, once for relevance weights).
+ */
+export async function wikiGraphSnapshot(projectPath: string): Promise<WikiGraphSnapshot> {
+  return invoke<WikiGraphSnapshot>("wiki_graph_snapshot", { projectPath })
+}
