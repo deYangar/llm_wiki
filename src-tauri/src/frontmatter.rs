@@ -21,14 +21,19 @@ use std::io::Read;
 use std::path::Path;
 
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Default head-read budget: 16KB comfortably covers every frontmatter
 /// block seen in the 3,700+ page production libraries while avoiding a
 /// full read of multi-megabyte regulation pages.
 pub const DEFAULT_HEAD_BYTES: usize = 16 * 1024;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+/// The full field table (order + scalar/list rendering + folded multiline
+/// originals + skipped lines) round-trips through the persisted page-meta
+/// index, so `Serialize`/`Deserialize` derive on the whole struct — storing
+/// only projected keys (title/type/…) would corrupt search's arbitrary
+/// frontmatter-key filtering and PATCH's byte-stable rendering.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Frontmatter {
     /// Ordered key table. The boolean marks entries written as scalars in
     /// the source (`key: value`); lists render back as block items and
@@ -580,38 +585,234 @@ pub fn wiki_tree_fingerprint(wiki_root: &Path) -> u64 {
     acc
 }
 
-/// One full metadata walk: collect the .md list (deterministic WalkDir
-/// order, same ceiling as the uncached search scan) and parse each head
-/// in parallel. Per-file failures degrade to flags, never abort the walk.
-fn build_page_meta_index(project_path: &str) -> std::sync::Arc<PageMetaIndex> {
-    let wiki_root = std::path::Path::new(project_path).join("wiki");
+/// One .md file as seen by the metadata walk: path plus the identity pair
+/// the fingerprint and the persisted-index reuse decision are both built
+/// from.
+struct WalkedMetaFile {
+    path: std::path::PathBuf,
+    mtime_ns: u128,
+    len: u64,
+}
+
+/// Single metadata walk over the wiki tree collecting every `*.md` file
+/// (case-insensitive extension, same ceiling as the uncached search scan).
+/// The same walk feeds the fingerprint and the incremental rebuild, so a
+/// rebuild pays exactly one directory traversal instead of two.
+fn walk_wiki_meta_files(wiki_root: &Path) -> (Vec<WalkedMetaFile>, bool) {
     let mut files = Vec::new();
+    let mut ceiling_hit = false;
     if wiki_root.exists() {
-        files = walkdir::WalkDir::new(&wiki_root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry.file_type().is_file()
-                    && entry
-                        .path()
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-            })
-            .take(MAX_META_SCAN_FILES)
-            .map(|entry| entry.path().to_path_buf())
-            .collect();
-        if files.len() >= MAX_META_SCAN_FILES {
-            eprintln!(
-                "[PageMeta] stopped scanning wiki after {MAX_META_SCAN_FILES} markdown files in {project_path}"
-            );
+        for entry in walkdir::WalkDir::new(wiki_root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file()
+                || !entry
+                    .path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            {
+                continue;
+            }
+            if files.len() >= MAX_META_SCAN_FILES {
+                ceiling_hit = true;
+                break;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            files.push(WalkedMetaFile {
+                path: entry.path().to_path_buf(),
+                mtime_ns,
+                len: meta.len(),
+            });
         }
     }
-    let entries: Vec<PageMeta> = files
-        .into_par_iter()
-        .map(|path| {
-            let rel_path = relative_to_project(project_path, &path);
-            match read_head(&path, DEFAULT_HEAD_BYTES) {
+    (files, ceiling_hit)
+}
+
+/// Fingerprint of a walked file list. Per-file hash inputs (path, mtime,
+/// size) and the commutative wrapping-sum accumulation are byte-identical
+/// to the streaming `wiki_tree_fingerprint`, so the collected-walk value
+/// and the streaming recheck value agree — asserted by test.
+fn fingerprint_of_meta_walk(files: &[WalkedMetaFile]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut acc: u64 = 0;
+    for file in files {
+        let mut hasher = DefaultHasher::new();
+        file.path.to_string_lossy().hash(&mut hasher);
+        file.mtime_ns.hash(&mut hasher);
+        file.len.hash(&mut hasher);
+        acc = acc.wrapping_add(hasher.finish());
+    }
+    acc
+}
+
+// ---- persisted page-meta index (cold-start plan, 2026-10-20) -----------
+//
+// The in-memory cache dies with the process, so every app start paid the
+// full 50k-file head read before the knowledge tree could render. The
+// index file mirrors the last build's PageMeta table under the app's own
+// project state directory (`.llm-wiki/`; `.data/` is the user's snapshot
+// area and is never touched). A rebuild reuses a persisted entry whenever
+// (mtime_ns, size) still match — zero I/O for untouched pages — and only
+// re-reads heads for new/changed files. Every field of the frontmatter is
+// persisted (full Serialize on `Frontmatter`), keeping search's arbitrary
+// key filtering and PATCH's byte-stable rendering exact.
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPageMetaIndex {
+    version: u32,
+    project_path: String,
+    entries: Vec<PersistedPageMeta>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPageMeta {
+    rel_path: String,
+    /// Nanoseconds since the Unix epoch. u64 covers dates until 2262 —
+    /// the in-memory walk keeps u128, persisted entries store the u64
+    /// truncation consistently on both write and compare.
+    mtime_ns: u64,
+    size: u64,
+    frontmatter: Frontmatter,
+    head_read_ok: bool,
+    head_closed: bool,
+}
+
+fn page_meta_index_path(project_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(project_path)
+        .join(".llm-wiki")
+        .join("page-meta-index.json")
+}
+
+/// Load the persisted index as a `rel_path -> (mtime_ns, size, PageMeta)`
+/// table. Anything unexpected — missing file, parse error, wrong version,
+/// wrong project — degrades to an empty table with a log line; the caller
+/// then does one honest full rebuild and overwrites the file.
+fn load_persisted_page_meta_index(
+    project_path: &str,
+) -> std::collections::HashMap<String, (u64, u64, PageMeta)> {
+    let path = page_meta_index_path(project_path);
+    let Ok(raw) = std::fs::read(&path) else {
+        return std::collections::HashMap::new();
+    };
+    let parsed: PersistedPageMetaIndex = match serde_json::from_slice(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            eprintln!(
+                "[PageMeta] persisted index {} is unreadable ({err}); rebuilding from scratch",
+                path.display()
+            );
+            return std::collections::HashMap::new();
+        }
+    };
+    if parsed.version != 1 || parsed.project_path != project_path {
+        eprintln!(
+            "[PageMeta] persisted index {} (version {}, project {}) does not match this project; rebuilding from scratch",
+            path.display(),
+            parsed.version,
+            parsed.project_path
+        );
+        return std::collections::HashMap::new();
+    }
+    parsed
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let rel = entry.rel_path.clone();
+            let meta = PageMeta {
+                rel_path: entry.rel_path,
+                frontmatter: entry.frontmatter,
+                head_read_ok: entry.head_read_ok,
+                head_closed: entry.head_closed,
+            };
+            (rel, (entry.mtime_ns, entry.size, meta))
+        })
+        .collect()
+}
+
+/// Atomic write-back of the index: serialize to a sibling `.tmp` file, then
+/// rename over the target. A failure is logged and never blocks the caller —
+/// the next rebuild simply writes again. `entries` and `files` are parallel
+/// arrays (rayon's collect preserves order).
+fn write_persisted_page_meta_index(project_path: &str, files: &[WalkedMetaFile], entries: &[PageMeta]) {
+    let doc = PersistedPageMetaIndex {
+        version: 1,
+        project_path: project_path.to_string(),
+        entries: files
+            .iter()
+            .zip(entries.iter())
+            .map(|(file, meta)| PersistedPageMeta {
+                rel_path: meta.rel_path.clone(),
+                mtime_ns: file.mtime_ns as u64,
+                size: file.len,
+                frontmatter: meta.frontmatter.clone(),
+                head_read_ok: meta.head_read_ok,
+                head_closed: meta.head_closed,
+            })
+            .collect(),
+    };
+    let dir = std::path::Path::new(project_path).join(".llm-wiki");
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "[PageMeta] could not create state dir {}: {err}",
+            dir.display()
+        );
+        return;
+    }
+    let target = page_meta_index_path(project_path);
+    let tmp = dir.join("page-meta-index.json.tmp");
+    let write_result = match serde_json::to_vec(&doc) {
+        Ok(bytes) => std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &target)),
+        Err(err) => {
+            eprintln!("[PageMeta] serializing index failed: {err}");
+            return;
+        }
+    };
+    if let Err(err) = write_result {
+        eprintln!(
+            "[PageMeta] persisting index to {} failed (next rebuild retries): {err}",
+            target.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Incremental build from an already-collected walk. Untouched pages reuse
+/// their persisted `PageMeta` (zero page I/O); only new/changed files pay
+/// the 16KB head read + parse. Returns the index and the fingerprint of the
+/// same walk, so the caller caches both without a second traversal. The
+/// walk ownership (ceiling log included) moves here from the caller.
+fn build_page_meta_index_from_walk(
+    project_path: &str,
+    files: Vec<WalkedMetaFile>,
+    ceiling_hit: bool,
+) -> (std::sync::Arc<PageMetaIndex>, u64) {
+    if ceiling_hit {
+        eprintln!(
+            "[PageMeta] stopped scanning wiki after {MAX_META_SCAN_FILES} markdown files in {project_path}"
+        );
+    }
+    let fingerprint = fingerprint_of_meta_walk(&files);
+    let (persisted, loaded_from_disk) = {
+        let table = load_persisted_page_meta_index(project_path);
+        let loaded = !table.is_empty();
+        (table, loaded)
+    };
+    let parsed: Vec<(PageMeta, bool)> = files
+        .par_iter()
+        .map(|file| {
+            let rel_path = relative_to_project(project_path, &file.path);
+            if let Some((mtime_ns, size, meta)) = persisted.get(&rel_path) {
+                if *mtime_ns == file.mtime_ns as u64 && *size == file.len {
+                    return (meta.clone(), true);
+                }
+            }
+            let page = match read_head(&file.path, DEFAULT_HEAD_BYTES) {
                 Ok(head) => match split_frontmatter(&head) {
                     Some((_, block)) => PageMeta {
                         rel_path,
@@ -632,15 +833,34 @@ fn build_page_meta_index(project_path: &str) -> std::sync::Arc<PageMetaIndex> {
                     head_read_ok: false,
                     head_closed: false,
                 },
-            }
+            };
+            (page, false)
         })
         .collect();
-    std::sync::Arc::new(PageMetaIndex { entries })
+    let reused = parsed.iter().filter(|(_, hit)| *hit).count();
+    let entries: Vec<PageMeta> = parsed.into_iter().map(|(meta, _)| meta).collect();
+    // An all-reuse rebuild would rewrite the index byte-identically — the
+    // file on disk already IS this state, so skip the 50MB churn. Any
+    // change (or a missing/garbage/mismatched file, which loads as an
+    // empty table) writes the full index back atomically.
+    if loaded_from_disk && reused == files.len() {
+        return (std::sync::Arc::new(PageMetaIndex { entries }), fingerprint);
+    }
+    write_persisted_page_meta_index(project_path, &files, &entries);
+    (std::sync::Arc::new(PageMetaIndex { entries }), fingerprint)
+}
+
+/// Walk + incremental build against the persisted index.
+fn build_page_meta_index(project_path: &str) -> (std::sync::Arc<PageMetaIndex>, u64) {
+    let wiki_root = std::path::Path::new(project_path).join("wiki");
+    let (files, ceiling_hit) = walk_wiki_meta_files(&wiki_root);
+    build_page_meta_index_from_walk(project_path, files, ceiling_hit)
 }
 
 /// Cached metadata index with graph-snapshot-cache semantics: trust a
 /// fingerprint verified within the TTL, re-verify it (one metadata walk)
-/// after that, rebuild on mismatch, single-flight concurrent rebuilds.
+/// after that, rebuild incrementally on mismatch (persisted-index reuse,
+/// only changed files re-read), single-flight concurrent rebuilds.
 pub fn page_meta_index_cached(project_path: &str) -> std::sync::Arc<PageMetaIndex> {
     page_meta_index_cached_with_ttl(project_path, META_FINGERPRINT_TTL)
 }
@@ -662,7 +882,12 @@ fn page_meta_index_cached_with_ttl(
         }
     }
 
-    let fingerprint = wiki_tree_fingerprint(&std::path::Path::new(project_path).join("wiki"));
+    // One metadata walk feeds both the fingerprint recheck and (on a miss)
+    // the incremental rebuild — the plan's single-traversal shape. WalkDir
+    // order variance cannot change the fingerprint (commutative sum), and
+    // on a recheck hit the collected list is simply dropped.
+    let (files, ceiling_hit) = walk_wiki_meta_files(&std::path::Path::new(project_path).join("wiki"));
+    let fingerprint = fingerprint_of_meta_walk(&files);
     let try_hit = |cache: &std::sync::Mutex<
         std::collections::HashMap<std::path::PathBuf, PageMetaCacheEntry>,
     >| {
@@ -695,7 +920,11 @@ fn page_meta_index_cached_with_ttl(
         return index;
     }
 
-    let index = build_page_meta_index(project_path);
+    // Build (incremental against the persisted on-disk index) and cache the
+    // result. The fingerprint stored with the entry comes from the same
+    // walk the index was built from, so a follower that raced a write
+    // simply sees a mismatch on its next recheck and rebuilds.
+    let (index, fingerprint) = build_page_meta_index_from_walk(project_path, files, ceiling_hit);
     if let Ok(mut entries) = cache.lock() {
         entries.insert(
             std::path::PathBuf::from(project_path),
@@ -1176,7 +1405,7 @@ mod tests {
     fn meta_cache_build_parses_heads_and_flags_edges() {
         let dir = meta_cache_fixture("build");
         let project = dir.to_string_lossy().to_string();
-        let index = build_page_meta_index(&project);
+        let (index, _fingerprint) = build_page_meta_index(&project);
         let find = |suffix: &str| {
             index
                 .entries()
@@ -1244,5 +1473,278 @@ mod tests {
         let seventh = page_meta_index_cached_with_ttl(&project, Duration::ZERO);
         assert!(!Arc::ptr_eq(&sixth, &seventh));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn frontmatter_serde_round_trip_preserves_everything() {
+        let block = "type: case\ntitle: 页面\ndescription: 首行值，\n  续行内容。\ntags: [\"a\", \"b\"]\nyear: 2025\nnested:\n  sub: 值\n";
+        let fm = Frontmatter::parse(block);
+        let bytes = serde_json::to_vec(&fm).unwrap();
+        let de: Frontmatter = serde_json::from_slice(&bytes).unwrap();
+        // PartialEq covers the full field table, folds and skipped lines.
+        assert_eq!(fm, de);
+        // The byte-stable PATCH rendering survives the round trip too.
+        assert_eq!(de.render(), fm.render());
+        let keys: Vec<&str> = de.keys().collect();
+        // `sub` lands in fields too: the parser records the nested parent in
+        // skipped and keeps scanning from the sub-key line (existing parse
+        // semantics — the round trip must preserve it either way).
+        assert_eq!(keys, vec!["type", "title", "description", "tags", "year", "sub"]);
+        assert_eq!(de.skipped_lines(), &["nested".to_string()]);
+        assert_eq!(
+            de.get("description"),
+            Some(&["首行值， 续行内容。".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn fingerprint_of_meta_walk_matches_streaming_fingerprint() {
+        let dir = meta_cache_fixture("fingerprint");
+        let wiki_root = dir.join("wiki");
+        let (files, ceiling) = walk_wiki_meta_files(&wiki_root);
+        assert!(!ceiling);
+        assert_eq!(files.len(), 3);
+        assert_eq!(
+            fingerprint_of_meta_walk(&files),
+            wiki_tree_fingerprint(&wiki_root)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn meta_index_persists_and_rebuilds_incrementally() {
+        use std::time::Duration;
+        let dir = meta_cache_fixture("persist");
+        // Forward-slash form so the persisted `project_path` round-trips
+        // through serde_json without backslash escaping.
+        let project = dir.to_string_lossy().replace('\\', "/");
+        let cached = || page_meta_index_cached_with_ttl(&project, Duration::ZERO);
+        fn find<'a>(index: &'a PageMetaIndex, suffix: &str) -> &'a PageMeta {
+            index
+                .entries()
+                .iter()
+                .find(|m| m.rel_path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing {suffix}"))
+        }
+
+        // Cold build writes the index file under the app's own state dir.
+        let first = cached();
+        assert_eq!(first.entries().len(), 3);
+        let index_path = page_meta_index_path(&project);
+        assert!(index_path.exists());
+        let raw = std::fs::read_to_string(&index_path).unwrap();
+        assert!(raw.contains("\"version\":1"));
+        assert!(raw.contains("normal.md"));
+
+        // No-op rebuild (cache dropped, files untouched): every row must be
+        // byte-equal to the first build — the persisted entries are reused,
+        // not re-parsed.
+        invalidate_page_meta_cache(&project);
+        let second = cached();
+        assert_eq!(second.entries().len(), 3);
+        for entry in first.entries() {
+            let reused = find(&second, &entry.rel_path);
+            assert_eq!(reused.frontmatter, entry.frontmatter);
+            assert_eq!(reused.head_read_ok, entry.head_read_ok);
+            assert_eq!(reused.head_closed, entry.head_closed);
+        }
+
+        // Modify one file (different size so mtime granularity can't hide
+        // it), add one, delete one — the rebuild must pick up exactly those
+        // three and leave the rest at their persisted values.
+        std::fs::write(
+            dir.join("wiki").join("cases").join("normal.md"),
+            "---\ntype: case\ntitle: 改过\nyear: 2026\n---\n正文变长了",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("wiki").join("cases").join("added.md"),
+            "---\ntype: concept\n---\n新页",
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("wiki").join("cases").join("bare.md")).unwrap();
+        invalidate_page_meta_cache(&project);
+        let third = cached();
+        assert_eq!(third.entries().len(), 3);
+        let normal = find(&third, "normal.md");
+        assert_eq!(normal.frontmatter.get("year"), Some(&["2026".to_string()][..]));
+        assert_eq!(normal.frontmatter.get("title"), Some(&["改过".to_string()][..]));
+        let added = find(&third, "added.md");
+        assert_eq!(added.frontmatter.get("type"), Some(&["concept".to_string()][..]));
+        assert!(third.entries().iter().all(|m| !m.rel_path.ends_with("bare.md")));
+        // Untouched page kept its exact persisted shape (incl. the over-16KB
+        // flag edge, which the incremental path must not lose).
+        assert!(find(&third, "big.md").head_read_ok && !find(&third, "big.md").head_closed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn meta_index_corrupt_persisted_file_falls_back_to_full_rebuild() {
+        use std::time::Duration;
+        let dir = meta_cache_fixture("corrupt");
+        let project = dir.to_string_lossy().replace('\\', "/");
+        let index_path = page_meta_index_path(&project);
+        page_meta_index_cached_with_ttl(&project, Duration::ZERO);
+        assert!(index_path.exists());
+
+        std::fs::write(&index_path, b"\x00garbage not json{").unwrap();
+        invalidate_page_meta_cache(&project);
+        let rebuilt = page_meta_index_cached_with_ttl(&project, Duration::ZERO);
+        assert_eq!(rebuilt.entries().len(), 3);
+        assert!(rebuilt
+            .entries()
+            .iter()
+            .any(|m| m.frontmatter.get("type") == Some(&["case".to_string()][..])));
+        // The rewrite replaced the garbage with a valid index.
+        let raw = std::fs::read_to_string(&index_path).unwrap();
+        assert!(raw.contains("\"version\":1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn meta_index_version_or_project_mismatch_is_ignored() {
+        use std::time::Duration;
+        let dir = meta_cache_fixture("mismatch");
+        // Forward-slash form so the persisted `project_path` round-trips
+        // through serde_json without backslash escaping.
+        let project = dir.to_string_lossy().replace('\\', "/");
+        let index_path = page_meta_index_path(&project);
+        page_meta_index_cached_with_ttl(&project, Duration::ZERO);
+
+        // Wrong version.
+        let raw = std::fs::read_to_string(&index_path).unwrap();
+        let wrong_version = raw.replace("\"version\":1", "\"version\":2");
+        std::fs::write(&index_path, wrong_version).unwrap();
+        invalidate_page_meta_cache(&project);
+        let rebuilt = page_meta_index_cached_with_ttl(&project, Duration::ZERO);
+        assert_eq!(rebuilt.entries().len(), 3);
+
+        // Wrong project path (someone copied the file across projects).
+        let wrong_project = raw.replace(
+            &format!("\"project_path\":\"{project}\""),
+            "\"project_path\":\"C:/elsewhere/wiki-lib\"",
+        );
+        std::fs::write(&index_path, wrong_project).unwrap();
+        invalidate_page_meta_cache(&project);
+        let rebuilt = page_meta_index_cached_with_ttl(&project, Duration::ZERO);
+        assert_eq!(rebuilt.entries().len(), 3);
+        let raw = std::fs::read_to_string(&index_path).unwrap();
+        assert!(raw.contains(&project));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn meta_index_concurrent_first_builds_share_single_flight() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let dir = meta_cache_fixture("concurrent");
+        let project = dir.to_string_lossy().replace('\\', "/");
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let project = project.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    page_meta_index_cached_with_ttl(&project, Duration::ZERO)
+                })
+            })
+            .collect();
+        let mut expected: Option<Vec<String>> = None;
+        for handle in handles {
+            let index = handle.join().unwrap();
+            let mut rels: Vec<String> = index
+                .entries()
+                .iter()
+                .map(|m| m.rel_path.clone())
+                .collect();
+            rels.sort();
+            match &expected {
+                None => expected = Some(rels),
+                Some(prev) => assert_eq!(&rels, prev),
+            }
+        }
+        assert_eq!(expected.unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- live measurement harness (plan 2026-10-20 §2.4) ----------------
+    //
+    // `cargo test --lib page_meta_bench_live --release -- --ignored --nocapture`
+    // with PAGE_META_BENCH_PROJECT pointing at a (large) wiki project.
+    // Read-only against the wiki tree; the only file it may create or
+    // delete is the app's own `.llm-wiki/page-meta-index.json`.
+    // PAGE_META_BENCH_FRESH=1 deletes the persisted index first, turning
+    // the run into a from-scratch full rebuild (cold-start shape).
+
+    #[test]
+    #[ignore]
+    fn page_meta_bench_live() {
+        let project = std::env::var("PAGE_META_BENCH_PROJECT")
+            .expect("PAGE_META_BENCH_PROJECT must point at a wiki project");
+        let fresh = std::env::var("PAGE_META_BENCH_FRESH").ok().as_deref() == Some("1");
+        let label = std::env::var("PAGE_META_BENCH_LABEL").unwrap_or_default();
+        let index_path = std::path::Path::new(&project)
+            .join(".llm-wiki")
+            .join("page-meta-index.json");
+        if fresh {
+            match std::fs::remove_file(&index_path) {
+                Ok(()) => println!("[bench] deleted persisted index (cold full rebuild)"),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => panic!("could not delete index: {err}"),
+            }
+        } else {
+            println!(
+                "[bench] persisted index present: {}",
+                index_path.exists()
+            );
+        }
+
+        // Walk-only cost (the fingerprint recheck every TTL-expired request
+        // pays even on an all-reuse rebuild).
+        let t_walk = std::time::Instant::now();
+        let fp = wiki_tree_fingerprint(&std::path::Path::new(&project).join("wiki"));
+        println!("[bench] label={label} fingerprint_walk={:?} fp={fp}", t_walk.elapsed());
+
+        // Cold process → in-memory cache is empty → the first call is the
+        // full build path (persisted-index reuse when the file exists).
+        let t_build = std::time::Instant::now();
+        let index = page_meta_index_cached(&project);
+        let build = t_build.elapsed();
+
+        // Second call inside the TTL window: pure memory hit.
+        let t_hit = std::time::Instant::now();
+        let again = page_meta_index_cached(&project);
+        let hit = t_hit.elapsed();
+
+        println!(
+            "[bench] label={label} entries={} build={build:?} memory_hit={hit:?} fresh={fresh}",
+            index.entries().len()
+        );
+        // Optional: print one entry's parsed frontmatter so a scripted
+        // out-of-band edit between runs can prove it landed in the index.
+        if let Ok(probe) = std::env::var("PAGE_META_BENCH_PROBE_REL") {
+            match index.entries().iter().find(|m| m.rel_path == probe) {
+                Some(meta) => {
+                    let value =
+                        |key: &str| {
+                            meta.frontmatter
+                                .get(key)
+                                .and_then(|v| v.first())
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+                    println!(
+                        "[bench] probe rel={probe} type={:?} title={:?} head_read_ok={} head_closed={}",
+                        value("type"),
+                        value("title"),
+                        meta.head_read_ok,
+                        meta.head_closed
+                    );
+                }
+                None => println!("[bench] probe rel={probe} NOT FOUND"),
+            }
+        }
+        assert!(std::sync::Arc::ptr_eq(&index, &again));
     }
 }
