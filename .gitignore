@@ -53,3 +53,4 @@ pnpm-debug.log*
 # graph-pipeline-parity one-shot artifacts
 tools/graph-pipeline-parity/graph-snapshot-dump.json
 tools/graph-pipeline-parity/parity-report.json
+__pycache__/
