@@ -32,7 +32,7 @@ const EBOOK_EXTS: &[&str] = &["epub", "mobi"];
 const LEGACY_DOC_EXTS: &[&str] = &["pages", "numbers", "key"];
 const OFFICE_CACHE_FORMAT: &str = "anydoc-0.1.6-v1";
 
-fn require_absolute_path(operation: &str, path: &str) -> Result<(), String> {
+pub(crate) fn require_absolute_path(operation: &str, path: &str) -> Result<(), String> {
     if is_absolute_path_cross_platform(path) {
         Ok(())
     } else {

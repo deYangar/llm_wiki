@@ -646,6 +646,7 @@ pub fn run() {
             commands::fs::list_directory,
             commands::fs::list_wiki_page_meta,
             commands::fs::list_wiki_page_type_counts,
+            commands::wiki_graph::wiki_graph_snapshot,
             commands::fs::copy_file,
             commands::fs::copy_directory,
             commands::fs::preprocess_file,

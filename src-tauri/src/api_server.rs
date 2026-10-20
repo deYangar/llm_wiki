@@ -2845,25 +2845,31 @@ fn load_agent_runtime_config(app: &AppHandle, project_id: Option<&str>) -> Agent
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ApiGraphNode {
-    id: String,
-    label: String,
-    node_type: String,
-    path: String,
-    link_count: usize,
+pub(crate) struct ApiGraphNode {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) node_type: String,
+    pub(crate) path: String,
+    pub(crate) link_count: usize,
     /// Frontmatter `tags` of the underlying page (empty for pages without
     /// a well-formed block). Powers the `tag` query filter so consumers can
     /// pull related nodes by tag prefix instead of wikilinks only.
     #[serde(default)]
-    tags: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    /// Frontmatter `sources` of the underlying page, read from the same
+    /// already-read content as `tags`. Only additive for the HTTP /graph
+    /// contract (existing consumers ignore unknown fields); the invoke-side
+    /// graph snapshot uses it to skip a second full-library read.
+    #[serde(default)]
+    pub(crate) sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ApiGraphEdge {
-    source: String,
-    target: String,
-    weight: f64,
+pub(crate) struct ApiGraphEdge {
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) weight: f64,
 }
 
 fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
@@ -3116,16 +3122,16 @@ fn filter_graph<'a>(
 // 6k files). A fingerprint mismatch simply triggers a rebuild on the next
 // request — the graph never goes stale, at worst one rebuild is repeated.
 
-struct GraphSnapshot {
-    nodes: Vec<ApiGraphNode>,
+pub(crate) struct GraphSnapshot {
+    pub(crate) nodes: Vec<ApiGraphNode>,
     /// Edges with each endpoint's position in `nodes` precomputed at build
     /// time. Unfiltered queries slice pages by `min_index` directly and
     /// skip building an id→position map on every cache hit.
-    edges: Vec<OwnedGraphEdge>,
+    pub(crate) edges: Vec<OwnedGraphEdge>,
 }
 
-struct OwnedGraphEdge {
-    edge: ApiGraphEdge,
+pub(crate) struct OwnedGraphEdge {
+    pub(crate) edge: ApiGraphEdge,
     min_index: usize,
 }
 
@@ -3156,13 +3162,14 @@ fn own_edges(nodes: &[ApiGraphNode], edges: Vec<ApiGraphEdge>) -> Vec<OwnedGraph
 /// rebuild after a fingerprint change re-reads only the files whose
 /// (mtime, len) moved instead of the whole tree.
 #[derive(Clone)]
-struct ParsedPage {
+pub(crate) struct ParsedPage {
     id: String,
     title: String,
     node_type: String,
     rel_path: String,
     links: Vec<String>,
     tags: Vec<String>,
+    sources: Vec<String>,
 }
 
 struct GraphCacheEntry {
@@ -3264,7 +3271,7 @@ fn fingerprint_of_walked(files: &[WalkedFile]) -> u64 {
     acc
 }
 
-fn build_graph_cached(project_path: &str) -> Result<Arc<GraphSnapshot>, String> {
+pub(crate) fn build_graph_cached(project_path: &str) -> Result<Arc<GraphSnapshot>, String> {
     build_graph_cached_with_ttl(project_path, FINGERPRINT_RECHECK_TTL)
 }
 
@@ -3357,11 +3364,17 @@ fn parse_graph_page(project_path: &str, path: &Path) -> Option<ParsedPage> {
     let node_type = extract_type(&content);
     let rel_path = relative_to_project(project_path, path);
     let links = commands::search::extract_graph_links(&content);
-    // Tags come from the same already-read content — no extra head
-    // read per page, so the graph build cost is unaffected.
-    let tags = crate::frontmatter::split_frontmatter(&content)
-        .map(|(_, block)| crate::frontmatter::Frontmatter::parse(block))
+    // Tags and sources come from the same already-read content — no extra
+    // head read per page, so the graph build cost is unaffected.
+    let fm = crate::frontmatter::split_frontmatter(&content)
+        .map(|(_, block)| crate::frontmatter::Frontmatter::parse(block));
+    let tags = fm
+        .as_ref()
         .and_then(|fm| fm.get("tags").map(|tags| tags.to_vec()))
+        .unwrap_or_default();
+    let sources = fm
+        .as_ref()
+        .and_then(|fm| fm.get("sources").map(|sources| sources.to_vec()))
         .unwrap_or_default();
     Some(ParsedPage {
         id,
@@ -3370,6 +3383,7 @@ fn parse_graph_page(project_path: &str, path: &Path) -> Option<ParsedPage> {
         rel_path,
         links,
         tags,
+        sources,
     })
 }
 
@@ -3400,8 +3414,10 @@ fn build_graph_from_walk(
         .collect();
     let mut by_path: std::collections::HashMap<PathBuf, (u128, u64, ParsedPage)> =
         std::collections::HashMap::with_capacity(files.len());
-    let mut raw: BTreeMap<String, (String, String, String, Vec<String>, Vec<String>)> =
-        BTreeMap::new();
+    let mut raw: BTreeMap<
+        String,
+        (String, String, String, Vec<String>, Vec<String>, Vec<String>),
+    > = BTreeMap::new();
     for (file, page) in files.iter().zip(parsed.into_iter()) {
         let Some(page) = page else { continue };
         by_path.insert(
@@ -3410,7 +3426,14 @@ fn build_graph_from_walk(
         );
         raw.insert(
             page.id,
-            (page.title, page.node_type, page.rel_path, page.links, page.tags),
+            (
+                page.title,
+                page.node_type,
+                page.rel_path,
+                page.links,
+                page.tags,
+                page.sources,
+            ),
         );
     }
     let ids: BTreeSet<String> = raw.keys().cloned().collect();
@@ -3431,7 +3454,7 @@ fn build_graph_from_walk(
     let mut link_count: BTreeMap<String, usize> = raw.keys().map(|id| (id.clone(), 0)).collect();
     let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
-    for (source, (_, _, _, links, _)) in &raw {
+    for (source, (_, _, _, links, _, _)) in &raw {
         for link in links {
             let Some(target) = resolve_link(link, &ids, &by_lower, &by_norm) else {
                 continue;
@@ -3457,14 +3480,15 @@ fn build_graph_from_walk(
     }
     let nodes = raw
         .into_iter()
-        .filter(|(_, (_, node_type, _, _, _))| node_type != "query")
-        .map(|(id, (label, node_type, path, _, tags))| ApiGraphNode {
+        .filter(|(_, (_, node_type, _, _, _, _))| node_type != "query")
+        .map(|(id, (label, node_type, path, _, tags, sources))| ApiGraphNode {
             link_count: *link_count.get(&id).unwrap_or(&0),
             id,
             label,
             node_type,
             path,
             tags,
+            sources,
         })
         .collect();
     (nodes, edges, by_path)
@@ -4650,7 +4674,11 @@ mod tests {
     // Golden serialization of the fixture below (nodes JSON + edges JSON),
     // pinned by graph_fixture_snapshot_is_byte_stable.
 
-    const GRAPH_FIXTURE_SNAPSHOT: &str = "[{\"id\":\"attention\",\"label\":\"attention\",\"nodeType\":\"note\",\"path\":\"wiki/sub/attention.md\",\"linkCount\":3,\"tags\":[]},{\"id\":\"gpu-cluster\",\"label\":\"gpu cluster\",\"nodeType\":\"hardware\",\"path\":\"wiki/gpu-cluster.md\",\"linkCount\":1,\"tags\":[]},{\"id\":\"transformer\",\"label\":\"Transformer 模型\",\"nodeType\":\"other\",\"path\":\"wiki/transformer.md\",\"linkCount\":1,\"tags\":[\"topic:检索\"]},{\"id\":\"检索\",\"label\":\"检索\",\"nodeType\":\"workflow\",\"path\":\"wiki/检索.md\",\"linkCount\":2,\"tags\":[\"topic:检索\",\"role:业务\"]}]\n[{\"source\":\"attention\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"gpu-cluster\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"query-hub\",\"target\":\"attention\",\"weight\":1.0},{\"source\":\"transformer\",\"target\":\"attention\",\"weight\":1.0}]";
+    // Golden serialization updated for the sources contract (2026-10-20,
+    // §3.1 of the cold-start/graph plan): ApiGraphNode gained a trailing
+    // `sources` field (frontmatter `sources`, [] in this fixture). No
+    // existing field, order, or edge changed.
+    const GRAPH_FIXTURE_SNAPSHOT: &str = "[{\"id\":\"attention\",\"label\":\"attention\",\"nodeType\":\"note\",\"path\":\"wiki/sub/attention.md\",\"linkCount\":3,\"tags\":[],\"sources\":[]},{\"id\":\"gpu-cluster\",\"label\":\"gpu cluster\",\"nodeType\":\"hardware\",\"path\":\"wiki/gpu-cluster.md\",\"linkCount\":1,\"tags\":[],\"sources\":[]},{\"id\":\"transformer\",\"label\":\"Transformer 模型\",\"nodeType\":\"other\",\"path\":\"wiki/transformer.md\",\"linkCount\":1,\"tags\":[\"topic:检索\"],\"sources\":[]},{\"id\":\"检索\",\"label\":\"检索\",\"nodeType\":\"workflow\",\"path\":\"wiki/检索.md\",\"linkCount\":2,\"tags\":[\"topic:检索\",\"role:业务\"],\"sources\":[]}]\n[{\"source\":\"attention\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"gpu-cluster\",\"target\":\"检索\",\"weight\":1.0},{\"source\":\"query-hub\",\"target\":\"attention\",\"weight\":1.0},{\"source\":\"transformer\",\"target\":\"attention\",\"weight\":1.0}]";
 
     //
     // These tests pin the exact build_graph/filter_graph behavior that the
@@ -4777,6 +4805,40 @@ mod tests {
             panic!("snapshot drift:\n--- expected ---\n{GRAPH_FIXTURE_SNAPSHOT}\n--- actual ---\n{serialized}");
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    // §3.1 of the cold-start/graph plan: nodes carry frontmatter `sources`
+    // so the invoke-side graph snapshot needs no second full-library read.
+    #[test]
+    fn graph_node_carries_sources_from_frontmatter() {
+        let root = test_project_dir();
+        let wiki = root.join("wiki");
+        fs::write(
+            wiki.join("case.md"),
+            "---\ntype: case\nsources:\n  - \"sources/decree-12.md\"\n  - \"sources/notice-7.md\"\n---\nSee [[letter]].\n",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("letter.md"),
+            "---\ntype: source\n---\n[[case]] 回链。\n",
+        )
+        .unwrap();
+
+        let (nodes, edges) = build_graph(&root.to_string_lossy()).expect("build_graph");
+        let node = |id: &str| nodes.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("missing node {id}"));
+        assert_eq!(
+            node("case").sources,
+            vec!["sources/decree-12.md".to_string(), "sources/notice-7.md".to_string()]
+        );
+        // Pages without a sources block degrade to [], same as tags.
+        assert_eq!(node("letter").sources, Vec::<String>::new());
+        // Mutually linked pages share one deduplicated undirected edge.
+        assert_eq!(graph_edge_pairs_of(&edges), vec![("case", "letter")]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn graph_edge_pairs_of(edges: &[ApiGraphEdge]) -> Vec<(&str, &str)> {
+        edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect()
     }
 
     fn graph_edge_pairs<'a>(r: &'a GraphQueryResult) -> Vec<(&'a str, &'a str)> {

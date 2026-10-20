@@ -12,3 +12,4 @@ pub mod project;
 pub mod project_maintenance;
 pub mod search;
 pub mod vectorstore;
+pub mod wiki_graph;
