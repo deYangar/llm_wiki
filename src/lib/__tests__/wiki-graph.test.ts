@@ -13,10 +13,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import type { WikiGraphSnapshot } from "@/commands/fs"
 
-const mockSnapshot = vi.fn<[], Promise<WikiGraphSnapshot>>()
+const mockSnapshot = vi.fn<() => Promise<WikiGraphSnapshot>>()
 
 vi.mock("@/commands/fs", () => ({
-  wikiGraphSnapshot: (...args: unknown[]) => mockSnapshot(...args),
+  wikiGraphSnapshot: () => mockSnapshot(),
 }))
 
 vi.mock("@/stores/wiki-store", () => ({

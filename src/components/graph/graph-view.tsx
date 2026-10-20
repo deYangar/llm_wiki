@@ -81,9 +81,10 @@ const BASE_NODE_SIZE = 8
 const MAX_NODE_SIZE = 28
 const DEFAULT_GRAPH_SPACING = 1
 const GRAPH_SPACING_DEBOUNCE_MS = 180
+const GRAPH_DATA_VERSION_DEBOUNCE_MS = 3000
 const WORKER_LAYOUT_NODE_THRESHOLD = 220
 
-type HoverState = { node: string; neighbors: Set<string> } | null
+type HoverState = { node: string; neighbors: ReadonlySet<string> } | null
 type GraphPreview = {
   path: string
   title: string
@@ -302,6 +303,10 @@ function makeLayoutWorker(): Worker | null {
 const positionCache = new Map<string, { x: number; y: number }>()
 let lastLayoutDataKey = ""
 let pendingLayoutDataKey = ""
+// Rebuilt O(E) with every graph load; hover lookups read the precomputed
+// set instead of walking graph.neighbors() and allocating a fresh Set per
+// mouseenter (the old per-hover cost at 50k nodes).
+let neighborIndex = new Map<string, ReadonlySet<string>>()
 
 function GraphLoader({
   nodes,
@@ -371,6 +376,16 @@ function GraphLoader({
         }
       }
     }
+
+    // Precompute hover neighbor sets once per graph load (O(E)) so
+    // enterNode never walks the graph or allocates.
+    const neighbors = new Map<string, Set<string>>()
+    graph.forEachNode((nodeId) => neighbors.set(nodeId, new Set()))
+    graph.forEachEdge((_edge, _attrs, source, target) => {
+      neighbors.get(source)?.add(target)
+      neighbors.get(target)?.add(source)
+    })
+    neighborIndex = neighbors
 
     const runMainThreadLayout = () => {
       const settings = forceAtlas2.inferSettings(graph)
@@ -479,13 +494,20 @@ function GraphRenderSettings({
       renderEdgeLabels: false,
       defaultDrawNodeHover: createGraphNodeHoverRenderer(palette),
       nodeReducer: (node, attrs) => {
-        const result = { ...attrs }
         const hasHover = !!hoverState
         const hasHighlight = highlightedNodes.size > 0
+        if (!hasHover && !hasHighlight) return attrs
         const isHoverNode = hoverState?.node === node
         const isHoverNeighbor = hoverState?.neighbors.has(node) ?? false
         const isHighlighted = highlightedNodes.has(node)
-
+        const dimmed = (hasHover && !isHoverNode && !isHoverNeighbor) || (hasHighlight && !isHighlighted)
+        // sigma (v3) reducers may return the original attrs object —
+        // verified against the vendored source, it never mutates reducer
+        // output. Nodes the current hover/highlight state leaves
+        // untouched keep their original reference; only affected nodes
+        // pay the per-object copy.
+        if (!isHighlighted && !isHoverNode && !dimmed) return attrs
+        const result = { ...attrs }
         if (isHighlighted) {
           result.size = (attrs.size ?? BASE_NODE_SIZE) * 1.5
           result.zIndex = 10
@@ -496,7 +518,7 @@ function GraphRenderSettings({
           result.zIndex = 10
           result.forceLabel = true
         }
-        if ((hasHover && !isHoverNode && !isHoverNeighbor) || (hasHighlight && !isHighlighted)) {
+        if (dimmed) {
           result.color = mixColor(attrs.color ?? "#94a3b8", palette.mutedNodeMixTarget, 0.75)
           result.label = ""
           result.size = (attrs.size ?? BASE_NODE_SIZE) * 0.6
@@ -504,27 +526,33 @@ function GraphRenderSettings({
         return result
       },
       edgeReducer: (_edge, attrs) => {
-        const result = { ...attrs }
-        const source = String(attrs.sourceNode ?? "")
-        const target = String(attrs.targetNode ?? "")
         const hasHover = !!hoverState
         const hasHighlight = highlightedNodes.size > 0
+        // Low-priority (weak) edges hide unless hovered/highlighted —
+        // this is their resting state, so no hover/highlight still needs
+        // the hidden branch.
+        if (!hasHover && !hasHighlight) {
+          return attrs.lowPriority ? { ...attrs, hidden: true } : attrs
+        }
+        // Written as strings at edge-creation time; no defensive cast.
+        const source = attrs.sourceNode
+        const target = attrs.targetNode
         const hoverEdge = hasHover && (source === hoverState?.node || target === hoverState?.node)
         const highlightedEdge = hasHighlight && highlightedNodes.has(source) && highlightedNodes.has(target)
 
-        if (attrs.lowPriority && !hoverEdge && !highlightedEdge) {
-          result.hidden = true
-          return result
+        // Priority: active edges win, then weak-edge hiding, then dimming
+        // (an edge can match dim + active when hover runs during a
+        // highlight; active must keep the final say, as before).
+        if (hoverEdge || highlightedEdge) {
+          return { ...attrs, color: palette.activeEdge, size: Math.max(2, (attrs.size ?? 1) * 1.5) }
+        }
+        if (attrs.lowPriority) {
+          return { ...attrs, hidden: true }
         }
         if ((hasHover && !hoverEdge) || (hasHighlight && !highlightedEdge)) {
-          result.color = palette.dimmedEdge
-          result.size = 0.3
+          return { ...attrs, color: palette.dimmedEdge, size: 0.3 }
         }
-        if (hoverEdge || highlightedEdge) {
-          result.color = palette.activeEdge
-          result.size = Math.max(2, (attrs.size ?? 1) * 1.5)
-        }
-        return result
+        return attrs
       },
     })
     sigma.refresh()
@@ -558,8 +586,8 @@ function EventHandler({
       enterNode: ({ node }) => {
         const container = sigma.getContainer()
         container.style.cursor = "pointer"
-        const graph = sigma.getGraph()
-        onHoverChange({ node, neighbors: new Set(graph.neighbors(node)) })
+        // Precomputed at graph-load time; no per-hover graph walk/alloc.
+        onHoverChange({ node, neighbors: neighborIndex.get(node) ?? new Set() })
       },
       leaveNode: () => {
         const container = sigma.getContainer()
@@ -747,10 +775,21 @@ export function GraphView() {
     return () => window.clearTimeout(timer)
   }, [graphSpacingDraft])
 
+  // dataVersion churn is debounced (mirrors KnowledgeTree's 3s reload):
+  // batch imports bump it per write and rebuilding the graph mid-burst
+  // would re-fetch the snapshot for every write. First mount and the
+  // manual refresh/retry buttons (which call loadGraph directly) load
+  // immediately.
+  const firstGraphLoadRef = useRef(true)
   useEffect(() => {
-    if (dataVersion !== lastLoadedVersion.current) {
-      loadGraph()
+    if (dataVersion === lastLoadedVersion.current) return
+    if (firstGraphLoadRef.current) {
+      firstGraphLoadRef.current = false
+      void loadGraph()
+      return
     }
+    const timer = window.setTimeout(() => void loadGraph(), GRAPH_DATA_VERSION_DEBOUNCE_MS)
+    return () => window.clearTimeout(timer)
   }, [loadGraph, dataVersion])
 
   useEffect(() => {
@@ -910,10 +949,14 @@ export function GraphView() {
   }, [isResizing])
 
   // Count nodes by type for legend
-  const typeCounts = nodes.reduce<Record<string, number>>((acc, n) => {
-    acc[n.type] = (acc[n.type] ?? 0) + 1
-    return acc
-  }, {})
+  const typeCounts = useMemo(
+    () =>
+      nodes.reduce<Record<string, number>>((acc, n) => {
+        acc[n.type] = (acc[n.type] ?? 0) + 1
+        return acc
+      }, {}),
+    [nodes],
+  )
   const nodeTypeLabelMap = useMemo(() => {
     const labels = { ...nodeTypeLabels }
     for (const type of Object.keys(typeCounts)) {
