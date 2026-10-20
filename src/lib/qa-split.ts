@@ -780,10 +780,15 @@ export function extractRoundMeta(text: string, fileName: string): QaRoundMeta {
   // 不命中 ROUND_SENTENCE 时 letterName 为空，落实函会被误判为审核问询函族、
   // 再被首轮默认错给 roundNo=1——文件名的「落实函/反馈意见」字样做 kind 兜底
   //（泛名文件无 kind 字样，不受影响）。
+  // 「问询函」在场时「反馈意见」是问询函的行文别名，不是注册反馈（2026-10-21
+  // 炬申/中成/宏创 7 页实锤：抬头交易所、出具句为《审核问询函》，文件名却带
+  // 「审核问询函…反馈意见」字样）——只有显式「注册环节反馈意见」或无问询函
+  // 在场的反馈意见才判注册反馈。
+  const mentionsInquiry = /问询函/.test(letterName) || /问询函/.test(fileName)
   const isFeedback =
     letterName.includes("注册环节反馈意见") ||
-    letterName.includes("反馈意见") ||
-    /反馈意见/.test(fileName)
+    (letterName.includes("反馈意见") && !mentionsInquiry) ||
+    (/反馈意见/.test(fileName) && !mentionsInquiry)
   const isImplementation =
     (letterName.includes("落实函") || /落实函/.test(fileName)) && !isFeedback
   const roundKind: QaRoundMeta["roundKind"] = isFeedback

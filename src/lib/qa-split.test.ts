@@ -831,6 +831,31 @@ describe("qa-split — extractRoundMeta", () => {
     expect(meta.roundKind).toBe("注册反馈")
   })
 
+  it("treats 反馈意见 as an inquiry-letter alias when 问询函 is present (炬申/中成/宏创 shape)", () => {
+    // 2026-10-21 实锤形态：文件名「审核问询函反馈意见…」＝问询函行文别名，
+    // 正文出具句/抬头都是交易所问询函——不得判注册反馈（否则 issuer 也会错成证监会）。
+    const body = `深圳证券交易所：
+
+由保荐机构转来的《关于炬申物流集团股份有限公司申请向不特定对象发行可转换公司债券的审核问询函》（审核函〔2025〕120029号），以下简称反馈意见）奉悉。`
+    const meta = extractRoundMeta(
+      body,
+      "7-2 关于对炬申物流集团股份有限公司申请向不特定对象发行可转换公司债券的审核问询函反馈意见中有关财务事项的说明.pdf",
+    )
+    expect(meta.roundKind).toBe("审核问询函")
+    expect(meta.issuer).toBe("交易所")
+    // 文件名单独携带别名（正文无出具句）同样不误判
+    const fileOnly = extractRoundMeta(
+      "正文没有任何轮次信息。",
+      "5 中联资产评估集团有限公司关于《关于中成进出口股份有限公司发行股份购买资产的审核问询函之反馈意见回复》核查意见.pdf",
+    )
+    expect(fileOnly.roundKind).toBe("审核问询函")
+    expect(fileOnly.issuer).toBe("交易所")
+    // 无问询函在场的真注册反馈不受守卫影响
+    expect(
+      extractRoundMeta("无关文本。", "6-1-1 关于某公司申请注册环节反馈意见落实函的回复.pdf").roundKind,
+    ).toBe("注册反馈")
+  })
+
   it("falls back to the filename as a weak reference", () => {
     const meta = extractRoundMeta("正文没有任何轮次信息。", "关于第一轮审核问询函的回复.pdf")
     expect(meta.roundNo).toBe(1)
