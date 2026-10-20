@@ -61,6 +61,7 @@
     "filterBySource": "Filtra la conoscenza per fonte",
     "allSources": "Tutte le fonti",
     "noWikiPages": "Ancora nessuna pagina wiki. Importa delle fonti per iniziare.",
+    "loadingRows": "Caricamento pagine…",
     "typeLabels": {
       "overview": "Panoramica",
       "entity": "Entità",

@@ -36,6 +36,23 @@ describe("buildTreeListRows", () => {
   it("empty input yields no rows", () => {
     expect(buildTreeListRows([], new Set(["entity"]))).toEqual([])
   })
+
+  it("countOverrides show the real header count for skeleton groups", () => {
+    // Skeleton group carries one placeholder item; the override supplies
+    // the real count.
+    const skeleton: ReadonlyArray<readonly [string, readonly Page[]]> = [
+      ["entity", [{ path: "__skeleton__:entity" }]],
+    ]
+    const overrides = new Map([["entity", 8945]])
+    const rows = buildTreeListRows(skeleton, new Set(["entity"]), overrides)
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toEqual({ kind: "header", key: "type:entity", type: "entity", count: 8945 })
+    expect(rows[1]).toEqual({
+      kind: "page",
+      key: "__skeleton__:entity",
+      page: { path: "__skeleton__:entity" },
+    })
+  })
 })
 
 describe("buildRowOffsets", () => {

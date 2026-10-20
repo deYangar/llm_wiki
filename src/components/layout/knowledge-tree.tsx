@@ -1,11 +1,11 @@
 import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect, memo } from "react"
 import {
-  FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, TrendingUp, Target, ChevronRight, ChevronDown, Layout, Globe, Trash2,
+  FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, TrendingUp, Target, ChevronRight, ChevronDown, Layout, Globe, Trash2, RefreshCw,
 } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Button } from "@/components/ui/button"
 import { useWikiStore } from "@/stores/wiki-store"
-import { listDirectory, listWikiPageMeta } from "@/commands/fs"
+import { listDirectory, listWikiPageMeta, listWikiPageTypeCounts, type WikiPageTypeCountRow } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
@@ -17,6 +17,7 @@ import { useAppDialog } from "@/stores/app-dialog-store"
 import { filterPagesBySource, listPageSourceIdentities } from "@/lib/knowledge-source-filter"
 import { flattenFilesNaturally } from "@/lib/file-tree-order"
 import { buildRowOffsets, buildTreeListRows, findVisibleRowRange, treeRowHeight } from "@/lib/virtual-tree-rows"
+import { twoStageGroups } from "@/lib/knowledge-tree-skeleton"
 
 const VISIBLE_RANGE_OVERSCAN = 8
 
@@ -27,6 +28,8 @@ interface WikiPageInfo {
   tags: string[]
   origin?: string
   sources: string[]
+  /** Skeleton placeholder from the type-counts stage — renders as a loading row. */
+  placeholder?: boolean
 }
 
 const TYPE_CONFIG: Record<string, { icon: typeof FileText; label: string; color: string; order: number }> = {
@@ -55,6 +58,11 @@ export function KnowledgeTree() {
   const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
   const dataVersion = useWikiStore((s) => s.dataVersion)
   const [pages, setPages] = useState<WikiPageInfo[]>([])
+  // Two-stage load: type counts (tiny payload) render the group headers as
+  // a skeleton while the full 50k-row page list is still in flight.
+  const [typeCounts, setTypeCounts] = useState<WikiPageTypeCountRow[] | null>(null)
+  const [rowsLoaded, setRowsLoaded] = useState(false)
+  const countsGeneration = useRef(0)
   const [selectedSource, setSelectedSource] = useState<string | null>(null)
   const [expandedTypes, setExpandedTypes] = useState<Set<string>>(new Set(["overview", "entity", "concept", "source"]))
   // Two-stage delete: first click arms the row, second click executes.
@@ -92,8 +100,24 @@ export function KnowledgeTree() {
           }
         }),
       )
+      setRowsLoaded(true)
     } catch {
-      if (generation === loadGeneration.current) setPages([])
+      if (generation === loadGeneration.current) {
+        setPages([])
+        setRowsLoaded(true)
+      }
+    }
+  }, [project])
+
+  const loadCounts = useCallback(async () => {
+    if (!project) return
+    const generation = ++countsGeneration.current
+    try {
+      const rows = await listWikiPageTypeCounts(normalizePath(project.path))
+      if (generation !== countsGeneration.current) return
+      setTypeCounts(rows)
+    } catch {
+      if (generation === countsGeneration.current) setTypeCounts(null)
     }
   }, [project])
 
@@ -102,16 +126,20 @@ export function KnowledgeTree() {
   // should not force a wiki metadata re-parse.
   useEffect(() => {
     void loadPages()
-  }, [loadPages])
+    void loadCounts()
+  }, [loadPages, loadCounts])
 
   // dataVersion churn is debounced: batch imports bump it per write and
   // the sidebar does not need per-write freshness. The trailing reload
   // lands after the burst; the generation counter drops stale runs, so
   // loads never overlap.
   useEffect(() => {
-    const timer = setTimeout(() => void loadPages(), 3000)
+    const timer = setTimeout(() => {
+      void loadPages()
+      void loadCounts()
+    }, 3000)
     return () => clearTimeout(timer)
-  }, [loadPages, dataVersion])
+  }, [loadPages, loadCounts, dataVersion])
 
   useEffect(() => {
     setSelectedSource(null)
@@ -178,11 +206,26 @@ export function KnowledgeTree() {
     })
   }, [visiblePages])
 
+  // Two-stage display: type-count skeleton groups until the full row list
+  // arrives. Ordering mirrors sortedGroups so headers never jump.
+  const displayGroups = useMemo(
+    () =>
+      twoStageGroups<WikiPageInfo>({
+        rowsLoaded,
+        sortedGroups,
+        typeCounts,
+        orderOf: (type) => typeConfig(type).order,
+        labelOf: wikiTypeLabel,
+        loadingTitle: t("sidebar.loadingRows"),
+      }),
+    [rowsLoaded, sortedGroups, typeCounts, t],
+  )
+
   // ~50k pages would otherwise live in the DOM at once and re-allocate on
   // every data-version refresh; only the viewport slice is mounted.
   const rows = useMemo(
-    () => buildTreeListRows(sortedGroups, expandedTypes),
-    [sortedGroups, expandedTypes],
+    () => buildTreeListRows(displayGroups.groups, expandedTypes, displayGroups.countOverrides),
+    [displayGroups, expandedTypes],
   )
   const { offsets, totalHeight } = useMemo(() => buildRowOffsets(rows), [rows])
 
@@ -267,7 +310,7 @@ export function KnowledgeTree() {
           </div>
         )}
 
-        {sortedGroups.length === 0 && (
+        {displayGroups.groups.length === 0 && (
           <div className="px-2 py-4 text-center text-xs text-muted-foreground">
             {t("sidebar.noWikiPages")}
           </div>
@@ -363,6 +406,18 @@ const PageRow = memo(function PageRow({
   onOpen: (path: string) => void
   onDelete: (pagePath: string) => Promise<void>
 }) {
+  // Skeleton placeholder from the type-counts stage: a muted, non-
+  // interactive loading row under an expanded group header.
+  if (page.placeholder) {
+    return (
+      <div className="ml-3 h-full">
+        <div className="flex h-7 items-center gap-1.5 rounded-md px-2 text-sm text-muted-foreground/70">
+          <RefreshCw className="h-3 w-3 shrink-0 animate-pulse" />
+          <span className="truncate">{page.title}</span>
+        </div>
+      </div>
+    )
+  }
   return (
     <div className="ml-3 h-full">
       <div

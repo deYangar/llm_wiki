@@ -1790,6 +1790,149 @@ pub async fn list_wiki_page_meta(project_path: String) -> Result<Vec<WikiPageMet
     .map_err(|e| format!("list_wiki_page_meta blocking task join error: {e}"))?
 }
 
+/// One `{wikiType, count}` bucket for the knowledge tree's type-count
+/// fast path. `wikiType` carries the FINAL displayed type — frontmatter
+/// type when present (lowercased), otherwise the same path inference the
+/// TS layer applies to "other" rows — so the sidebar can render group
+/// headers before the full 50k-row payload arrives.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WikiPageTypeCountRow {
+    pub wiki_type: String,
+    pub count: usize,
+}
+
+/// Directory → type table, order-sensitive, ported 1:1 from
+/// `src/lib/wiki-page-types.ts` WIKI_TYPE_DIRS. Matching is the TS
+/// `includes` triple (`/wiki/{dir}/` anywhere, `/{dir}/` anywhere,
+/// `wiki/{dir}/` prefix) — quirks included, so Rust counts and TS display
+/// never disagree.
+const WIKI_TYPE_DIRS: [(&str, &str); 11] = [
+    ("entities", "entity"),
+    ("concepts", "concept"),
+    ("sources", "source"),
+    ("queries", "query"),
+    ("comparisons", "comparison"),
+    ("synthesis", "synthesis"),
+    ("findings", "finding"),
+    ("standards", "standard"),
+    ("playbooks", "playbook"),
+    ("thesis", "thesis"),
+    ("methodology", "methodology"),
+];
+
+/// Port of `wiki-page-types.ts` custom-directory rule
+/// `(?:^|/)wiki/([^/.][^/]*)/[^/]+\.md$` without a regex dependency:
+/// scan "wiki/" occurrences at path boundaries left to right (the regex
+/// engine's leftmost-match order after backtracking) and take the first
+/// whose suffix is exactly `{cap}/{name}.md` with `cap` free of dots and
+/// slashes and `name` free of slashes.
+fn custom_wiki_dir_of(normalized: &str) -> Option<String> {
+    let bytes = normalized.as_bytes();
+    for i in 0..normalized.len() {
+        if normalized[i..].len() < 5 || &normalized[i..i + 5] != "wiki/" {
+            continue;
+        }
+        if i != 0 && bytes[i - 1] != b'/' {
+            continue;
+        }
+        let rest = &normalized[i + 5..];
+        let Some((cap, after_cap)) = rest.split_once('/') else {
+            continue;
+        };
+        if cap.is_empty() || cap.starts_with('.') || cap.contains('/') {
+            continue;
+        }
+        let Some(name) = after_cap.strip_suffix(".md") else {
+            continue;
+        };
+        if name.is_empty() || name.contains('/') {
+            continue;
+        }
+        return Some(cap.to_string());
+    }
+    None
+}
+
+/// Port of `wiki-page-types.ts` `inferWikiTypeFromPath` (the TS call site
+/// passes the row's file name, which equals the path's last segment, so a
+/// single rel_path argument reproduces the TS result).
+pub(crate) fn infer_wiki_type_from_path(rel_path: &str) -> Option<String> {
+    let normalized = rel_path.replace('\\', "/").to_lowercase();
+    for (dir, ty) in WIKI_TYPE_DIRS {
+        let with_wiki = format!("/wiki/{dir}/");
+        let plain = format!("/{dir}/");
+        let prefix = format!("wiki/{dir}/");
+        if normalized.contains(&with_wiki) || normalized.contains(&plain) || normalized.starts_with(&prefix)
+        {
+            return Some(ty.to_string());
+        }
+    }
+    let name = normalized.rsplit('/').next().unwrap_or("");
+    if name == "overview.md" || normalized.contains("/overview.md") {
+        return Some("overview".to_string());
+    }
+    custom_wiki_dir_of(&normalized)
+}
+
+/// Sync guts of `list_wiki_page_type_counts` — same skip rules and
+/// frontmatter resolution as `list_wiki_page_meta`, aggregated by final
+/// displayed type instead of materialized into rows.
+fn wiki_page_type_counts(project_path: &str) -> Result<Vec<WikiPageTypeCountRow>, String> {
+    let index = crate::frontmatter::page_meta_index_cached(project_path);
+    let project = project_path.trim_end_matches('/');
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for meta in index.entries() {
+        let name = meta.rel_path.rsplit('/').next().unwrap_or("");
+        if name == "index.md" || name == "log.md" {
+            continue;
+        }
+        let frontmatter = if meta.head_read_ok && !meta.head_closed {
+            recover_large_frontmatter(&format!("{project}/{}", meta.rel_path))
+        } else {
+            meta.frontmatter.clone()
+        };
+        // Displayed type ladder, matching wiki_page_meta_row + the TS
+        // re-inference: non-empty frontmatter type lowercased, EXCEPT the
+        // literal "other" (any case) which the TS layer re-infers from the
+        // path; missing type infers too; inference may still return None
+        // → "other".
+        let fm_type = frontmatter
+            .get("type")
+            .and_then(|values| values.first())
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_lowercase());
+        let effective = match fm_type.as_deref() {
+            None | Some("other") => infer_wiki_type_from_path(&meta.rel_path)
+                .unwrap_or_else(|| "other".to_string()),
+            Some(t) => t.to_string(),
+        };
+        *counts.entry(effective).or_default() += 1;
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(wiki_type, count)| WikiPageTypeCountRow { wiki_type, count })
+        .collect())
+}
+
+/// Lightweight per-type counters for the knowledge tree's two-stage load:
+/// the group headers (type + count) render from this while the full
+/// 50k-row `list_wiki_page_meta` payload is still in flight.
+#[tauri::command]
+pub async fn list_wiki_page_type_counts(
+    project_path: String,
+) -> Result<Vec<WikiPageTypeCountRow>, String> {
+    require_absolute_path("list_wiki_page_type_counts", &project_path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("list_wiki_page_type_counts", || {
+            wiki_page_type_counts(&project_path)
+        })
+    })
+    .await
+    .map_err(|e| format!("list_wiki_page_type_counts blocking task join error: {e}"))?
+}
+
 #[tauri::command]
 pub async fn copy_file(source: String, destination: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2252,6 +2395,151 @@ mod tests {
         assert_eq!(first_heading("## h2\n### h3"), None);
         assert_eq!(first_heading("#\ttab heading").as_deref(), Some("tab heading"));
         assert_eq!(first_heading(""), None);
+    }
+
+    // ---- infer_wiki_type_from_path: mirrors src/lib/wiki-page-types.test.ts
+    // (the TS case table must stay identical on both sides) ----------------
+
+    #[test]
+    fn infer_type_recognizes_core_wiki_directories() {
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/entities/ada-lovelace.md"),
+            Some("entity".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/concepts/attention.md"),
+            Some("concept".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/sources/paper.md"),
+            Some("source".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/queries/open-question.md"),
+            Some("query".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/comparisons/model-a-vs-b.md"),
+            Some("comparison".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/synthesis/summary.md"),
+            Some("synthesis".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_type_recognizes_research_template_directories() {
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/findings/result.md"),
+            Some("finding".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/thesis/main-claim.md"),
+            Some("thesis".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/methodology/systematic-review.md"),
+            Some("methodology".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_type_handles_windows_separators_and_overview() {
+        assert_eq!(
+            infer_wiki_type_from_path("C:\\wiki\\findings\\result.md"),
+            Some("finding".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/overview.md"),
+            Some("overview".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_type_uses_custom_wiki_subdirectories() {
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/people/ada-lovelace.md"),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/technologies/vector-db.md"),
+            Some("technologies".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_type_custom_dir_edge_cases_match_regex() {
+        // Dot-prefixed capture groups are excluded by `[^/.][^/]*`.
+        assert_eq!(infer_wiki_type_from_path("/project/wiki/.hidden/x.md"), None);
+        // More than one segment between the capture and the file name does
+        // not match `[^/]+\.md$`.
+        assert_eq!(infer_wiki_type_from_path("/project/wiki/a/b/c.md"), None);
+        // A nested wiki/ occurrence wins when the first cannot match.
+        assert_eq!(
+            infer_wiki_type_from_path("/project/wiki/a/wiki/people/x.md"),
+            Some("people".to_string())
+        );
+        // Non-md files never match the custom-dir rule.
+        assert_eq!(infer_wiki_type_from_path("/project/wiki/people/x.txt"), None);
+        // Pages outside any wiki/ directory infer nothing.
+        assert_eq!(infer_wiki_type_from_path("random/page.md"), None);
+        // The overview rule also fires on a path merely containing it.
+        assert_eq!(
+            infer_wiki_type_from_path("wiki/cases/overview.md"),
+            Some("overview".to_string())
+        );
+    }
+
+    fn type_counts_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-wiki-type-counts-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wiki = dir.join("wiki");
+        std::fs::create_dir_all(wiki.join("entities")).unwrap();
+        std::fs::create_dir_all(wiki.join("concepts")).unwrap();
+        std::fs::create_dir_all(wiki.join("people")).unwrap();
+        std::fs::write(
+            wiki.join("entities").join("a.md"),
+            "---\ntype: entity\ntitle: A\n---\n正文\n",
+        )
+        .unwrap();
+        // "Other" (any case) must re-infer from the path, like the TS layer.
+        std::fs::write(
+            wiki.join("concepts").join("b.md"),
+            "---\ntype: Other\ntitle: B\n---\n正文\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wiki.join("people").join("c.md"),
+            "---\ntitle: C\n---\n正文\n",
+        )
+        .unwrap();
+        // index.md / log.md are skipped by the row loader too.
+        std::fs::write(wiki.join("index.md"), "---\ntype: entity\n---\nindex\n").unwrap();
+        std::fs::write(wiki.join("log.md"), "---\ntype: entity\n---\nlog\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn type_counts_aggregate_final_displayed_types() {
+        let dir = type_counts_fixture("agg");
+        let project = dir.to_string_lossy().replace('\\', "/");
+        let mut counts = wiki_page_type_counts(&project).unwrap();
+        counts.sort_by(|a, b| a.wiki_type.cmp(&b.wiki_type));
+        assert_eq!(
+            counts,
+            vec![
+                WikiPageTypeCountRow { wiki_type: "concept".to_string(), count: 1 },
+                WikiPageTypeCountRow { wiki_type: "entity".to_string(), count: 1 },
+                WikiPageTypeCountRow { wiki_type: "people".to_string(), count: 1 },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

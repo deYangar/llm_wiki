@@ -21,15 +21,22 @@ export function treeRowHeight(kind: "header" | "page"): number {
 /**
  * Flatten ordered groups into a single row list. Collapsed groups
  * contribute only their header row. Keys are unique per group/page so
- * React can reuse row elements across refreshes.
+ * React can reuse row elements across refreshes. `countOverrides` lets a
+ * skeleton group (one placeholder item) display the real header count.
  */
 export function buildTreeListRows<TPage>(
   groups: ReadonlyArray<readonly [string, readonly TPage[]]>,
   expandedTypes: ReadonlySet<string>,
+  countOverrides?: ReadonlyMap<string, number>,
 ): TreeListRow<TPage>[] {
   const rows: TreeListRow<TPage>[] = []
   for (const [type, items] of groups) {
-    rows.push({ kind: "header", key: `type:${type}`, type, count: items.length })
+    rows.push({
+      kind: "header",
+      key: `type:${type}`,
+      type,
+      count: countOverrides?.get(type) ?? items.length,
+    })
     if (!expandedTypes.has(type)) continue
     for (const page of items) {
       rows.push({ kind: "page", key: (page as { path?: string }).path ?? String(page), page })

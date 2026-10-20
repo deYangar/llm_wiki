@@ -308,3 +308,20 @@ export interface WikiPageMetaRow {
 export async function listWikiPageMeta(projectPath: string): Promise<WikiPageMetaRow[]> {
   return invoke<WikiPageMetaRow[]>("list_wiki_page_meta", { projectPath })
 }
+
+/** Mirror of `commands::fs::WikiPageTypeCountRow` (Rust side). */
+export interface WikiPageTypeCountRow {
+  wikiType: string
+  count: number
+}
+
+/**
+ * Per-type counters for the knowledge tree's two-stage load: group
+ * headers render from this small payload while the full 50k-row
+ * listWikiPageMeta response is still in flight. `wikiType` already
+ * carries the final displayed type (frontmatter type, else the same
+ * path inference the TS layer applies to "other" rows).
+ */
+export async function listWikiPageTypeCounts(projectPath: string): Promise<WikiPageTypeCountRow[]> {
+  return invoke<WikiPageTypeCountRow[]>("list_wiki_page_type_counts", { projectPath })
+}
