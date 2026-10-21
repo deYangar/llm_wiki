@@ -628,6 +628,22 @@ pub fn run() {
                     eprintln!("[tray] failed to update tray availability state: {err}");
                 }
             }
+            // Service-mode startup (`--minimized` CLI arg or
+            // LLM_WIKI_START_MINIMIZED=1): open with the main window already
+            // minimized so an orchestrator (portable bundle) can start the
+            // backend without stealing desktop focus. Default behavior is
+            // unchanged when neither is set.
+            let start_minimized = std::env::args().any(|a| a == "--minimized")
+                || std::env::var("LLM_WIKI_START_MINIMIZED")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            if start_minimized {
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Err(err) = window.minimize() {
+                        eprintln!("[minimized] failed to minimize main window: {err}");
+                    }
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
