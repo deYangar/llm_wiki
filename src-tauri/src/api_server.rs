@@ -5416,6 +5416,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_filter_single_page_prefix_keeps_vector_lane_on_stem_rows() {
+        // 生产形态复刻（2026-10-21 真库实测：单页 path_prefix 下
+        // vectorHits=0、mode 降级 keyword）：目标页的向量行还是
+        // pre-migration 的 bare-stem id，且被 35 个贴近 query 的诱饵挤出
+        // 全局 top-k。谓词带上 stem id + 窄谓词精确 KNN 之后，vector
+        // lane 必须在单页限定下存活——旧实现里 stem 行被谓词排除，
+        // 谓词命中 0 行后整条 lane 名存实亡。
+        let root = test_project_dir();
+        let sources = root.join("wiki").join("sources");
+        let concepts = root.join("wiki").join("concepts");
+        fs::create_dir_all(&sources).unwrap();
+        fs::create_dir_all(&concepts).unwrap();
+        fs::write(
+            sources.join("stem-target.md"),
+            "---\ntype: source\ntitle: 目标题\n---\n# 目标题\n\n收入确认 时点。",
+        )
+        .unwrap();
+        fs::write(
+            concepts.join("stem-decoy.md"),
+            "---\ntype: concept\ntitle: 诱饵\n---\n# 诱饵\n\n无关正文。",
+        )
+        .unwrap();
+
+        let dim = 16usize;
+        let query: Vec<f32> = (0..dim).map(|i| ((i * 7) as f32 * 0.13).sin()).collect();
+        let far: Vec<f32> = (0..dim).map(|i| ((i * 13 + 5) as f32 * 0.29).cos()).collect();
+        let near = |i: usize| -> Vec<f32> {
+            query
+                .iter()
+                .enumerate()
+                .map(|(j, v)| v + ((i + j) as f32) * 1e-6)
+                .collect()
+        };
+        let chunk = |embedding: Vec<f32>, idx: u32| commands::vectorstore::ChunkUpsertInput {
+            chunk_index: idx,
+            chunk_text: format!("chunk {idx}"),
+            heading_path: String::new(),
+            embedding,
+        };
+        let path = root.to_string_lossy().to_string();
+        // Target page's vectors live under the pre-migration stem id.
+        commands::vectorstore::vector_upsert_chunks(
+            path.clone(),
+            "stem-target".into(),
+            vec![chunk(far.clone(), 0), chunk(far.clone(), 1)],
+        )
+        .await
+        .unwrap();
+        let decoys: Vec<_> = (0..35u32).map(|i| chunk(near(i as usize), i)).collect();
+        commands::vectorstore::vector_upsert_chunks(
+            path.clone(),
+            "concepts/stem-decoy".into(),
+            decoys,
+        )
+        .await
+        .unwrap();
+
+        let out = commands::search::search_project_inner(
+            path.clone(),
+            "收入确认".into(),
+            5,
+            false,
+            Some(query.clone()),
+            Some(SearchFilter {
+                path_prefix: Some("wiki/sources/stem-target.md".to_string()),
+                ..Default::default()
+            }),
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.vector_hits > 0,
+            "vector lane starved on single-page prefix: {out:?}"
+        );
+        assert!(!out.results.is_empty());
+        for r in &out.results {
+            assert!(
+                r.path.ends_with("sources/stem-target.md"),
+                "unfiltered page leaked into results: {}",
+                r.path
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn search_filter_field_eq_year() {
         let root = test_project_dir();
         write_search_fixture(&root);

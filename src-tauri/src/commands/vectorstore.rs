@@ -67,6 +67,14 @@ const TABLE_V1: &str = "wiki_vectors";
 /// v2 (current) table name. One row per CHUNK — a page is typically
 /// represented by multiple rows sharing the same `page_id`.
 const TABLE_V2: &str = "wiki_chunks_v2";
+
+/// Predicates matching at most this many rows take the in-memory exact
+/// KNN path (see `vector_search_chunks_predicate_inner`); above it the
+/// indexed KNN keeps the fast lane. 2,048 rows ≈ 16MB of 2048-dim f32
+/// vectors — the fetch rides the page_id BTree scalar index (measured
+/// ~7ms at 422 ids, ~409ms at 8,254) and the distance pass is
+/// single-digit milliseconds.
+const FILTERED_EXACT_MAX_ROWS: usize = 2_048;
 const MAX_PAGE_ID_CHARS: usize = 256;
 static VECTORSTORE_V2_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>> =
     OnceLock::new();
@@ -674,6 +682,41 @@ async fn vector_search_chunks_predicate_inner(
         .await
         .map_err(|e| format!("Open table error: {e}"))?;
 
+    if let Some(predicate) = predicate.as_deref() {
+        if !predicate.is_empty() {
+            // Narrow-predicate exact path (2026-10-21): the IVF index only
+            // probes a subset of partitions, so when the predicate matches
+            // very few rows those rows sit outside the probed set and the
+            // KNN returns empty — measured on the production library, a
+            // single-page predicate with exactly 1 matching row returned 0
+            // rows through the index and the same row through an
+            // index-bypassed scan. Fetch the surviving rows via the
+            // page_id scalar index and score them in memory instead:
+            // exact by construction, and the cost scales with the hit
+            // count, not the table. Predicates with more hits than
+            // FILTERED_EXACT_MAX_ROWS keep the indexed KNN below — their
+            // hits spread over many partitions, so the probed subset
+            // covers them with near certainty (2026-10-20 probe: identical
+            // top-10/distances vs a bypassed scan at 8,254 ids).
+            let fetched = table
+                .query()
+                .only_if(predicate.to_string())
+                .limit(FILTERED_EXACT_MAX_ROWS + 1)
+                .execute()
+                .await
+                .map_err(|e| format!("Execute filtered row fetch error: {e}"))?;
+            use futures::TryStreamExt;
+            let fetched_batches: Vec<RecordBatch> = fetched
+                .try_collect()
+                .await
+                .map_err(|e| format!("Collect filtered rows error: {e}"))?;
+            let hit_rows: usize = fetched_batches.iter().map(|b| b.num_rows()).sum();
+            if hit_rows <= FILTERED_EXACT_MAX_ROWS {
+                return exact_knn_over_rows(&query_embedding, top_k, &fetched_batches);
+            }
+        }
+    }
+
     let mut query = table
         .vector_search(query_embedding)
         .map_err(|e| format!("Search error: {e}"))?;
@@ -744,6 +787,83 @@ async fn vector_search_chunks_predicate_inner(
         }
 
         Ok(out)
+}
+
+/// Score the predicate-surviving rows fetched via the scalar index
+/// against the query embedding in memory and keep the top_k. Distance is
+/// plain L2 and the score conversion 1/(1+distance) — identical
+/// conventions to the indexed KNN path, so RRF fusion sees one scale.
+/// Rows fetched through a plain `query()` carry no `_distance` column,
+/// hence the manual pass. Ties break on chunk_id for determinism.
+fn exact_knn_over_rows(
+    query_embedding: &[f32],
+    top_k: usize,
+    batches: &[RecordBatch],
+) -> Result<Vec<ChunkSearchResult>, String> {
+    let mut scored: Vec<(f32, ChunkSearchResult)> = Vec::new();
+    for batch in batches {
+        let chunk_ids = batch
+            .column_by_name("chunk_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or("Missing chunk_id column")?;
+        let page_id_col = batch
+            .column_by_name("page_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or("Missing page_id column")?;
+        let chunk_indexes = batch
+            .column_by_name("chunk_index")
+            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
+            .ok_or("Missing chunk_index column")?;
+        let chunk_texts = batch
+            .column_by_name("chunk_text")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or("Missing chunk_text column")?;
+        let heading_paths = batch
+            .column_by_name("heading_path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or("Missing heading_path column")?;
+        let vectors = batch
+            .column_by_name("vector")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+            .ok_or("Missing vector column")?;
+
+        for i in 0..batch.num_rows() {
+            let value_ref = vectors.value(i);
+            let values = value_ref
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or("vector column is not f32")?;
+            let mut distance = 0f32;
+            for (j, q) in query_embedding.iter().enumerate().take(values.len()) {
+                let d = q - values.value(j);
+                distance += d * d;
+            }
+            scored.push((
+                distance,
+                ChunkSearchResult {
+                    chunk_id: chunk_ids.value(i).to_string(),
+                    page_id: page_id_col.value(i).to_string(),
+                    chunk_index: chunk_indexes.value(i),
+                    chunk_text: chunk_texts.value(i).to_string(),
+                    heading_path: heading_paths.value(i).to_string(),
+                    score: 0.0,
+                },
+            ));
+        }
+    }
+    scored.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.chunk_id.cmp(&b.1.chunk_id))
+    });
+    scored.truncate(top_k);
+    Ok(scored
+        .into_iter()
+        .map(|(distance, mut hit)| {
+            hit.score = 1.0 / (1.0 + distance);
+            hit
+        })
+        .collect())
 }
 
 /// Delete every chunk belonging to a page. Used when a source document
@@ -1340,6 +1460,63 @@ mod tests_v2 {
     fn page_id_predicate_quotes_values() {
         let pred = page_id_in_predicate(&["questions/a".into(), "it's".into()]);
         assert_eq!(pred, "page_id IN ('questions/a', 'it''s')");
+    }
+
+    #[tokio::test]
+    async fn narrow_predicate_exact_path_returns_target_rows() {
+        // 单页 path_prefix 的生产形态（2026-10-21 实测：窄谓词经 IVF 返回
+        // 空）。exact 路径走 scalar-index 取行 + 内存打分，不经过 IVF
+        // partition 选择，结构上无假阴性：必须返回谓词命中的全部行。
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        vector_upsert_chunks(
+            pp.clone(),
+            "sources/narrow-target".into(),
+            make_chunks("t", 2, 16),
+        )
+        .await
+        .unwrap();
+        vector_upsert_chunks(
+            pp.clone(),
+            "concepts/near-decoy".into(),
+            make_chunks("d", 5, 16),
+        )
+        .await
+        .unwrap();
+
+        let query = fake_embedding(3, 16);
+        let hits = vector_search_chunks_predicate(
+            pp.clone(),
+            query.clone(),
+            10,
+            "page_id IN ('sources/narrow-target')".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "exact path must return every matching row: {hits:?}"
+        );
+        for r in &hits {
+            assert_eq!(r.page_id, "sources/narrow-target");
+            // score keeps the 1/(1+L2) convention of the indexed path.
+            assert!(r.score.is_finite() && (0.0..1.0).contains(&r.score));
+        }
+
+        // A predicate matching zero rows returns empty honestly — it no
+        // longer falls back to an unconstrained whole-library KNN whose
+        // results the post-map would then drop.
+        let none = vector_search_chunks_predicate(
+            pp,
+            query,
+            10,
+            "page_id IN ('sources/absent')".into(),
+        )
+        .await
+        .unwrap();
+        assert!(none.is_empty());
     }
 
     // 诊断 v2（2026-10-15）：本地合成 1156 规律短 id 全过，但生产实例

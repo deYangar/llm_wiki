@@ -523,6 +523,13 @@ impl PageMetaIndex {
     pub fn entries(&self) -> &[PageMeta] {
         &self.entries
     }
+
+    /// Test-only constructor (in-crate tests build index inputs for
+    /// predicate helpers without walking a wiki tree).
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<PageMeta>) -> Self {
+        Self { entries }
+    }
 }
 
 struct PageMetaCacheEntry {

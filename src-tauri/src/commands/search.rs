@@ -447,6 +447,7 @@ pub async fn search_project_inner(
     let mut results = Vec::new();
     let mut page_paths_by_vector_id = BTreeMap::new();
     let mut legacy_stem_candidates = BTreeMap::<String, Vec<String>>::new();
+    let mut legacy_page_paths = BTreeMap::new();
     let mut graph_pages = BTreeMap::new();
     let mut total_filtered = 0usize;
     let mut vector_pushdown_predicate: Option<String> = None;
@@ -572,21 +573,27 @@ pub async fn search_project_inner(
             }
         }
         total_filtered = graph_pages.len();
+        legacy_page_paths = legacy_stem_candidates
+            .into_iter()
+            .filter_map(|(stem, paths)| (paths.len() == 1).then(|| (stem, paths[0].clone())))
+            .collect();
         // Vector-lane pushdown predicate, built while `index` (the full
         // page set) is still in scope: fully-covered directories become
         // one BTree-friendly range term each, only partially-covered
-        // directories pay per-id IN entries. Exactly equivalent to an
-        // IN-list over the candidate ids — a page matches the predicate
-        // iff it is a final candidate (stem-only ids are excluded on
-        // purpose: they never match a v2 row).
+        // directories pay per-id IN entries. Equivalent to an IN-list over
+        // the candidate ids plus the uniquely-owned legacy stem ids — a
+        // page matches the predicate iff it is a final candidate, and its
+        // pre-migration vector rows (still keyed by bare stem) match too.
+        // Ambiguous stems (multiple surviving pages share one) stay out:
+        // their rows can't be attributed to a single page.
         if filter.is_some() {
-            vector_pushdown_predicate = build_page_id_predicate(&index, &page_paths_by_vector_id);
+            vector_pushdown_predicate = build_page_id_predicate(
+                &index,
+                &page_paths_by_vector_id,
+                &legacy_page_paths,
+            );
         }
     }
-    let legacy_page_paths = legacy_stem_candidates
-        .into_iter()
-        .filter_map(|(stem, paths)| (paths.len() == 1).then(|| (stem, paths[0].clone())))
-        .collect::<BTreeMap<_, _>>();
     eprintln!("[perf] scan+score phase: {}ms (candidates={total_filtered})", perf_t0.elapsed().as_millis());
 
     let mut token_sorted = (0..results.len()).collect::<Vec<_>>();
@@ -1047,28 +1054,34 @@ struct PageVectorResult {
 ///   Note the range form plans differently (IVF + eligibility mask
 ///   instead of pre-materialized rows) and measured ~1s at half-library
 ///   coverage — it exists for the oversized case only, not as a speedup.
-/// Partially-covered directories contribute per-id IN entries. Stem-only
-/// ids (no '/') are skipped entirely: they exist only for v1-migration
-/// rows and never match a v2 page_id. Returns None when there are no
-/// qualified candidates (an empty IN-list is not valid SQL; the caller
-/// then runs unconstrained and the belt-and-braces post-map drops
-/// everything, same as before).
+/// Partially-covered directories contribute per-id IN entries.
+/// `legacy_stems` are the bare-stem ids of uniquely-owned candidate pages
+/// whose vector rows predate the v2 migration and are still keyed by stem
+/// (2026-10-21: previously skipped entirely, which left e.g. case
+/// overview pages with only pre-migration rows invisible to every
+/// filtered vector search). They ride along as IN entries — they never
+/// collide with the range terms, which only match `dir/...` forms.
+/// Ambiguous stems (several surviving pages share one) are already
+/// absent from `legacy_stems`, so they cannot leak another page's rows.
+/// Returns None when there are no qualified candidates (an empty IN-list
+/// is not valid SQL; the caller then runs unconstrained and the
+/// belt-and-braces post-map drops everything, same as before).
 fn build_page_id_predicate(
     index: &crate::frontmatter::PageMetaIndex,
     candidates: &BTreeMap<String, String>,
+    legacy_stems: &BTreeMap<String, String>,
 ) -> Option<String> {
-    if candidates.is_empty() {
-        return None;
-    }
     let qualified: Vec<&String> = candidates
         .keys()
         .filter(|id| id.rsplit_once('/').is_some())
         .collect();
-    if qualified.is_empty() {
+    let stems: Vec<&String> = legacy_stems.keys().collect();
+    if qualified.is_empty() && stems.is_empty() {
         return None;
     }
-    if qualified.len() <= PAGE_ID_IN_LIST_MAX {
-        let owned: Vec<String> = qualified.into_iter().cloned().collect();
+    if qualified.len() + stems.len() <= PAGE_ID_IN_LIST_MAX {
+        let mut owned: Vec<String> = qualified.into_iter().cloned().collect();
+        owned.extend(stems.into_iter().cloned());
         return Some(vectorstore::page_id_in_predicate(&owned));
     }
     // dir -> every page (with a vector id) under it survived the filter
@@ -1103,6 +1116,10 @@ fn build_page_id_predicate(
     }
     if !leftover.is_empty() {
         terms.push(vectorstore::page_id_in_predicate(&leftover));
+    }
+    if !stems.is_empty() {
+        let owned: Vec<String> = stems.into_iter().cloned().collect();
+        terms.push(vectorstore::page_id_in_predicate(&owned));
     }
     if terms.is_empty() {
         return None;
@@ -2151,6 +2168,36 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn page_id_predicate_includes_unique_legacy_stem_ids() {
+        // 2026-10-21：候选页只有 pre-migration 的 stem 向量行时（如案例
+        // 概览页，47k stem-only 行仍在生产表里），谓词必须带上 stem id，
+        // vector lane 才能在过滤集内看到它们。歧义 stem（多页同名）在
+        // scan 阶段就被挡在 legacy 映射外，不会经此泄漏。
+        let index = crate::frontmatter::PageMetaIndex::from_entries(vec![]);
+        let candidates = BTreeMap::from([(
+            "sources/a-b".to_string(),
+            "wiki/sources/a-b.md".to_string(),
+        )]);
+        let legacy = BTreeMap::from([(
+            "案例甲（深创业板IPO·2025）".to_string(),
+            "wiki/cases/案例甲（深创业板IPO·2025）.md".to_string(),
+        )]);
+        let pred = build_page_id_predicate(&index, &candidates, &legacy).unwrap();
+        assert!(pred.contains("'sources/a-b'"), "pred: {pred}");
+        assert!(
+            pred.contains("'案例甲（深创业板IPO·2025）'"),
+            "pred: {pred}"
+        );
+    }
+
+    #[test]
+    fn page_id_predicate_none_without_v2_ids_or_stems() {
+        let index = crate::frontmatter::PageMetaIndex::from_entries(vec![]);
+        let empty: BTreeMap<String, String> = BTreeMap::new();
+        assert!(build_page_id_predicate(&index, &empty, &empty).is_none());
+    }
 
     #[test]
     fn score_file_cjk_fast_path_and_ascii_fold_both_match() {
