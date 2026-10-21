@@ -90,7 +90,9 @@ New-Item -ItemType Directory -Force -Path (Join-Path $repoRoot $OutputDir), $sta
 # ---------------------------------------------------------------- 组装
 Write-Step "exe + 原生依赖"
 Copy-Item $Exe (Join-Path $staging 'llm-wiki.exe')
-Copy-Tree (Join-Path $repoRoot 'pdfium') (Join-Path $staging 'pdfium')
+# pdfium 源在 src-tauri\pdfium\（运行时按 resource_dir=exe 旁解析：
+# <exe目录>\pdfium\pdfium.dll，安装版同布局）
+Copy-Tree (Join-Path $repoRoot 'src-tauri\pdfium') (Join-Path $staging 'pdfium')
 Write-Ok "exe + pdfium 就绪"
 
 Write-Step "mcp-server（node 依赖整体随包）"
