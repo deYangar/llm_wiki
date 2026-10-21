@@ -629,19 +629,32 @@ pub fn run() {
                 }
             }
             // Service-mode startup (`--minimized` CLI arg or
-            // LLM_WIKI_START_MINIMIZED=1): open with the main window already
-            // minimized so an orchestrator (portable bundle) can start the
-            // backend without stealing desktop focus. Default behavior is
-            // unchanged when neither is set.
+            // LLM_WIKI_START_MINIMIZED=1): run with the main window hidden
+            // so an orchestrator (portable bundle) can start the backend
+            // without a window at all. The tray icon is the way back
+            // (double-click / "Show LLM Wiki" menu).
+            //
+            // The main window ships with visible:false (tauri.conf.json) and
+            // visibility is decided HERE. Hidden, not minimized, on purpose:
+            // WebView2 initialization grabs foreground focus when the webview
+            // becomes ready, and SetForegroundWindow semantics RESTORE a
+            // minimized window — a minimized startup window never sticks
+            // (measured 2026-10-21 with both config-visible and
+            // setup-then-minimize orderings).
             let start_minimized = std::env::args().any(|a| a == "--minimized")
                 || std::env::var("LLM_WIKI_START_MINIMIZED")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
-            if start_minimized {
-                if let Some(window) = app.get_webview_window("main") {
-                    if let Err(err) = window.minimize() {
-                        eprintln!("[minimized] failed to minimize main window: {err}");
+            if let Some(window) = app.get_webview_window("main") {
+                if start_minimized {
+                    if let Err(err) = window.hide() {
+                        eprintln!("[minimized] failed to hide main window: {err}");
                     }
+                } else {
+                    if let Err(err) = window.show() {
+                        eprintln!("[window] failed to show main window: {err}");
+                    }
+                    let _ = window.set_focus();
                 }
             }
             Ok(())

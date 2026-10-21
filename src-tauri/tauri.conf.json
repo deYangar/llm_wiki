@@ -18,14 +18,17 @@
         "resizable": true,
         "fullscreen": false,
         "hiddenTitle": true,
-        "titleBarStyle": "Transparent"
+        "titleBarStyle": "Transparent",
+        "visible": false
       }
     ],
     "security": {
       "csp": "default-src 'self'; connect-src 'self' https: http:; img-src 'self' asset: http://asset.localhost https://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost https://asset.localhost; style-src 'self' 'unsafe-inline'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": [
+          "**"
+        ]
       }
     }
   },

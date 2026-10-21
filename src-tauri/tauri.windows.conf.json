@@ -4,7 +4,8 @@
       {
         "label": "main",
         "hiddenTitle": false,
-        "titleBarStyle": "Visible"
+        "titleBarStyle": "Visible",
+        "visible": false
       }
     ]
   },
