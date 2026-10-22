@@ -3,6 +3,7 @@ import { describe, it, expect } from "vitest"
 import {
   buildQaSplitReportEntry,
   buildQuestionFileBlocks,
+  questionTitle,
   classifyQaDocument,
   cn2num,
   extractPathMeta,
@@ -13,6 +14,7 @@ import {
   splitQaDocument,
   splitReplySections,
 } from "./qa-split"
+import type { QaRoundMeta, SplitQuestion } from "./qa-split"
 import { FILE_BLOCK_REGEX } from "./ingest"
 
 /**
@@ -892,14 +894,16 @@ describe("qa-split — extractPathMeta", () => {
     })
   })
 
-  it("adapts the Beijing layout (no board segment, deal normalized to IPO)", () => {
+  it("adapts the Beijing layout (board inferred as 北交所, deal normalized to IPO)", () => {
     const meta = extractPathMeta(
       "scheduled-import/问答/2025/北交所/公开发行并上市/注册/世纪数码/世纪数码：第二轮问询的回复.pdf",
     )
     expect(meta.year).toBe("2025")
     expect(meta.exchange).toBe("北交所")
     expect(meta.deal).toBe("IPO")
-    expect(meta.board).toBeUndefined()
+    // B5（2026-10-22 审计 S6）：北交所无板块层，但股票全在北交所板块——
+    // board 补「北交所」，不再产出无 board 的 question 页。
+    expect(meta.board).toBe("北交所")
     expect(meta.status).toBe("注册")
     expect(meta.company).toBe("世纪数码")
   })
@@ -1485,5 +1489,57 @@ describe("qa-split — sanitizeFallbackTags value domain (附录 B 全量枚举)
   it("returns empty for non-array input", () => {
     expect(sanitizeFallbackTags(undefined)).toEqual({ kept: [], dropped: [] })
     expect(sanitizeFallbackTags("topic:x")).toEqual({ kept: [], dropped: [] })
+  })
+})
+
+// ── B4（2026-10-22 审计 S7）：question 页 title 题号前缀清洗 ──────────
+
+describe("qa-split — questionTitle strips the leading question number (B4)", () => {
+  const roundMeta: QaRoundMeta = {
+    roundKind: "审核问询函",
+    roundNo: 1,
+    issuer: "交易所",
+    basis: "test",
+  }
+
+  function titleOf(stem: string, questionNo: number): string {
+    const question: SplitQuestion = {
+      questionNo,
+      title: stem,
+      questionText: stem,
+      replyText: "答",
+      channel: "H1",
+      questionNoIsGenerated: false,
+      startLine: 0,
+      replyStartLine: 1,
+    }
+    return questionTitle(question, roundMeta)
+  }
+
+  it("strips the duplicated arabic-number prefix (第1轮·问题7·7、关于…)", () => {
+    expect(titleOf("7、关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+  })
+
+  it("strips dot and fullwidth-dot separators", () => {
+    expect(titleOf("7.关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+    expect(titleOf("7．关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+  })
+
+  it("strips the chinese-number prefix", () => {
+    expect(titleOf("七、关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+  })
+
+  it("strips a bracket-wrapped number", () => {
+    expect(titleOf("(七)关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+  })
+
+  it("keeps numeric-open headings without a separator (7个交易日)", () => {
+    expect(titleOf("7个交易日的资金占用", 7)).toBe(
+      "第1轮·问题7·7个交易日的资金占用",
+    )
+  })
+
+  it("keeps a heading whose number is another question's", () => {
+    expect(titleOf("8、关于股份支付", 7)).toBe("第1轮·问题7·8、关于股份支付")
   })
 })

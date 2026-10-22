@@ -849,9 +849,13 @@ export function extractPathMeta(sourceIdentity: string): QaPathMeta {
   const fileStem = (parts[parts.length - 1] ?? "source").replace(/\.[^/.]+$/, "")
   if (exchange === "北交所") {
     // 问答/2025/北交所/公开发行并上市/注册/世纪数码/file.pdf
+    // B5（2026-10-22 审计 S6）：北交所无板块层，但北交所股票全部在
+    // 「北交所」板块——board 直接补「北交所」，不再产出 428 页无 board
+    // 的 question 页（存量由 A5④ 数据 PATCH 补齐）。
     return {
       year,
       exchange,
+      board: "北交所",
       deal: DEAL_NORMALIZE[rest[2]] ?? rest[2],
       status: rest[3],
       company: rest[4] ?? fileStem,
@@ -889,12 +893,53 @@ function yamlScalar(value: string): string {
   return value
 }
 
-function questionTitle(
+const CN_DIGITS = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"]
+
+function toChineseNumber(n: number): string | null {
+  if (!Number.isInteger(n) || n < 1 || n > 99) return null
+  if (n < 10) return CN_DIGITS[n]
+  const tens = Math.floor(n / 10)
+  const ones = n % 10
+  const tensPart = tens === 1 ? "十" : CN_DIGITS[tens] + "十"
+  return ones === 0 ? tensPart : tensPart + CN_DIGITS[ones]
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+/**
+ * 剥掉题干标题行自带的题号前缀（B4，2026-10-22 审计 S7）：questionTitle
+ * 模板已拼「问题N·」，标题原文再带「7、」就会产出「第1轮·问题7·7、关于
+ * 股份支付」的重复（2025 分册曾靠外部 PATCH 清洗 120 页，规则内置后新库
+ * 免洗）。只剥「恰好以本题题号开头 + 显式分隔符/括号包裹」的形态——
+ * 「7个交易日」这类数字开头的语义标题没有分隔符，不受影响；剥空则回退
+ * 原文（宁可重复不可截没）。
+ */
+export function stripQuestionNoPrefix(stem: string, questionNo: number): string {
+  const literals = [String(questionNo), toChineseNumber(questionNo) ?? ""]
+  for (const literal of literals) {
+    if (!literal) continue
+    const escaped = escapeRegExp(literal)
+    const patterns = [
+      new RegExp(`^${escaped}\\s*[、．.,，:：]\\s*`),
+      new RegExp(`^[（(]${escaped}[)）]\\s*`),
+    ]
+    for (const pattern of patterns) {
+      const stripped = stem.replace(pattern, "")
+      if (stripped !== stem && stripped.trim() !== "") return stripped.trim()
+    }
+  }
+  return stem
+}
+
+export function questionTitle(
   question: SplitQuestion,
   roundMeta: QaRoundMeta,
 ): string {
   const round = roundMeta.roundNo ? `第${roundMeta.roundNo}轮` : roundMeta.roundKind
-  const stem = question.title.slice(0, TITLE_MAX).trim() || `第${question.questionNo}题`
+  const cleaned = stripQuestionNoPrefix(question.title, question.questionNo)
+  const stem = cleaned.slice(0, TITLE_MAX).trim() || `第${question.questionNo}题`
   return `${round}·问题${question.questionNo}·${stem}`
 }
 
