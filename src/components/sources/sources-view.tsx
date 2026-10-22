@@ -28,7 +28,7 @@ import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { importSourceUrls, parseImportUrls, type UrlImportResult } from "@/lib/url-source-import"
 import { listIngestedSourceIdentities } from "@/lib/ingest-cache"
-import { getQueue, queueFingerprint, type IngestTask } from "@/lib/ingest-queue"
+import { getQueue, subscribeIngestQueue, type IngestTask } from "@/lib/ingest-queue"
 
 const SOURCE_TREE_INITIAL_ROWS = 160
 const SOURCE_TREE_LOAD_BATCH = 160
@@ -122,18 +122,7 @@ export function SourcesView() {
   }, [project, dataVersion])
 
   useEffect(() => {
-    // Fingerprint-gated: skip the snapshot update (and the tree-wide
-    // re-render it forces) when nothing rendered from the queue changed.
-    let lastFingerprint = queueFingerprint()
-    const refresh = () => {
-      const next = queueFingerprint()
-      if (next === lastFingerprint) return
-      lastFingerprint = next
-      setQueueSnapshot([...getQueue()])
-    }
-    refresh()
-    const interval = setInterval(refresh, 1000)
-    return () => clearInterval(interval)
+    return subscribeIngestQueue((tasks) => setQueueSnapshot([...tasks]))
   }, [project])
 
   const sourceStatuses = useMemo(() => {

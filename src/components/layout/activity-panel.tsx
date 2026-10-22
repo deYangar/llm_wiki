@@ -3,7 +3,7 @@ import {
   ChevronUp, ChevronDown, Loader2, CheckCircle2, AlertCircle,
   FileText, Users, Lightbulb, BookOpen, GitMerge, BarChart3, HelpCircle, Layout,
   RotateCcw, X, Clock, TrendingUp, Target, Pause, Play,
-  ArrowUp, ArrowDown,
+  ArrowUp, ArrowDown, Trash2,
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { useAppDialog } from "@/stores/app-dialog-store"
@@ -14,16 +14,20 @@ import { normalizePath, getFileName, isAbsolutePath } from "@/lib/path-utils"
 import {
   getQueue,
   getQueueSummary,
-  queueFingerprint,
   retryTask,
   retryAllStoppedTasks,
   retryTasks,
   cancelTask,
   cancelTasks,
   cancelAllTasks,
+  removeTask,
+  removeTasks,
+  hasActiveRun,
+  retainQueuedSelection,
   movePendingTask,
   pauseProcessing,
   resumeProcessing,
+  subscribeIngestQueue,
   type IngestTask,
 } from "@/lib/ingest-queue"
 import {
@@ -98,18 +102,10 @@ export function ActivityPanel() {
   const runningCount = items.filter((i) => i.status === "running").length
   const hasItems = items.length > 0
 
-  // Poll queue state. Fingerprint-gated: only re-render when something
-  // the panel actually displays changed, instead of forcing a full-panel
-  // reconcile on every 1s tick across a multi-thousand-task queue.
+  // Queue changes are pushed by the queue module. Avoid cloning and rendering
+  // the entire queue every second while large imports are idle.
   useEffect(() => {
-    let lastFingerprint = queueFingerprint()
-    const interval = setInterval(() => {
-      const next = queueFingerprint()
-      if (next === lastFingerprint) return
-      lastFingerprint = next
-      setQueueTasks([...getQueue()])
-    }, 1000)
-    return () => clearInterval(interval)
+    return subscribeIngestQueue((tasks) => setQueueTasks([...tasks]))
   }, [])
 
   useEffect(() => {
@@ -164,6 +160,26 @@ export function ActivityPanel() {
     })
   }, [project, selectedTaskIds])
 
+  const syncAfterRemoval = useCallback(() => {
+    const remaining = [...getQueue()]
+    setSelectedTaskIds((current) => retainQueuedSelection(current, remaining))
+    setQueueTasks(remaining)
+  }, [])
+
+  const handleRemoveSelected = useCallback(async () => {
+    if (!project) return
+    const removable = queueTasks.filter(
+      (task) => selectedTaskIds.has(task.id) && isRemovable(task),
+    )
+    if (removable.length === 0) return
+    if (!(await appDialog.confirm({
+      message: t("activity.removeSelectedConfirm", { count: removable.length }),
+      variant: "destructive",
+    }))) return
+    await removeTasks(removable.map((task) => task.id))
+    syncAfterRemoval()
+  }, [appDialog, project, queueTasks, selectedTaskIds, syncAfterRemoval, t])
+
   const handleMoveTask = useCallback((taskId: string, direction: "up" | "down") => {
     void movePendingTask(taskId, direction).then(() => setQueueTasks([...getQueue()]))
   }, [])
@@ -181,6 +197,11 @@ export function ActivityPanel() {
     if (!project) return
     cancelTask(taskId)
   }, [project])
+
+  const handleIngestRemove = useCallback((taskId: string) => {
+    if (!project) return
+    void removeTask(taskId).then(syncAfterRemoval)
+  }, [project, syncAfterRemoval])
 
   const handleCancelAll = useCallback(async () => {
     if (!project) return
@@ -356,6 +377,12 @@ export function ActivityPanel() {
                   >
                     {t("activity.cancelSelected")}
                   </button>
+                  <button
+                    onClick={handleRemoveSelected}
+                    className="rounded px-1.5 py-0.5 text-destructive hover:bg-destructive/10"
+                  >
+                    {t("common.remove")}
+                  </button>
                 </>
               )}
             </div>
@@ -445,7 +472,7 @@ export function ActivityPanel() {
 
           {/* Queue tasks */}
           {visibleQueueTasks.map((task) => (
-            <QueueRow key={task.id} task={task} selected={selectedTaskIds.has(task.id)} onSelect={toggleTaskSelection} onRetry={handleIngestRetry} onCancel={handleIngestCancel} onMove={handleMoveTask} />
+            <QueueRow key={task.id} task={task} selected={selectedTaskIds.has(task.id)} onSelect={toggleTaskSelection} onRetry={handleIngestRetry} onCancel={handleIngestCancel} onRemove={handleIngestRemove} onMove={handleMoveTask} />
           ))}
           {orderedQueueTasks.length > visibleQueueTasks.length && (
             <div className="border-b border-border/50 px-3 py-2 text-center text-[10px] text-muted-foreground">
@@ -481,12 +508,19 @@ export function ActivityPanel() {
   )
 }
 
-function QueueRow({ task, selected, onSelect, onRetry, onCancel, onMove }: {
+/** Stopped, and its run has already released the worker slot. */
+function isRemovable(task: IngestTask): boolean {
+  return (task.status === "failed" || task.status === "cancelled") &&
+    !hasActiveRun(task.id)
+}
+
+function QueueRow({ task, selected, onSelect, onRetry, onCancel, onRemove, onMove }: {
   task: IngestTask
   selected: boolean
   onSelect: (id: string) => void
   onRetry: (id: string) => void
   onCancel: (id: string) => void
+  onRemove: (id: string) => void
   onMove: (id: string, direction: "up" | "down") => void
 }) {
   const { t } = useTranslation()
@@ -525,6 +559,15 @@ function QueueRow({ task, selected, onSelect, onRetry, onCancel, onMove }: {
               title={t("common.retry")}
             >
               <RotateCcw className="h-3 w-3" />
+            </button>
+          )}
+          {isRemovable(task) && (
+            <button
+              onClick={() => onRemove(task.id)}
+              className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
+              title={t("common.remove")}
+            >
+              <Trash2 className="h-3 w-3" />
             </button>
           )}
           {task.status === "pending" && (

@@ -77,16 +77,8 @@ const INGEST_ANALYSIS_TOKENS_MAX = 16_384
 const INGEST_ANALYSIS_CHARS_PER_OUTPUT_TOKEN = 2.5
 const REVIEW_STAGE_MIN_SIGNAL_CHARS = 10_000
 const REVIEW_STAGE_MIN_FILE_BLOCKS = 4
+const WIKI_INDEX_PROMPT_MAX_CHARS = 32_000
 const AGGREGATE_WIKI_PATHS = ["wiki/index.md", "wiki/overview.md", "wiki/log.md"] as const
-
-export class NonRetryableIngestError extends Error {
-  readonly nonRetryable = true
-
-  constructor(message: string) {
-    super(message)
-    this.name = "NonRetryableIngestError"
-  }
-}
 
 function appendSavedImageRefsForCaption(content: string, images: SavedImage[]): string {
   if (images.length === 0) return content
@@ -109,7 +101,7 @@ function ingestAnalysisRequest(config: LlmConfig): {
         ...requested,
         budgetTokens: Math.max(
           1_024,
-          Math.min(requested.budgetTokens ?? 0, INGEST_ANALYSIS_TOKENS_MAX),
+          Math.min(requested.budgetTokens ?? 0, computeIngestGenerationMaxTokens(config.maxContextSize)),
         ),
       }
     : requested
@@ -1374,7 +1366,7 @@ async function autoIngestImpl(
         "(including automatic continuation attempts). " +
         "Wiki pages were not generated from the incomplete analysis. Split the source or use a model with a larger output limit."
       activity.updateItem(activityId, { status: "error", detail: message })
-      throw new NonRetryableIngestError(message)
+      throw new Error(message)
     }
   }
 
@@ -1546,6 +1538,7 @@ async function autoIngestImpl(
     signal,
     activityId,
     onFileWritten,
+    { summaryAlreadyWritten: previouslyCompletedPaths.includes(sourceSummaryPath) },
   )
   throwIfIngestAborted(signal, activityId)
   const writtenPaths = uniqueNormalizedPaths([
@@ -1624,6 +1617,7 @@ async function autoIngestImpl(
           signal,
           activityId,
           onFileWritten,
+          { summaryAlreadyWritten: writtenPaths.includes(sourceSummaryPath) },
         )
         // Match successful writes against the paths requested from the model,
         // not the final on-disk paths. writeFileBlocks may legitimately rewrite
@@ -1665,9 +1659,13 @@ async function autoIngestImpl(
       writtenPaths.push("wiki/index.md")
       onFileWritten?.("wiki/index.md")
     }
+    if (await updateWikiOverviewDeterministically(pp, writtenPaths)) {
+      writtenPaths.push("wiki/overview.md")
+      onFileWritten?.("wiki/overview.md")
+    }
   } catch (err) {
     writeWarnings.push(
-      `Deterministic index update failed: ${err instanceof Error ? err.message : String(err)}`,
+      `Deterministic aggregate update failed: ${err instanceof Error ? err.message : String(err)}`,
     )
   }
 
@@ -2404,6 +2402,72 @@ async function updateWikiIndexDeterministically(
   return true
 }
 
+const OVERVIEW_RECENT_START = "<!-- llm-wiki:recent-start -->"
+const OVERVIEW_RECENT_END = "<!-- llm-wiki:recent-end -->"
+
+async function updateWikiOverviewDeterministically(
+  projectPath: string,
+  writtenPaths: string[],
+): Promise<boolean> {
+  const candidates = Array.from(new Set(writtenPaths.map(normalizePath))).filter((path) =>
+    path.startsWith("wiki/")
+      && path.endsWith(".md")
+      && !AGGREGATE_WIKI_PATHS.includes(path as (typeof AGGREGATE_WIKI_PATHS)[number]),
+  )
+  if (candidates.length === 0) return false
+
+  const overviewPath = `${projectPath}/wiki/overview.md`
+  const overview = await readFile(overviewPath).catch(() => [
+    "---",
+    "type: overview",
+    "title: Project Overview",
+    "tags: []",
+    "related: []",
+    "---",
+    "",
+    "# Overview",
+    "",
+  ].join("\n"))
+  const additions: string[] = []
+  for (const path of candidates) {
+    const target = path.replace(/^wiki\//, "").replace(/\.md$/i, "")
+    const content = await readFile(`${projectPath}/${path}`).catch(() => "")
+    const parsed = parseFrontmatter(content)
+    const title = typeof parsed.frontmatter?.title === "string"
+      ? parsed.frontmatter.title.trim()
+      : getFileName(path).replace(/\.md$/i, "")
+    additions.push(`- [[${target}]] — ${title}`)
+  }
+  const updated = updateBoundedOverviewRecentSection(overview, additions)
+  if (updated === overview) return false
+  await writeFile(overviewPath, updated)
+  return true
+}
+
+export function updateBoundedOverviewRecentSection(
+  overview: string,
+  additions: string[],
+): string {
+  const start = overview.indexOf(OVERVIEW_RECENT_START)
+  const end = overview.indexOf(OVERVIEW_RECENT_END)
+  const existing = start >= 0 && end > start
+    ? overview.slice(start + OVERVIEW_RECENT_START.length, end)
+      .split("\n")
+      .filter((line) => /^-\s+/.test(line))
+    : []
+  const recent = Array.from(new Set([...additions, ...existing])).slice(0, 50)
+  const block = [
+    OVERVIEW_RECENT_START,
+    "## Recently Updated",
+    ...recent,
+    OVERVIEW_RECENT_END,
+  ].join("\n")
+  if (start >= 0 && end > start) {
+    return `${overview.slice(0, start)}${block}${overview.slice(end + OVERVIEW_RECENT_END.length)}`
+  }
+  return `${overview.trimEnd()}\n\n${block}\n`
+}
+
 function normalizeIndexTarget(target: string): string {
   return normalizePath(target)
     .replace(/^wiki\//i, "")
@@ -2688,6 +2752,22 @@ function setOrAppendFrontmatterDate(payload: string, key: "created" | "updated",
   return `${payload.trimEnd()}\n${key}: ${date}`
 }
 
+function sourceSummaryBlockWarning(
+  path: string,
+  sourceSummaryPath: string | undefined,
+  summaryWritten: boolean,
+): string | null {
+  const normalized = normalizePath(path)
+  if (!sourceSummaryPath || !normalized.toLowerCase().startsWith("wiki/sources/")) return null
+  if (normalized !== sourceSummaryPath) {
+    return `Ignored unexpected source summary "${path}"; only "${sourceSummaryPath}" may describe the current source.`
+  }
+  if (summaryWritten) {
+    return `Ignored duplicate source summary "${path}"; the first successful summary was preserved.`
+  }
+  return null
+}
+
 async function writeFileBlocks(
   projectPath: string,
   text: string,
@@ -2697,7 +2777,15 @@ async function writeFileBlocks(
   signal?: AbortSignal,
   activityId?: string,
   onFileWritten?: (relativePath: string) => void,
-  opts?: { summaryIsDeterministic?: boolean },
+  opts?: {
+    /** Caller already wrote the sources summary in this run — extra FILE
+     * blocks for it are dropped instead of overwriting the fresh copy
+     * (upstream b03508f behavior). */
+    summaryAlreadyWritten?: boolean
+    /** Summary is a single-source deterministic product (qa-split) —
+     * overwrite wholesale instead of merge-locking stale titles (F2). */
+    summaryIsDeterministic?: boolean
+  },
 ): Promise<{
   writtenPaths: string[]
   completedInputPaths: string[]
@@ -2708,6 +2796,7 @@ async function writeFileBlocks(
   const { blocks, warnings: parseWarnings, truncatedPaths } = parseFileBlocks(text)
   const warnings = [...parseWarnings]
   const writtenPaths: string[] = []
+  let summaryWritten = opts?.summaryAlreadyWritten ?? false
   // Keep the model-requested path separate from the final path. Path
   // canonicalization may rename the file after parsing, but callers that
   // repair a specific FILE block still need to know that request succeeded.
@@ -2728,9 +2817,11 @@ async function writeFileBlocks(
 
   for (const { path: rawRelativePath, content: rawContent } of blocks) {
     throwIfIngestAborted(signal, activityId)
-    let relativePath = rawRelativePath
-    if (sourceSummaryPath && relativePath.startsWith("wiki/sources/")) {
-      relativePath = sourceSummaryPath
+    let relativePath = normalizePath(rawRelativePath)
+    const summaryWarning = sourceSummaryBlockWarning(relativePath, sourceSummaryPath, summaryWritten)
+    if (summaryWarning) {
+      warnings.push(summaryWarning)
+      continue
     }
     if (isAppManagedAggregatePath(relativePath)) {
       warnings.push(
@@ -2799,6 +2890,14 @@ async function writeFileBlocks(
         warnings.push(msg)
         continue
       }
+    }
+
+    // Schema routing can move another typed page into wiki/sources/, so
+    // enforce the same boundary again on its final destination.
+    const routedSummaryWarning = sourceSummaryBlockWarning(relativePath, sourceSummaryPath, summaryWritten)
+    if (routedSummaryWarning) {
+      warnings.push(routedSummaryWarning)
+      continue
     }
 
     // Language guard: reject individual FILE blocks whose body contradicts
@@ -2902,6 +3001,7 @@ async function writeFileBlocks(
         await writeFile(fullPath, toWrite)
       }
       writtenPaths.push(relativePath)
+      if (relativePath === sourceSummaryPath) summaryWritten = true
       completedInputPaths.push(rawRelativePath)
       onFileWritten?.(relativePath)
     } catch (err) {
@@ -2912,12 +3012,17 @@ async function writeFileBlocks(
     }
   }
 
+  const repairableTruncatedPaths = truncatedPaths.filter((path) => {
+    const warning = sourceSummaryBlockWarning(path, sourceSummaryPath, summaryWritten)
+    if (warning) warnings.push(warning)
+    return !warning
+  })
   return {
     writtenPaths,
     completedInputPaths,
     warnings,
     hardFailures,
-    truncatedPaths,
+    truncatedPaths: repairableTruncatedPaths,
   }
 }
 
@@ -3012,6 +3117,15 @@ const ENTITY_ANALYSIS_RULES = [
   "Canonical naming priority: reuse the exact title of an existing wiki page first; otherwise preserve the source spelling. Widely used localized names may be recorded as aliases, but never invent or phonetically guess a name.",
 ] as const
 
+const ANALYSIS_OUTPUT_LIMITS = [
+  "HARD OUTPUT LIMITS: a response exceeding these limits is invalid.",
+  "- Key Entities: at most 25 candidates, one compact line per candidate, no table.",
+  "- Key Concepts: at most 25 entries.",
+  "- Main Arguments & Findings: at most 15 entries.",
+  "- Connections, Contradictions, and Recommendations: at most 8 entries per section.",
+  "- Total response: at most 16,000 characters. Prefer high-value reusable knowledge over exhaustive enumeration.",
+] as const
+
 const ENTITY_PAGE_RULES = [
   "Create a standalone entity page only for a candidate explicitly marked `Page-worthy: yes`. Keep other mentions as plain prose in the source summary, or as wikilinks only when the target already exists in the current wiki index.",
   "Canonical naming priority: reuse the exact title of an existing wiki page first; otherwise preserve the source spelling. A widely used localized name may be an alias, but never invent or phonetically guess a name.",
@@ -3042,6 +3156,7 @@ export function buildAnalysisPrompt(
     languageRule(sourceContent),
     "",
     "Your analysis should cover:",
+    ...ANALYSIS_OUTPUT_LIMITS,
     "",
     "## Key Entities",
     "List candidate named people, organizations, products, datasets, and tools. For each:",
@@ -3085,7 +3200,7 @@ export function buildAnalysisPrompt(
       ? `## Project Schema (page types available — map source content to schema-defined types when it fits)\n${schema}`
       : "",
     purpose ? `## Wiki Purpose (for context)\n${purpose}` : "",
-    index ? `## Current Wiki Index (for checking existing content)\n${index}` : "",
+    index ? `## Current Wiki Index (for checking existing content)\n${boundWikiIndexForPrompt(index)}` : "",
   ].filter(Boolean).join("\n")
 }
 
@@ -3132,6 +3247,7 @@ export function buildGenerationPrompt(
     "## What to generate",
     "",
     `1. A source summary page at **${summaryPath}** (MUST use this exact path)`,
+    "Emit exactly one source summary FILE block. Do not create additional wiki/sources/ pages for works merely cited by the source; keep those citations in the summary or link to existing pages.",
     "2. Entity or schema-defined typed pages for key named things identified in the analysis. Prefer schema-defined directories when present; otherwise use wiki/entities/.",
     "3. Concept or schema-defined typed pages for key ideas, methods, techniques, and abstractions. Prefer schema-defined directories when present; otherwise use wiki/concepts/.",
     "4. A log entry for wiki/log.md (just the new entry to append, format: ## [YYYY-MM-DD] ingest | Title)",
@@ -3220,7 +3336,7 @@ export function buildGenerationPrompt(
     "  SEARCH: automated technical debt detection AI generated code | software quality metrics LLM code generation | static analysis tools agentic software development",
     "",
     purpose ? `## Wiki Purpose\n${purpose}` : "",
-    index ? `## Current Wiki Index (preserve all existing entries, add new ones)\n${index}` : "",
+    index ? `## Current Wiki Index (preserve all existing entries, add new ones)\n${boundWikiIndexForPrompt(index)}` : "",
     overview ? `## Current Overview (update this to reflect the new source)\n${overview}` : "",
     "",
     // ── OUTPUT FORMAT MUST BE THE LAST SECTION — models weight recent instructions highest ──
@@ -3311,7 +3427,7 @@ export function buildReviewSuggestionPrompt(
     "Return REVIEW blocks only. Do not output FILE blocks. Do not wrap the response in markdown fences.",
     "",
     purpose ? `## Wiki Purpose\n${purpose}` : "",
-    index ? `## Current Wiki Index\n${trimLongText(index, indexCap)}` : "",
+    index ? `## Current Wiki Index\n${boundWikiIndexForPrompt(index, indexCap)}` : "",
     "",
     `## Source\n${sourceIdentity}`,
     "",
@@ -3606,6 +3722,23 @@ function trimLongText(text: string, maxChars: number): string {
   return `${text.slice(0, maxChars).trimEnd()}\n\n[...trimmed for prompt budget...]`
 }
 
+export function boundWikiIndexForPrompt(
+  index: string,
+  maxChars = WIKI_INDEX_PROMPT_MAX_CHARS,
+): string {
+  const safeMax = Math.max(1_000, Math.floor(maxChars))
+  if (index.length <= safeMax) return index
+  const marker = "\n\n[...middle of wiki index omitted for prompt budget...]\n\n"
+  const available = Math.max(1, safeMax - marker.length)
+  const headLength = Math.floor(available * 0.6)
+  const tailLength = available - headLength
+  const rawHead = index.slice(0, headLength)
+  const rawTail = index.slice(-tailLength)
+  const head = (rawHead.includes("\n") ? rawHead.replace(/\n[^\n]*$/, "") : rawHead).trimEnd()
+  const tail = (rawTail.includes("\n") ? rawTail.replace(/^[^\n]*\n?/, "") : rawTail).trimStart()
+  return `${head}${marker}${tail}`
+}
+
 function trimInlineStatus(text: string, maxChars = 240): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars).trimEnd()}...`
 }
@@ -3772,6 +3905,7 @@ export function buildChunkAnalysisSystemPrompt(
     languageRule(sourceContent),
     "",
     "Output exactly two markdown sections:",
+    "HARD OUTPUT LIMITS: each section must stay within 60 lines; list at most 25 entities and 25 concepts; never use a table for entity enumeration.",
     "",
     "## Chunk Analysis",
     "- Concise summary of the main chunk",
@@ -3792,7 +3926,7 @@ export function buildChunkAnalysisSystemPrompt(
     "Stable project context follows. It changes rarely and should be treated as background:",
     purpose ? `## Wiki Purpose\n${purpose}` : "",
     schema ? `## Wiki Schema\n${schema}` : "",
-    index ? `## Current Wiki Index\n${trimLongText(index, 40_000)}` : "",
+    index ? `## Current Wiki Index\n${boundWikiIndexForPrompt(index)}` : "",
   ].filter(Boolean).join("\n")
 }
 
@@ -4316,7 +4450,7 @@ export async function startIngest(
     "",
     purpose ? `## Wiki Purpose\n${purpose}` : "",
     schema ? `## Wiki Schema\n${schema}` : "",
-    index ? `## Current Wiki Index\n${index}` : "",
+    index ? `## Current Wiki Index\n${boundWikiIndexForPrompt(index)}` : "",
   ]
     .filter(Boolean)
     .join("\n\n")
@@ -4406,12 +4540,13 @@ async function executeIngestWritesImpl(
     userGuidance ? `Additional guidance: ${userGuidance}` : "",
     "",
     schema ? `## Wiki Schema\n${schema}` : "",
-    index ? `## Current Wiki Index\n${index}` : "",
+    index ? `## Current Wiki Index\n${boundWikiIndexForPrompt(index)}` : "",
     activeSourceIdentity && activeSourceSummaryPath
       ? [
           `## Source File`,
           `The original source file is: **${activeSourceIdentity}**`,
           `If you generate a source summary page, it MUST use this exact path: **${activeSourceSummaryPath}**.`,
+          "Emit at most one source summary FILE block. Do not generate other wiki/sources/ pages for cited works.",
           `Every page generated from this source MUST include "${activeSourceIdentity}" in its frontmatter \`sources\` field.`,
         ].join("\n")
       : "",
@@ -4474,18 +4609,19 @@ async function executeIngestWritesImpl(
   )
 
   const writtenPaths: string[] = []
+  const summaryWarnings: string[] = []
+  let summaryWritten = false
   const matches = accumulated.matchAll(FILE_BLOCK_REGEX)
 
   for (const match of matches) {
-    let relativePath = match[1].trim()
+    const relativePath = normalizePath(match[1].trim())
     let content = match[2]
 
     if (!relativePath) continue
-    if (
-      activeSourceSummaryPath &&
-      relativePath.startsWith("wiki/sources/")
-    ) {
-      relativePath = activeSourceSummaryPath
+    const summaryWarning = sourceSummaryBlockWarning(relativePath, activeSourceSummaryPath ?? undefined, summaryWritten)
+    if (summaryWarning) {
+      summaryWarnings.push(summaryWarning)
+      continue
     }
 
     if (!isSafeIngestPath(relativePath) || isAppManagedAggregatePath(relativePath)) {
@@ -4516,9 +4652,15 @@ async function executeIngestWritesImpl(
         await writeFile(fullPath, content)
       }
       writtenPaths.push(fullPath)
+      if (relativePath === activeSourceSummaryPath) summaryWritten = true
     } catch (err) {
       console.error(`Failed to write ${fullPath}:`, err)
     }
+  }
+
+  if (summaryWarnings.length > 0) {
+    await appendIngestWarningLog(pp, activeSourceIdentity ?? "", summaryWarnings)
+    getStore().addMessage("system", `Ingest warnings:\n${summaryWarnings.map((warning) => `- ${warning}`).join("\n")}`)
   }
 
   if (writtenPaths.length > 0) {

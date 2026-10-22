@@ -126,6 +126,15 @@ describe("reasoning capabilities", () => {
       .toEqual({ mode: "auto" })
   })
 
+  it("supports off and maximum effort for future OpenAI model families", () => {
+    expect(resolveReasoningCapabilities(config("openai", "gpt-6-luna")).modes)
+      .toEqual(["auto", "off", "low", "medium", "high", "max"])
+    // 本地 off 档体系：非推理模型也提供 off（发送时省略字段），使已保存的
+    // off 设置在模型切换后不被规范化掉——与上游 AUTO_ONLY 设计有意不同。
+    expect(resolveReasoningCapabilities(config("openai", "gpt-4.1")).modes)
+      .toEqual(["auto", "off"])
+  })
+
   it("normalizes custom budgets to positive integer values", () => {
     const cfg = config("anthropic", "claude-sonnet-4-5")
     expect(normalizeReasoningForProvider(cfg, { mode: "custom", budgetTokens: 2048.9 }))

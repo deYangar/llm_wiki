@@ -155,6 +155,20 @@ function localMineruApiBase(endpoint: string | undefined): string {
   return candidate.replace(/\/+$/, "")
 }
 
+/** Official V1 endpoints live under {base}/v1. Users often paste an endpoint
+ * that already carries the /v1 suffix — don't double it (upstream 7fc668b). */
+function localV1ApiBase(base: string): string {
+  return /\/v1$/i.test(base) ? base : `${base}/v1`
+}
+
+function urlOriginOrNull(url: string): string | null {
+  try {
+    return new URL(url).origin
+  } catch {
+    return null
+  }
+}
+
 // ── API calls ──
 
 async function mineruHeaders(token: string): Promise<HeadersInit> {
@@ -795,7 +809,7 @@ export async function detectLocalMineruProtocol(
   let protocol: LocalMineruProtocol = "tasks"
   try {
     const res = await httpFetch(
-      `${base}/v1/health`,
+      `${localV1ApiBase(base)}/health`,
       localMineruRequestInit(config.localToken, { signal }),
     )
     if (res.ok) {
@@ -883,10 +897,15 @@ async function parseWithLocalMineruV1(
 ): Promise<MineruExtractedMarkdown> {
   const httpFetch = await getHttpFetch()
   const base = localMineruApiBase(config.localEndpoint)
-  const tier = (config.localTier as string) || "standard"
+  // Official V1 parse jobs only accept tier "standard" | "advanced". The
+  // legacy config domain (flash | basic | standard) belongs to the community
+  // tasks protocol; sending it here would be rejected with a 400. Anything
+  // the settings UI can produce today therefore resolves to "standard",
+  // matching the behavior verified against real V1 deployments.
+  const tier = (config.localTier as string) === "advanced" ? "advanced" : "standard"
 
   const healthRes = await httpFetch(
-    `${base}/v1/health`,
+    `${localV1ApiBase(base)}/health`,
     localV1RequestInit(config.localToken, { signal }),
   )
   if (!healthRes.ok) {
@@ -907,7 +926,7 @@ async function parseWithLocalMineruV1(
   onProgress?.("Uploading to local MinerU (V1)...")
   const displayName = fileName.length > 120 ? `${contentSha.slice(0, 8)}…${fileName.slice(-100)}` : fileName
   const initRes = await httpFetch(
-    `${base}/v1/uploads`,
+    `${localV1ApiBase(base)}/uploads`,
     localV1RequestInit(config.localToken, {
       method: "POST",
       signal,
@@ -936,9 +955,12 @@ async function parseWithLocalMineruV1(
     }
     let putUrl = initiated.upload_url
     if (putUrl.startsWith("/")) putUrl = base + putUrl
+    // A cross-origin upload_url is server-controlled but foreign; sending
+    // the local API token there would leak it (upstream 7fc668b property).
+    const sameOriginPut = urlOriginOrNull(putUrl) === urlOriginOrNull(base)
     const putRes = await httpFetch(
       putUrl,
-      localV1RequestInit(config.localToken, {
+      localV1RequestInit(sameOriginPut ? config.localToken : undefined, {
         method: "PUT",
         signal,
         headers: initiated.upload_headers ?? {},
@@ -949,7 +971,7 @@ async function parseWithLocalMineruV1(
       throw new Error(`Local MinerU (V1) byte upload failed: HTTP ${putRes.status}`)
     }
     const completeRes = await httpFetch(
-      `${base}/v1/uploads/${encodeURIComponent(initiated.id)}/complete`,
+      `${localV1ApiBase(base)}/uploads/${encodeURIComponent(initiated.id)}/complete`,
       localV1RequestInit(config.localToken, {
         method: "POST",
         signal,
@@ -967,7 +989,7 @@ async function parseWithLocalMineruV1(
 
   // Create the parse job; the zip artifact carries the image assets.
   const jobCreateRes = await httpFetch(
-    `${base}/v1/parse/jobs`,
+    `${localV1ApiBase(base)}/parse/jobs`,
     localV1RequestInit(config.localToken, {
       method: "POST",
       signal,
@@ -1000,7 +1022,7 @@ async function parseWithLocalMineruV1(
   while (Date.now() - start < timeoutMs) {
     throwIfAborted(signal)
     const res = await httpFetch(
-      `${base}/v1/parse/jobs/${encodeURIComponent(jobId)}`,
+      `${localV1ApiBase(base)}/parse/jobs/${encodeURIComponent(jobId)}`,
       localV1RequestInit(config.localToken, { signal }),
     )
     if (!res.ok) {
@@ -1034,7 +1056,7 @@ async function parseWithLocalMineruV1(
   onProgress?.("Downloading parsed result...")
   if (outputs.zip) {
     const zipRes = await httpFetch(
-      `${base}/v1/files/${encodeURIComponent(outputs.zip.file_id)}/content`,
+      `${localV1ApiBase(base)}/files/${encodeURIComponent(outputs.zip.file_id)}/content`,
       localV1RequestInit(config.localToken, { signal }),
     )
     if (!zipRes.ok) {
@@ -1044,7 +1066,7 @@ async function parseWithLocalMineruV1(
   }
   if (outputs.markdown) {
     const mdRes = await httpFetch(
-      `${base}/v1/files/${encodeURIComponent(outputs.markdown.file_id)}/content`,
+      `${localV1ApiBase(base)}/files/${encodeURIComponent(outputs.markdown.file_id)}/content`,
       localV1RequestInit(config.localToken, { signal }),
     )
     if (!mdRes.ok) {
@@ -1496,7 +1518,7 @@ export async function testMineruConnection(
     const protocol = await detectLocalMineruProtocol(config)
     if (protocol === "v1") {
       const res = await httpFetch(
-        `${base}/v1/health`,
+        `${localV1ApiBase(base)}/health`,
         localV1RequestInit(config.localToken),
       )
       if (!res.ok) {

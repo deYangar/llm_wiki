@@ -854,6 +854,23 @@ describe("testMineruConnection", () => {
     )
   })
 
+  it("accepts a configured endpoint that already ends in /v1", async () => {
+    __mineruTest.clearLocalProtocolCache()
+    mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.10" }))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.10" }))
+
+    await expect(testMineruConnection("", {
+      backend: "local",
+      localEndpoint: "http://127.0.0.1:8000/v1/",
+    })).resolves.toBeUndefined()
+    // detect probe + connection verify, both normalized — never /v1/v1/health.
+    expect(mockHttpFetch.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:8000/v1/health",
+      "http://127.0.0.1:8000/v1/health",
+    ])
+  })
+
   it("rejects a 200 response that is not a healthy official MinerU service", async () => {
     mockHttpFetch.mockResolvedValueOnce(jsonResponse({ status: "unhealthy" }))
 
@@ -1166,6 +1183,45 @@ describe("local V1 protocol (mineru-kit api-server)", () => {
     expect(jobCreate.tier).toBe("standard")
     expect(jobCreate.output_formats).toContain("zip")
     expect(jobCreate.files[0].source).toEqual({ type: "file_id", file_id: "file-9" })
+  })
+
+  it("does not leak the local API token to a cross-origin upload URL", async () => {
+    __mineruTest.primeLocalProtocolCache(v1Config.localEndpoint, "v1")
+    mockHttpFetch
+      // health verify inside parseWithLocalMineruV1
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.11" }))
+      // upload init → pending with a FOREIGN upload_url
+      .mockResolvedValueOnce(jsonResponse({
+        id: "upload-x",
+        upload_url: "https://objects.example/upload-x",
+        upload_headers: { "X-Upload-Token": "signed" },
+        status: "pending",
+      }))
+      // byte PUT to the foreign origin
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "completed", file: { id: "file-x" } }))
+      .mockResolvedValueOnce(jsonResponse({ job_id: "job-x", status: "queued" }))
+      .mockResolvedValueOnce(jsonResponse({
+        job_id: "job-x",
+        status: "completed",
+        files: [{ status: "completed", output_files: { zip: { file_id: "zip-x" } } }],
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "# V1 result" }))
+
+    const result = await parseWithMineru(
+      { ...v1Config, localToken: "local-secret" },
+      "/docs/scan.pdf",
+    )
+    expect(result).toBe("# V1 result")
+
+    // The foreign PUT carries only the server-signed headers — no token.
+    const put = mockHttpFetch.mock.calls.find((call) => call[1]?.method === "PUT")
+    expect(put?.[0]).toBe("https://objects.example/upload-x")
+    expect(put?.[1]?.headers).toEqual({ "X-Upload-Token": "signed" })
+    // Same-origin calls keep the bearer token.
+    for (const call of mockHttpFetch.mock.calls.filter((c) => String(c[0]).endsWith("/v1/health"))) {
+      expect(call[1]?.headers).toEqual({ Authorization: "Bearer local-secret" })
+    }
   })
 
   it("honors the sha256 dedupe hit without uploading bytes", async () => {
