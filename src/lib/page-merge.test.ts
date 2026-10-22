@@ -98,7 +98,7 @@ describe("mergePageContent — corrected single-source replacement", () => {
     expect(out).toContain("created: 2025-01-01")
     expect(out).toContain("updated: 2026-04-30")
     expect(out).toMatch(/tags:\s*\[\s*"manual",\s*"generated"\s*\]/)
-    expect(out).toMatch(/related:\s*\[\s*"kept-link",\s*"new-link"\s*\]/)
+    expect(out).toMatch(/related:\s*\[\s*"\[\[kept-link\]\]",\s*"\[\[new-link\]\]"\s*\]/)
     expect(backup).toHaveBeenCalledWith(existing)
     expect(merger).not.toHaveBeenCalled()
   })
@@ -165,7 +165,7 @@ describe("mergePageContent — LLM merge", () => {
     // Array fields are unions
     expect(out).toMatch(/sources:\s*\[\s*"doc-A.pdf",\s*"doc-B.pdf"\s*\]/)
     expect(out).toMatch(/tags:\s*\[\s*"microbiology",\s*"ebpr",\s*"paos",\s*"propionate"\s*\]/)
-    expect(out).toMatch(/related:\s*\[\s*"dpao",\s*"vfa",\s*"pha"\s*\]/)
+    expect(out).toMatch(/related:\s*\[\s*"\[\[dpao\]\]",\s*"\[\[vfa\]\]",\s*"\[\[pha\]\]"\s*\]/)
   })
 
   it("preserves locked title even if LLM rewrote it", async () => {

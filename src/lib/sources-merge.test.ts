@@ -15,6 +15,7 @@ import { describe, it, expect } from "vitest"
 import {
   parseSources,
   writeSources,
+  writeFrontmatterArray,
   mergeSourcesLists,
   mergeSourcesIntoContent,
   mergeArrayFieldsIntoContent,
@@ -447,9 +448,12 @@ describe("mergeArrayFieldsIntoContent", () => {
     ])
     expect(parseFrontmatterArray(merged, "sources")).toEqual(["a.md", "b.md"])
     expect(parseFrontmatterArray(merged, "tags")).toEqual(["old-tag", "new-tag"])
+    // related normalizes to the schema-canonical wrapped form `[[slug]]`
+    // (B1, 2026-10-22): bare slugs from the incoming page are re-wrapped,
+    // so the merged series reads uniformly.
     expect(parseFrontmatterArray(merged, "related")).toEqual([
-      "old-rel",
-      "new-rel",
+      "[[old-rel]]",
+      "[[new-rel]]",
     ])
     // Body always comes from incoming (no body merge here — that's
     // page-merge.ts's job).
@@ -507,5 +511,101 @@ describe("mergeArrayFieldsIntoContent", () => {
     const b = mergeArrayFieldsIntoContent(incoming, existing, ["sources"])
     expect(parseSources(b)).toEqual(parseSources(a))
     expect(b).toContain("new body")
+  })
+})
+
+// ── quote-aware inline arrays (2026-10-22 audit S3 / B1) ───────────
+//
+// Wikilink values ("[[锦天城]]") contain `]`. The pre-fix regex
+// `\[([^\]]*)\]` stopped at the first one, producing half-broken items
+// that union-dedup then preserved forever. These cases pin the scanner.
+
+describe("parseFrontmatterArray — inline arrays containing ] in values", () => {
+  it("extracts wikilink items whole instead of truncating at the inner ]", () => {
+    const page = WRAP('related: ["[[锦天城]]", "[[金杜]]"]')
+    expect(parseFrontmatterArray(page, "related")).toEqual(["[[锦天城]]", "[[金杜]]"])
+  })
+
+  it("extracts a lone wikilink item", () => {
+    expect(parseFrontmatterArray(WRAP('related: ["[[a]]"]'), "related")).toEqual(["[[a]]"])
+  })
+
+  it("keeps commas inside quoted values from splitting items", () => {
+    expect(parseFrontmatterArray(WRAP('tags: ["a, b", "c"]'), "tags")).toEqual(["a, b", "c"])
+  })
+
+  it("returns [] for an unclosed inline array instead of half-parsing", () => {
+    expect(parseFrontmatterArray(WRAP('related: ["[[a]]", "[[b]]"'), "related")).toEqual([])
+  })
+
+  it("still parses bare (unquoted) values with ] correctly", () => {
+    expect(parseFrontmatterArray(WRAP("related: [[[a]], [[b]]]"), "related")).toEqual([
+      "[[a]]",
+      "[[b]]",
+    ])
+  })
+})
+
+describe("writeFrontmatterArray — replacing arrays containing ] in values", () => {
+  it("replaces the full line with no trailing bytes left behind", () => {
+    const page = WRAP('related: ["[[a]]", "[[b]]"]\ntitle: X')
+    const rewritten = writeFrontmatterArray(page, "related", ["[[a]]"])
+    expect(parseFrontmatterArray(rewritten, "related")).toEqual(["[[a]]"])
+    // The old second item must not survive as garbage after the new array.
+    expect(rewritten).not.toContain('"[[b]]"]')
+    expect(rewritten).toContain("title: X")
+  })
+
+  it("replaces an unclosed inline array line wholesale", () => {
+    const page = WRAP('related: ["[[a]]", "[[b]]"\ntitle: X')
+    const rewritten = writeFrontmatterArray(page, "related", ["[[a]]"])
+    expect(parseFrontmatterArray(rewritten, "related")).toEqual(["[[a]]"])
+    expect(rewritten).toContain("title: X")
+    expect(rewritten).not.toContain("[[b]]")
+  })
+})
+
+describe("mergeArrayFieldsIntoContent — related wikilink normalization (B1)", () => {
+  it("collapses half-broken and whole duplicates of the same wikilink", () => {
+    // Real-world shape from the 2026-10-22 audit (锦天城 page): the broken
+    // `[[利柏特…` and the whole `[[利柏特…]]` were two distinct dedup keys.
+    const existing = WRAP(
+      'related: ["[[利柏特（沪主板再融资·2024）", "[[利柏特（沪主板再融资·2024）]]"]',
+    )
+    const incoming = WRAP('related: ["[[利柏特（沪主板再融资·2024）]]"]')
+    const merged = mergeArrayFieldsIntoContent(incoming, existing, ["related"])
+    expect(parseFrontmatterArray(merged, "related")).toEqual([
+      "[[利柏特（沪主板再融资·2024）]]",
+    ])
+  })
+
+  it("normalizes bare slugs and wrapped links to the wrapped form", () => {
+    const existing = WRAP("related: [利柏特（沪主板再融资·2024）]")
+    const incoming = WRAP('related: ["[[赛力斯（沪主板重大资产重组·2024）]]"]')
+    const merged = mergeArrayFieldsIntoContent(incoming, existing, ["related"])
+    expect(parseFrontmatterArray(merged, "related")).toEqual([
+      "[[利柏特（沪主板再融资·2024）]]",
+      "[[赛力斯（沪主板重大资产重组·2024）]]",
+    ])
+  })
+
+  it("repairs an existing half-broken link even when the incoming page has none", () => {
+    const existing = WRAP('related: ["[[锦天城]]", "[[金杜"]')
+    const incoming = WRAP("related: []")
+    const merged = mergeArrayFieldsIntoContent(incoming, existing, ["related"])
+    expect(parseFrontmatterArray(merged, "related")).toEqual(["[[锦天城]]", "[[金杜]]"])
+  })
+
+  it("leaves sources paths unwrapped (no wikilink policy for other fields)", () => {
+    const existing = WRAP("sources: [a/b.pdf]")
+    const incoming = WRAP("sources: [c/d.pdf]")
+    const merged = mergeArrayFieldsIntoContent(incoming, existing, ["sources"])
+    expect(parseFrontmatterArray(merged, "sources")).toEqual(["a/b.pdf", "c/d.pdf"])
+  })
+
+  it("stays a reference-stable no-op when incoming already equals the merged series", () => {
+    const existing = WRAP('related: ["[[a]]"]')
+    const incoming = WRAP('related: ["[[a]]"]')
+    expect(mergeArrayFieldsIntoContent(incoming, existing, ["related"])).toBe(incoming)
   })
 })

@@ -24,6 +24,50 @@
 // ─── Generic helpers (the implementation core) ────────────────────
 
 /**
+ * Scan an inline flow array starting at `openIndex` (which must point at
+ * the opening `[`) and return the index of the matching closing `]`, or -1
+ * if unclosed. Quote-aware: a `]` inside a quoted string does not close the
+ * array.
+ *
+ * Why a scanner and not `\[([^\]]*)\]`: wikilink values such as
+ * `"[[锦天城]]"` contain `]`, and the character-class regex stopped at the
+ * first one — `related: ["[[a]]", "[[b]]"]` parsed as the single half-broken
+ * item `"[[a`, and the rewrite left the trailing `]]", "[[b]]"]` bytes
+ * behind as garbage. The scanner treats bracket depth and string quoting
+ * the way YAML does.
+ */
+function findInlineArrayEnd(text: string, openIndex: number): number {
+  let quote: "\"" | "'" | null = null
+  let escaped = false
+  let depth = 0
+  for (let i = openIndex; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (quote === "\"" && ch === "\\") {
+      escaped = true
+      continue
+    }
+    if (quote === null && (ch === "\"" || ch === "'")) {
+      quote = ch
+      continue
+    }
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "[") depth++
+    else if (ch === "]") {
+      depth--
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
+/**
  * Extract a frontmatter array field by name. Handles both:
  *   inline form:    `name: ["a", "b"]` or `name: [a, b]`
  *   block form:     `name:\n  - a\n  - b`
@@ -54,10 +98,12 @@ export function parseFrontmatterArray(content: string, fieldName: string): strin
     return out
   }
 
-  const inlineRe = new RegExp(`^${escapedName}:\\s*\\[([^\\]]*)\\]`, "m")
-  const inline = fm.match(inlineRe)
-  if (!inline) return []
-  const body = inline[1].trim()
+  const open = fm.match(new RegExp(`^${escapedName}:\\s*\\[`, "m"))
+  if (!open || open.index === undefined) return []
+  const bracketIndex = open.index + open[0].length - 1
+  const endIndex = findInlineArrayEnd(fm, bracketIndex)
+  if (endIndex < 0) return [] // unclosed — treat as absent, don't half-parse
+  const body = fm.slice(bracketIndex + 1, endIndex).trim()
   if (body === "") return []
   return splitInlineArray(body)
 }
@@ -125,11 +171,26 @@ export function writeFrontmatterArray(
   const serialized = values.map(quoteInlineArrayValue).join(", ")
   const newLine = `${fieldName}: [${serialized}]`
 
-  // Replace inline form in place — preserves field ordering.
-  const inlineRe = new RegExp(`^${escapedName}:\\s*\\[[^\\]]*\\]`, "m")
-  if (inlineRe.test(fmBody)) {
-    const rewritten = fmBody.replace(inlineRe, newLine)
-    return `${openDelim}${rewritten}${closeDelim}${content.slice(fmMatch[0].length)}`
+  // Replace inline form in place — preserves field ordering. The extent of
+  // the old line is located with the quote-aware scanner (findInlineArrayEnd)
+  // so values containing `]` (wikilinks) are replaced whole instead of
+  // leaving trailing bytes behind.
+  const open = fmBody.match(new RegExp(`^${escapedName}:\\s*\\[`, "m"))
+  if (open && open.index !== undefined) {
+    const bracketIndex = open.index + open[0].length - 1
+    const endIndex = findInlineArrayEnd(fmBody, bracketIndex)
+    if (endIndex >= 0) {
+      const rewritten =
+        fmBody.slice(0, open.index) + newLine + fmBody.slice(endIndex + 1)
+      return `${openDelim}${rewritten}${closeDelim}${content.slice(fmMatch[0].length)}`
+    }
+    // Unclosed inline array (truncated emission): replace the whole broken
+    // line rather than appending and leaving the fragment in place.
+    const brokenLineRe = new RegExp(`^${escapedName}:\\s*\\[.*$`, "m")
+    if (brokenLineRe.test(fmBody)) {
+      const rewritten = fmBody.replace(brokenLineRe, newLine)
+      return `${openDelim}${rewritten}${closeDelim}${content.slice(fmMatch[0].length)}`
+    }
   }
 
   // Replace block form in place, normalized to inline form.
@@ -174,6 +235,28 @@ function mergeLists(
 }
 
 /**
+ * Per-field merge policies. `related` holds wikilinks whose canonical form
+ * is `[[title]]` (schema.md), but three shapes exist on disk and in LLM
+ * output: `[[title]]`, bare `title`, and the half-broken `[[title` left
+ * behind by the pre-scanner parser. Merging keyed on the raw string kept
+ * broken and whole duplicates side by side forever (锦天城/金杜 pages,
+ * 2026-10-22 audit). Normalizing to the bare title before dedup and
+ * re-wrapping on write collapses all three shapes into one `[[title]]`.
+ */
+function stripWikilinkWrapper(value: string): string {
+  let v = value.trim()
+  if (v.startsWith("[[")) v = v.slice(2)
+  if (v.endsWith("]]")) v = v.slice(0, -2)
+  return v.trim()
+}
+
+function rewrapWikilink(bare: string): string {
+  return `[[${bare}]]`
+}
+
+const WIKILINK_FIELDS = new Set(["related"])
+
+/**
  * Multi-field merge entry point. For each requested field, union the
  * existing-on-disk value with the LLM-emitted new value, and rewrite
  * the new content's frontmatter with the merged values.
@@ -195,10 +278,20 @@ export function mergeArrayFieldsIntoContent(
   let result = newContent
   let changed = false
   for (const field of fields) {
+    const isWikilink = WIKILINK_FIELDS.has(field)
+    const normalize = isWikilink ? stripWikilinkWrapper : (v: string) => v.trim()
+    const serialize = isWikilink ? rewrapWikilink : (v: string) => v
     const oldValues = parseFrontmatterArray(existingContent, field)
     if (oldValues.length === 0) continue // field absent in existing → nothing to preserve
     const newValues = parseFrontmatterArray(result, field)
-    const merged = mergeLists(oldValues, newValues)
+    const merged = mergeLists(
+      oldValues.map(normalize),
+      newValues.map(normalize),
+    ).map(serialize)
+    // no-op ⇔ the incoming page already carries exactly the merged series
+    // verbatim. Comparing against the raw (un-serialized) newValues keeps the
+    // rewrite alive when the incoming shape differs from the canonical one
+    // (e.g. existing `[[a` + incoming bare `a` still normalizes to `[[a]]`).
     if (
       merged.length === newValues.length &&
       merged.every((s, i) => s === newValues[i])
