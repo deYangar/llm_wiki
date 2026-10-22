@@ -54,3 +54,6 @@ pnpm-debug.log*
 tools/graph-pipeline-parity/graph-snapshot-dump.json
 tools/graph-pipeline-parity/parity-report.json
 __pycache__/
+
+# 工作底稿不入公开库（2026-10-22 拍板）——解析产物/问询函原件只留本地
+issue806-analysis/
