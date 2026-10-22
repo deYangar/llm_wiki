@@ -65,6 +65,7 @@ type SpawnPayload = Record<string, unknown> & {
   prompt: string
   isolateLocalConfig: boolean
   disableThinking: boolean
+  reasoningEffort: string
   timeoutMinutes?: number
   workingDirectory?: string
 }
@@ -248,6 +249,9 @@ export async function streamCodexCli(
       prompt: buildPrompt(messages),
       isolateLocalConfig: config.localCliIsolation === true,
       disableThinking,
+      // C.1（2026-10-22）：档位全集——Rust 侧映射 model_reasoning_effort
+      // （off→none、low/medium/high 直传、max→high 降级）。
+      reasoningEffort: reasoning.mode,
       timeoutMinutes: config.codexCliTimeoutMinutes,
       workingDirectory,
     }

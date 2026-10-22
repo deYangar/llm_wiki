@@ -619,7 +619,7 @@ describe("reasoning controls", () => {
     expect(body.thinking).toEqual({ type: "disabled" })
   })
 
-  it("adapts future OpenAI model ids and supports none/xhigh effort", () => {
+  it("adapts future OpenAI model ids; max degrades to high (no documented xhigh enum)", () => {
     const cfg = mkConfig({ provider: "openai", model: "gpt-6-luna" })
     const off = getProviderConfig(cfg).buildBody(
       [{ role: "user", content: "hi" }],
@@ -634,7 +634,7 @@ describe("reasoning controls", () => {
       [{ role: "user", content: "hi" }],
       { reasoning: { mode: "max" } },
     ) as Record<string, unknown>
-    expect(max.reasoning_effort).toBe("xhigh")
+    expect(max.reasoning_effort).toBe("high")
   })
 
   it("merges custom request fields without allowing core body overrides", () => {
@@ -1043,14 +1043,14 @@ describe("reasoning controls", () => {
     expect(body.temperature).toBeUndefined()
   })
 
-  it("omits unsupported reasoning off for Gemini 2.5 Pro", () => {
+  it("maps reasoning off to thinkingBudget 0 for Gemini 2.5 Pro (budget wire supports real off)", () => {
     const cfg = mkConfig({ provider: "google", model: "gemini-2.5-pro" })
     const body = getProviderConfig(cfg).buildBody(
       [{ role: "user", content: "hi" }],
       { reasoning: { mode: "off" } },
     ) as { generationConfig?: Record<string, unknown> }
 
-    expect(body.generationConfig?.thinkingConfig).toBeUndefined()
+    expect(body.generationConfig?.thinkingConfig).toEqual({ thinkingBudget: 0 })
   })
 
   it("uses adaptive thinking and effort for Claude 4.7+", () => {
@@ -1145,5 +1145,111 @@ describe("reasoning controls", () => {
     ) as Record<string, unknown>
 
     expect(body.reasoning_effort).toBeUndefined()
+  })
+})
+
+// ── C.3（2026-10-22 拍板后）：档位全集的 wire 映射 ────────────────────
+
+describe("reasoning ladder wire mapping (C.3, full mode set)", () => {
+  const build = (cfg: ReturnType<typeof mkConfig>, mode: string) =>
+    getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode } as never },
+    ) as Record<string, unknown>
+
+  it("Ark chat v3: ladder modes send thinking enabled + reasoning_effort", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "doubao-seed-2-1-pro-260915",
+      customEndpoint: "https://ark.cn-beijing.volces.com/api/v3",
+    })
+    expect(build(cfg, "low")).toEqual(
+      expect.objectContaining({ thinking: { type: "enabled" }, reasoning_effort: "low" }),
+    )
+    expect(build(cfg, "max")).toEqual(
+      expect.objectContaining({ thinking: { type: "enabled" }, reasoning_effort: "max" }),
+    )
+  })
+
+  it("Ark glm-5-3-flash: off maps to reasoning_effort minimal (no real disable)", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "glm-5-3-flash-260828",
+      customEndpoint: "https://ark.cn-beijing.volces.com/api/v3",
+    })
+    const body = build(cfg, "off")
+    expect(body.reasoning_effort).toBe("minimal")
+    expect(body.thinking).toBeUndefined()
+  })
+
+  it("Ark coding plan (Anthropic wire): ladder modes use output_config.effort", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "doubao-seed-2-1-lite",
+      customEndpoint: "https://ark.cn-beijing.volces.com/api/coding",
+      apiMode: "anthropic_messages",
+    })
+    expect(build(cfg, "high")).toEqual(
+      expect.objectContaining({
+        thinking: { type: "enabled" },
+        output_config: { effort: "high" },
+      }),
+    )
+  })
+
+  it("DeepSeek v4: low/medium send reasoning_effort alongside thinking enabled", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "deepseek-v4",
+      customEndpoint: "https://api.deepseek.com/v1",
+    })
+    expect(build(cfg, "low")).toEqual(
+      expect.objectContaining({ thinking: { type: "enabled" }, reasoning_effort: "low" }),
+    )
+  })
+
+  it("BigModel GLM: ladder modes map to thinking enabled (no effort ladder)", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "GLM-5.3-Flash",
+      customEndpoint: "https://open.bigmodel.cn/api/paas/v4",
+    })
+    expect(build(cfg, "high")).toEqual(
+      expect.objectContaining({ thinking: { type: "enabled" } }),
+    )
+  })
+
+  it("MiniMax wire: ladder modes map to plain thinking enabled (no budget_tokens)", () => {
+    const cfg = mkConfig({
+      provider: "minimax",
+      model: "MiniMax-M3",
+      customEndpoint: "https://api.minimax.io/anthropic",
+    })
+    const body = build(cfg, "high") as { thinking?: Record<string, unknown> }
+    expect(body.thinking).toEqual({ type: "enabled" })
+  })
+
+  it("Anthropic budget ladder: low=1024 / medium=4096 / high=16384 / max=32768", () => {
+    const cfg = mkConfig({ provider: "anthropic", model: "claude-sonnet-4-5" })
+    expect(build(cfg, "low")).toEqual(
+      expect.objectContaining({ thinking: { type: "enabled", budget_tokens: 1024 } }),
+    )
+    expect(build(cfg, "medium")).toEqual(
+      expect.objectContaining({ thinking: { type: "enabled", budget_tokens: 4096 } }),
+    )
+    expect(build(cfg, "high")).toEqual(
+      expect.objectContaining({ thinking: { type: "enabled", budget_tokens: 16384 } }),
+    )
+    expect(build(cfg, "max")).toEqual(
+      expect.objectContaining({ thinking: { type: "enabled", budget_tokens: 32768 } }),
+    )
+  })
+
+  it("Gemini 3: off sends nothing (no documented disable); max degrades to high", () => {
+    const cfg = mkConfig({ provider: "google", model: "gemini-3-pro-preview" })
+    const off = build(cfg, "off") as { generationConfig?: Record<string, unknown> }
+    expect(off.generationConfig?.thinkingConfig).toBeUndefined()
+    const max = build(cfg, "max") as { generationConfig?: Record<string, unknown> }
+    expect(max.generationConfig?.thinkingConfig).toEqual({ thinkingLevel: "high" })
   })
 })

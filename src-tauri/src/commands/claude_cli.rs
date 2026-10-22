@@ -257,6 +257,7 @@ pub async fn claude_cli_spawn(
     messages: Vec<ClaudeMessage>,
     isolate_local_config: bool,
     disable_thinking: Option<bool>,
+    reasoning_effort: Option<String>,
     working_directory: Option<String>,
 ) -> Result<(), String> {
     // Build the turn list: fold any system messages into a preamble on
@@ -302,12 +303,33 @@ pub async fn claude_cli_spawn(
         cmd.env("PATH", path_env);
     }
     cmd.args(build_claude_cli_args(&model, isolate_local_config));
-    if disable_thinking.unwrap_or(false) {
-        // Claude Code's documented env knob: MAX_THINKING_TOKENS=0
-        // disables extended thinking for the session (issue #7668;
-        // thinking keywords like "think"/"ultrathink" are ignored once
-        // the env var is set, so 0 is a hard off).
-        cmd.env("MAX_THINKING_TOKENS", "0");
+    // Reasoning ladder (C.1, 2026-10-22): Claude Code's documented env knob is
+    // MAX_THINKING_TOKENS. 0 is a hard off (thinking keywords like
+    // "think"/"ultrathink" are ignored once the env var is set — issue #7668);
+    // ladder modes map onto the community-documented budget tiers
+    // (think=4k / think hard=10k / think harder=16k / ultrathink=31999).
+    match reasoning_effort.as_deref() {
+        Some("off") => {
+            cmd.env("MAX_THINKING_TOKENS", "0");
+        }
+        Some("low") => {
+            cmd.env("MAX_THINKING_TOKENS", "4000");
+        }
+        Some("medium") => {
+            cmd.env("MAX_THINKING_TOKENS", "10000");
+        }
+        Some("high") => {
+            cmd.env("MAX_THINKING_TOKENS", "16000");
+        }
+        Some("max") => {
+            cmd.env("MAX_THINKING_TOKENS", "31999");
+        }
+        _ => {
+            // Legacy payloads only carry the boolean; keep honoring it.
+            if disable_thinking.unwrap_or(false) {
+                cmd.env("MAX_THINKING_TOKENS", "0");
+            }
+        }
     }
     cmd.current_dir(&working_directory);
 

@@ -645,6 +645,7 @@
           "high": "高",
           "max": "最大",
           "custom": "自定义",
+          "modelVarianceNote": "档位全集对所有模型开放；实际效果因模型而异，详见各家官方文档。",
           "budgetTokens": "thinking token 预算",
           "hint": "控制聊天时的推理强度；文档摄取使用下方的独立设置。",
           "ingestTitle": "导入时的推理",

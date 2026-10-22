@@ -13,126 +13,63 @@ function config(provider: LlmConfig["provider"], model: string): LlmConfig {
   }
 }
 
-describe("reasoning capabilities", () => {
-  it("offers the off toggle on generic custom gateways without inferring vendor-private knobs", () => {
-    const cfg = config("custom", "Qwen3-thinking-only")
-    expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
-    expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
-    // Only generic disable fields go on the wire — the llama.cpp-private
-    // chat_template_kwargs stays reserved for local endpoints.
-    expect(resolveReasoningCapabilities(cfg).modes).not.toContain("low")
-  })
+/**
+ * 2026-10-22 咩咩拍板（C.0）：档位选择器统一全集，不再按模型裁剪。
+ * 此前按能力裁剪 modes 的矩阵（MiniMax auto-only、glm-5-3-flash
+ * auto-only、OpenAI 按模型分 4 组、Gemini/Claude thinking-required
+ * 无 off）全部退役——模型差异由 wire 映射层做最佳努力，UI 提示行
+ * 说明「档位实际效果因模型而异，见各家文档」。
+ */
+const FULL = ["auto", "off", "low", "medium", "high", "max"] as const
+const FULL_BUDGET = ["auto", "off", "low", "medium", "high", "max", "custom"] as const
 
-  it("offers the off toggle on CLI providers (claude-code / codex-cli)", () => {
-    for (const provider of ["claude-code", "codex-cli"] as const) {
-      const cfg = config(provider, "claude-sonnet-4-6")
-      expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
-      expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
+describe("reasoning capabilities — unified full mode set (C.0, 2026-10-22)", () => {
+  it("offers the full set on every provider regardless of model", () => {
+    const cases: Array<[LlmConfig, readonly string[]]> = [
+      // CLI subprocess transports
+      [config("claude-code", "claude-sonnet-4-6"), FULL],
+      [config("codex-cli", "gpt-5.1-codex"), FULL],
+      // MiniMax — M2.x/M3.1-Flash 的 off 无效是模型行为，不再是裁剪理由
+      [config("minimax", "MiniMax-M3"), FULL],
+      [config("minimax", "MiniMax-M2.7"), FULL],
+      [config("minimax", "MiniMax-M3.1-Flash-Preview"), FULL],
+      // OpenAI — 非推理/5 前/5.1+/未来系全部同一全集
+      [config("openai", "gpt-4o"), FULL],
+      [config("openai", "gpt-5"), FULL],
+      [config("openai", "gpt-5.1"), FULL],
+      [config("openai", "gpt-6-luna"), FULL],
+      [config("openai", "o4"), FULL],
+      [config("azure", "gpt-5.1"), FULL],
+      // Google / Anthropic — budget 系带 custom；gemini3 全集无 custom
+      [config("google", "gemini-2.5-pro"), FULL_BUDGET],
+      [config("google", "gemini-3-pro"), FULL],
+      [config("google", "gemini-2.5-flash"), FULL_BUDGET],
+      [config("anthropic", "claude-sonnet-4-5"), FULL_BUDGET],
+      [config("anthropic", "claude-opus-4-7"), FULL_BUDGET],
+      [config("ollama", "qwen3"), FULL],
+    ]
+    for (const [cfg, expected] of cases) {
+      expect(resolveReasoningCapabilities(cfg).modes, `${cfg.provider}/${cfg.model}`).toEqual(expected)
     }
   })
 
-  it("offers off only where MiniMax can actually disable thinking", () => {
-    expect(resolveReasoningCapabilities(config("minimax", "MiniMax-M3")).modes)
-      .toEqual(["auto", "off"])
-    // M2.x accepts the flag but keeps thinking on; M3.1-Flash 400s on it.
-    expect(resolveReasoningCapabilities(config("minimax", "MiniMax-M2.7")).modes)
-      .toEqual(["auto"])
-    expect(resolveReasoningCapabilities(config("minimax", "MiniMax-M3.1-Flash-Preview")).modes)
-      .toEqual(["auto"])
-  })
-
-  it("gates MiniMax custom-endpoint toggles by the same model rules", () => {
-    const base = { ...config("custom", "MiniMax-M3"), customEndpoint: "https://api.minimax.io/anthropic" }
-    expect(resolveReasoningCapabilities(base).modes).toEqual(["auto", "off"])
-    const m2 = { ...base, model: "MiniMax-M2.7" }
-    expect(resolveReasoningCapabilities(m2).modes).toEqual(["auto"])
-  })
-
-  it("offers the off toggle on Volcengine Ark endpoints except always-thinking GLM flash", () => {
-    const doubao = {
-      ...config("custom", "doubao-seed-2-1-pro-260915"),
-      customEndpoint: "https://ark.cn-beijing.volces.com/api/v3",
+  it("offers the full set on every custom endpoint flavor", () => {
+    const cases: Array<[string, string, readonly string[]]> = [
+      ["https://gateway.example/v1", "Qwen3-thinking-only", FULL],
+      ["https://api.minimax.io/anthropic", "MiniMax-M2.7", FULL],
+      ["https://ark.cn-beijing.volces.com/api/v3", "doubao-seed-2-1-pro-260915", FULL],
+      ["https://ark.cn-beijing.volces.com/api/coding", "doubao-seed-2-1-lite", FULL],
+      // Ark glm-5-3-flash off 无真关闭——wire 映射为 effort minimal，不裁剪
+      ["https://ark.cn-beijing.volces.com/api/v3", "glm-5-3-flash-260828", FULL],
+      ["https://api.deepseek.com/v1", "deepseek-v4", FULL],
+      ["https://open.bigmodel.cn/api/paas/v4", "GLM-5.3-Flash", FULL],
+      ["http://127.0.0.1:18200/v1", "Qwen3.8-27B.gguf", FULL],
+      ["https://openrouter.ai/api/v1", "vendor/reasoning-model", FULL_BUDGET],
+    ]
+    for (const [endpoint, model, expected] of cases) {
+      const cfg = { ...config("custom", model), customEndpoint: endpoint }
+      expect(resolveReasoningCapabilities(cfg).modes, `${endpoint} ${model}`).toEqual(expected)
     }
-    expect(resolveReasoningCapabilities(doubao).modes).toEqual(["auto", "off"])
-    const coding = {
-      ...doubao,
-      customEndpoint: "https://ark.cn-beijing.volces.com/api/coding",
-    }
-    expect(resolveReasoningCapabilities(coding).modes).toEqual(["auto", "off"])
-    // Ark's glm-5-3-flash "始终启用思考,不再支持禁用"
-    const glmFlash = {
-      ...doubao,
-      model: "glm-5-3-flash-260828",
-    }
-    expect(resolveReasoningCapabilities(glmFlash).modes).toEqual(["auto"])
-  })
-
-  it("offers OpenRouter's documented reasoning controls only on its endpoint", () => {
-    const cfg = {
-      ...config("custom", "vendor/reasoning-model"),
-      customEndpoint: "https://openrouter.ai/api/v1",
-    }
-
-    expect(resolveReasoningCapabilities(cfg).modes)
-      .toEqual(["auto", "off", "low", "medium", "high", "max", "custom"])
-    expect(normalizeReasoningForProvider(cfg, { mode: "low" })).toEqual({ mode: "low" })
-  })
-
-  it("offers the thinking toggle on local inference endpoints (llama.cpp / vLLM / LM Studio)", () => {
-    for (const endpoint of ["http://127.0.0.1:18200/v1", "http://localhost:1234/v1", "http://[::1]:8080/v1"]) {
-      const cfg = {
-        ...config("custom", "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"),
-        customEndpoint: endpoint,
-      }
-      expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
-      expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
-    }
-  })
-
-  it("offers the thinking toggle on Zhipu BigModel first-party endpoints", () => {
-    for (const endpoint of ["https://open.bigmodel.cn/api/paas/v4", "https://api.z.ai/api/paas/v4"]) {
-      const cfg = {
-        ...config("custom", "GLM-5.3-Flash"),
-        customEndpoint: endpoint,
-      }
-      expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
-      expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
-    }
-  })
-
-  it("does not offer off for thinking-required Gemini and Claude models", () => {
-    expect(resolveReasoningCapabilities(config("google", "gemini-2.5-pro")).modes)
-      .not.toContain("off")
-    expect(resolveReasoningCapabilities(config("anthropic", "claude-opus-4-7")).modes)
-      .not.toContain("off")
-    expect(resolveReasoningCapabilities(config("anthropic", "claude-sonnet-4-6")).modes)
-      .not.toContain("custom")
-  })
-
-  it("offers the off toggle on every OpenAI model, and effort levels only on reasoning models", () => {
-    // Non-reasoning models never think; off is a legitimate no-op that
-    // keeps saved/ingest "off" settings from being normalized away.
-    expect(resolveReasoningCapabilities(config("openai", "gpt-4o")).modes)
-      .toEqual(["auto", "off"])
-    // GPT-5.1+ accepts the official reasoning_effort "none".
-    expect(resolveReasoningCapabilities(config("openai", "gpt-5.1")).modes)
-      .toEqual(["auto", "off", "low", "medium", "high"])
-    // Pre-5.1 reasoning models (gpt-5, o-series) reject "none" with 400.
-    expect(resolveReasoningCapabilities(config("openai", "gpt-5")).modes)
-      .toEqual(["auto", "low", "medium", "high"])
-    expect(resolveReasoningCapabilities(config("openai", "o4")).modes)
-      .toEqual(["auto", "low", "medium", "high"])
-    expect(normalizeReasoningForProvider(config("openai", "gpt-5"), { mode: "max" }))
-      .toEqual({ mode: "auto" })
-  })
-
-  it("supports off and maximum effort for future OpenAI model families", () => {
-    expect(resolveReasoningCapabilities(config("openai", "gpt-6-luna")).modes)
-      .toEqual(["auto", "off", "low", "medium", "high", "max"])
-    // 本地 off 档体系：非推理模型也提供 off（发送时省略字段），使已保存的
-    // off 设置在模型切换后不被规范化掉——与上游 AUTO_ONLY 设计有意不同。
-    expect(resolveReasoningCapabilities(config("openai", "gpt-4.1")).modes)
-      .toEqual(["auto", "off"])
   })
 
   it("normalizes custom budgets to positive integer values", () => {
@@ -145,5 +82,19 @@ describe("reasoning capabilities", () => {
       .toEqual({ mode: "custom", budgetTokens: 32_768 })
     expect(normalizeReasoningForProvider(cfg, { mode: "custom", budgetTokens: 0 }))
       .toEqual({ mode: "auto" })
+  })
+
+  it("custom is only honored where the budget wire exists; other modes pass through", () => {
+    // 非 budget 系 provider 的 custom 归 auto（wire 层没有 budget 合同）
+    const openai = config("openai", "gpt-5.1")
+    expect(normalizeReasoningForProvider(openai, { mode: "custom", budgetTokens: 2048 }))
+      .toEqual({ mode: "auto" })
+    // 全集内的档位全部透传——不再按模型归一回 auto
+    expect(normalizeReasoningForProvider(openai, { mode: "max" })).toEqual({ mode: "max" })
+    const glmFlash = {
+      ...config("custom", "glm-5-3-flash-260828"),
+      customEndpoint: "https://ark.cn-beijing.volces.com/api/v3",
+    }
+    expect(normalizeReasoningForProvider(glmFlash, { mode: "off" })).toEqual({ mode: "off" })
   })
 })

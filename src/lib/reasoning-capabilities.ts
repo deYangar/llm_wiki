@@ -8,16 +8,17 @@ export interface ReasoningCapabilities {
   normalize(requested: ReasoningConfig): ReasoningConfig
 }
 
+/**
+ * 2026-10-22 咩咩拍板（C.0）：档位选择器统一全集，不再按模型裁剪。
+ * 某模型某档「能不能关、服务端怎么映射」是 wire 层与各家协议的事——
+ * modes 恒为全集，模型差异转移到 llm-providers 的映射层做最佳努力，
+ * UI 旁挂一行「档位实际效果因模型而异，见各家文档」。custom
+ * [budgetTokens] 仅 budget 系 provider（Anthropic / Gemini 2.5 Pro /
+ * OpenRouter）附加。
+ */
+const FULL_LEVELS = ["auto", "off", "low", "medium", "high", "max"] as const
+const FULL_BUDGET_LEVELS = ["auto", "off", "low", "medium", "high", "max", "custom"] as const
 const AUTO_ONLY = ["auto"] as const
-const OPENAI_LEVELS = ["auto", "low", "medium", "high"] as const
-const OPENAI_TOGGLE_LEVELS = ["auto", "off", "low", "medium", "high"] as const
-const OPENAI_FUTURE_LEVELS = ["auto", "off", "low", "medium", "high", "max"] as const
-const BUDGET_LEVELS = ["auto", "off", "low", "medium", "high", "max", "custom"] as const
-const THINKING_REQUIRED_BUDGETS = ["auto", "low", "medium", "high", "max", "custom"] as const
-const THINKING_REQUIRED_LEVELS = ["auto", "low", "medium", "high", "max"] as const
-const OLLAMA_LEVELS = ["auto", "off", "low", "medium", "high", "max"] as const
-const TOGGLE_LEVELS = ["auto", "off"] as const
-const DEEPSEEK_LEVELS = ["auto", "off", "high", "max"] as const
 
 function capabilities(
   modes: readonly ReasoningMode[],
@@ -27,8 +28,8 @@ function capabilities(
     modes,
     customBudgetRange,
     normalize(requested) {
-      if (!modes.includes(requested.mode)) return { mode: "auto" }
       if (requested.mode !== "custom") return { mode: requested.mode }
+      if (!modes.includes("custom")) return { mode: "auto" }
       const budget = Math.min(customBudgetRange.max, Math.floor(requested.budgetTokens ?? 0))
       if (budget > 0 && budget < customBudgetRange.min) {
         return { mode: "custom", budgetTokens: customBudgetRange.min }
@@ -158,93 +159,43 @@ export function isBigModelEndpoint(endpoint: string): boolean {
 }
 
 /**
- * Resolve only capabilities that are part of the selected wire contract.
+ * Resolve the wire contract's reasoning capabilities.
  *
- * Every provider offers at least an "off" toggle — a thinking model
- * that cannot be told to stop thinking burns the caller's whole token
- * budget on chain-of-thought. Where a vendor genuinely has no off
- * switch (MiniMax M2.x accepts `disabled` but keeps thinking on;
- * M3.1-Flash rejects it with 400) the capability is withheld instead
- * of offering a toggle that cannot work.
+ * 2026-10-22 拍板后 modes 恒为全集（见文件头注释）——本函数剩下的职责是
+ * custom budget 档的归属（仅 budget 系 provider）与 normalize 边界。各
+ * 模型某档的真实效果由 llm-providers 的映射层负责，UI 提示行兜底说明。
  */
 export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabilities {
   if (config.provider === "claude-code" || config.provider === "codex-cli") {
-    // Subprocess CLIs: off maps to MAX_THINKING_TOKENS=0 (claude,
-    // documented env var) / model_reasoning_effort="none" (codex,
-    // ReasoningEffort enum value since the gpt-5.1 era).
-    return capabilities(TOGGLE_LEVELS)
+    // Subprocess CLIs: off/low/medium/high/max map onto
+    // MAX_THINKING_TOKENS (claude, documented env var) /
+    // model_reasoning_effort (codex, ReasoningEffort enum; codex has no
+    // "max" — it degrades to "high" in the CLI transport).
+    return capabilities(FULL_LEVELS)
   }
-  if (config.provider === "ollama") return capabilities(OLLAMA_LEVELS)
+  if (config.provider === "ollama") return capabilities(FULL_LEVELS)
   if (config.provider === "google") {
-    if (isGemini3(config.model)) return capabilities(THINKING_REQUIRED_LEVELS)
+    if (isGemini3(config.model)) return capabilities(FULL_LEVELS)
     if (isGemini25Pro(config.model)) {
-      return capabilities(THINKING_REQUIRED_BUDGETS, { min: 128, max: 32_768 })
+      return capabilities(FULL_BUDGET_LEVELS, { min: 128, max: 32_768 })
     }
-    return capabilities(BUDGET_LEVELS)
+    return capabilities(FULL_BUDGET_LEVELS)
   }
   if (config.provider === "anthropic") {
-    return capabilities(
-      isClaude46OrLater(config.model) ? THINKING_REQUIRED_LEVELS : BUDGET_LEVELS,
-      { min: 1024, max: 32_768 },
-    )
+    return capabilities(FULL_BUDGET_LEVELS, { min: 1024, max: 32_768 })
   }
-  if (config.provider === "minimax") {
-    // M3 honors thinking.type=disabled; M2.x cannot disable and
-    // M3.1-Flash 400s on it — model-side behavior we cannot fix, so
-    // those models stay auto-only (honestly) instead of offering a
-    // dead toggle.
-    return capabilities(
-      supportsMiniMaxThinkingOff(config.model) ? TOGGLE_LEVELS : AUTO_ONLY,
-    )
-  }
+  if (config.provider === "minimax") return capabilities(FULL_LEVELS)
   if (config.provider === "openai" || config.provider === "azure") {
-    // Future reasoning models (gpt-6+) support the full ladder including
-    // max effort and a real off toggle.
-    if (isOpenAiFutureReasoningModel(config)) {
-      return capabilities(OPENAI_FUTURE_LEVELS)
-    }
-    if (isOpenAiReasoningModel(config)) {
-      return capabilities(isGpt51OrLater(config.model) ? OPENAI_TOGGLE_LEVELS : OPENAI_LEVELS)
-    }
-    // Non-reasoning models never think; "off" sends no field, which is
-    // exactly right — the toggle exists so saved/ingest "off" settings
-    // stop being normalized away and the UI stays consistent.
-    return capabilities(TOGGLE_LEVELS)
+    return capabilities(FULL_LEVELS)
   }
   if (config.provider === "custom") {
     const endpoint = config.customEndpoint.toLowerCase()
-    if (isOpenRouterEndpoint(endpoint)) return capabilities(BUDGET_LEVELS)
-    if (/api\.deepseek\.(?:com|cn)(?:[:/]|$)/.test(endpoint)) {
-      return capabilities(DEEPSEEK_LEVELS)
-    }
-    if (/xiaomimimo\.com(?:[:/]|$)/.test(endpoint)) {
-      return capabilities(TOGGLE_LEVELS)
-    }
-    if (isBigModelEndpoint(endpoint)) return capabilities(TOGGLE_LEVELS)
-    if (isLocalInferenceEndpoint(endpoint)) return capabilities(TOGGLE_LEVELS)
-    if (isMiniMaxAnthropicEndpoint(endpoint)) {
-      return capabilities(
-        supportsMiniMaxThinkingOff(config.model) ? TOGGLE_LEVELS : AUTO_ONLY,
-      )
-    }
-    if (isArkEndpoint(endpoint)) {
-      // Ark thinking models are enabled BY DEFAULT; the off toggle maps
-      // to the documented thinking.type=disabled. glm-5-3-flash on Ark
-      // cannot disable thinking at all.
-      return capabilities(
-        supportsArkThinkingOff(config.model) ? TOGGLE_LEVELS : AUTO_ONLY,
-      )
-    }
-    // Generic gateways: offer the off toggle and translate it to the
-    // two de-facto standard disable fields (thinking.type=disabled +
-    // enable_thinking=false). Strict endpoints that reject unknown
-    // fields (OpenAI/Azure/Google first-party) are excluded at the
-    // wire layer, not here.
-    return capabilities(TOGGLE_LEVELS)
+    if (isOpenRouterEndpoint(endpoint)) return capabilities(FULL_BUDGET_LEVELS)
+    return capabilities(FULL_LEVELS)
   }
   // Unreachable for known providers (the switch in getProviderConfig is
   // exhaustive); a stale persisted provider string has no wire contract
-  // to translate "off" onto, so auto is the only honest mode.
+  // to translate modes onto, so auto is the only honest mode.
   return capabilities(AUTO_ONLY)
 }
 

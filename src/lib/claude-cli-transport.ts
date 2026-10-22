@@ -179,6 +179,7 @@ type SpawnPayload = Record<string, unknown> & {
   messages: ChatMessage[]
   isolateLocalConfig: boolean
   disableThinking: boolean
+  reasoningEffort: string
   workingDirectory: string
 }
 
@@ -321,17 +322,20 @@ export async function streamClaudeCodeCli(
       return
     }
 
+    const reasoning = normalizeReasoningForProvider(
+      config,
+      overrides?.reasoning ?? config.reasoning ?? { mode: "auto" },
+    )
     const payload: SpawnPayload = {
       streamId,
       model: config.model,
       messages,
       isolateLocalConfig: config.localCliIsolation === true,
-      // Reasoning "off" maps to MAX_THINKING_TOKENS=0 in the Rust
-      // spawner; other levels have no CLI equivalent.
-      disableThinking: normalizeReasoningForProvider(
-        config,
-        overrides?.reasoning ?? config.reasoning ?? { mode: "auto" },
-      ).mode === "off",
+      // Reasoning ladder maps onto MAX_THINKING_TOKENS tiers in the Rust
+      // spawner (off=0 / low=4000 / medium=10000 / high=16000 / max=31999);
+      // disableThinking stays for pre-ladder payload compatibility.
+      disableThinking: reasoning.mode === "off",
+      reasoningEffort: reasoning.mode,
       workingDirectory,
     }
     await invoke("claude_cli_spawn", payload)

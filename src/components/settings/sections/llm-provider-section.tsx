@@ -933,6 +933,10 @@ function ReasoningControls({
           )
         })}
       </div>
+      {/* C.0（2026-10-22 拍板）：全集开放后，模型差异用一行提示兜底说明。 */}
+      <p className="text-xs text-muted-foreground">
+        {t("settings.sections.llm.reasoning.modelVarianceNote")}
+      </p>
       {normalizedValue.mode === "custom" && (
         <div className="flex items-center gap-2">
           <Input

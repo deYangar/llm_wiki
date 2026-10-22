@@ -645,6 +645,7 @@
           "high": "High",
           "max": "Max",
           "custom": "Custom",
+          "modelVarianceNote": "All modes are offered for every model; actual behavior varies by model — see each vendor's docs.",
           "budgetTokens": "thinking budget tokens",
           "hint": "Controls reasoning for chat. Document ingest uses the separate setting below.",
           "ingestTitle": "Reasoning during ingest",

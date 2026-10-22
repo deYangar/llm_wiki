@@ -645,6 +645,7 @@
           "high": "Alto",
           "max": "Massimo",
           "custom": "Personalizzato",
+          "modelVarianceNote": "Tutte le modalità sono offerte per ogni modello; il comportamento effettivo varia in base al modello — vedere la documentazione del fornitore.",
           "budgetTokens": "token di budget per il ragionamento",
           "hint": "Controlla il ragionamento per la chat. L'elaborazione dei documenti usa l'impostazione separata qui sotto.",
           "ingestTitle": "Ragionamento durante l'ingest",

@@ -142,6 +142,7 @@ pub async fn codex_cli_spawn(
     prompt: String,
     isolate_local_config: bool,
     disable_thinking: Option<bool>,
+    reasoning_effort: Option<String>,
     timeout_minutes: Option<u64>,
     working_directory: Option<String>,
 ) -> Result<(), String> {
@@ -162,6 +163,7 @@ pub async fn codex_cli_spawn(
         &model,
         isolate_local_config,
         disable_thinking.unwrap_or(false),
+        reasoning_effort.as_deref(),
     ));
     cmd.current_dir(&working_directory);
 
@@ -317,7 +319,32 @@ fn codex_spawn_timeout_minutes(value: Option<u64>) -> u64 {
     )
 }
 
-fn build_codex_cli_args(model: &str, isolate_local_config: bool, disable_thinking: bool) -> Vec<String> {
+/// Reasoning ladder → codex `model_reasoning_effort` override (C.1, 2026-10-22).
+/// codex-rs `ReasoningEffort` accepts minimal|low|medium|high — there is no
+/// "max", so it degrades to "high"; "off" keeps the pre-existing "none"
+/// (GPT-5.1-era no-reasoning value; models that predate it never spawn with
+/// the override because the frontend ladder maps them onto other modes).
+fn codex_reasoning_effort_override(
+    reasoning_effort: Option<&str>,
+    disable_thinking: bool,
+) -> Option<&'static str> {
+    match reasoning_effort {
+        Some("off") => Some("none"),
+        Some("low") => Some("low"),
+        Some("medium") => Some("medium"),
+        Some("high") | Some("max") => Some("high"),
+        // Legacy payloads only carry the boolean.
+        _ if disable_thinking => Some("none"),
+        _ => None,
+    }
+}
+
+fn build_codex_cli_args(
+    model: &str,
+    isolate_local_config: bool,
+    disable_thinking: bool,
+    reasoning_effort: Option<&str>,
+) -> Vec<String> {
     let mut args = vec!["-a".to_string(), "never".to_string(), "exec".to_string()];
 
     if isolate_local_config {
@@ -327,13 +354,9 @@ fn build_codex_cli_args(model: &str, isolate_local_config: bool, disable_thinkin
         ]);
     }
 
-    if disable_thinking {
-        // GPT-5.1-era "no reasoning" mode. `ReasoningEffort` in codex-rs
-        // accepts `none` (protocol/src/openai_models.rs); models that
-        // predate it (gpt-5, o-series) are never offered the off toggle
-        // by the frontend, so they never spawn with this override.
+    if let Some(effort) = codex_reasoning_effort_override(reasoning_effort, disable_thinking) {
         args.push("-c".to_string());
-        args.push("model_reasoning_effort=\"none\"".to_string());
+        args.push(format!("model_reasoning_effort=\"{effort}\""));
     }
 
     args.extend([
@@ -469,7 +492,7 @@ mod tests {
 
     #[test]
     fn codex_args_do_not_isolate_local_config_by_default() {
-        let args = build_codex_cli_args("gpt-5", false, false);
+        let args = build_codex_cli_args("gpt-5", false, false, None);
 
         assert!(args
             .windows(3)
@@ -483,7 +506,7 @@ mod tests {
 
     #[test]
     fn codex_args_can_isolate_user_config_and_rules() {
-        let args = build_codex_cli_args("gpt-5", true, false);
+        let args = build_codex_cli_args("gpt-5", true, false, None);
         let exec_pos = args.iter().position(|arg| arg == "exec").expect("exec arg");
         let ignore_config_pos = args
             .iter()
@@ -500,7 +523,7 @@ mod tests {
 
     #[test]
     fn codex_args_disable_thinking_maps_to_reasoning_effort_none() {
-        let args = build_codex_cli_args("gpt-5.1", false, true);
+        let args = build_codex_cli_args("gpt-5.1", false, true, None);
         let c_pos = args
             .iter()
             .position(|arg| arg == "-c")
@@ -514,6 +537,28 @@ mod tests {
             .position(|arg| arg == "-")
             .expect("prompt positional arg");
         assert!(c_pos < dash_pos);
+
+    #[test]
+    fn codex_args_reasoning_ladder_maps_onto_model_reasoning_effort() {
+        // C.1（2026-10-22 拍板）：档位全集。off→none（既有行为）、
+        // low/medium 直传、high/max→high（codex ReasoningEffort 无 max）、
+        // auto 不发 override。
+        let cases: [(&str, &str); 5] = [
+            ("off", "model_reasoning_effort=\"none\""),
+            ("low", "model_reasoning_effort=\"low\""),
+            ("medium", "model_reasoning_effort=\"medium\""),
+            ("high", "model_reasoning_effort=\"high\""),
+            ("max", "model_reasoning_effort=\"high\""),
+        ];
+        for (mode, expected) in cases {
+            let args = build_codex_cli_args("gpt-5.1", false, false, Some(mode));
+            let c_pos = args.iter().position(|arg| arg == "-c").expect("-c override arg");
+            assert_eq!(args[c_pos + 1], expected, "mode {mode}");
+        }
+
+        let auto = build_codex_cli_args("gpt-5.1", false, false, Some("auto"));
+        assert!(!auto.contains(&"-c".to_string()));
+    }
     }
 
     struct TestDir(PathBuf);

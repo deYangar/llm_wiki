@@ -15,6 +15,7 @@ import {
   isOpenRouterEndpoint,
   isLocalInferenceEndpoint,
   normalizeReasoningForProvider,
+  supportsArkThinkingOff,
   supportsMiniMaxThinkingOff,
 } from "@/lib/reasoning-capabilities"
 
@@ -579,15 +580,14 @@ function buildOpenAiCompatibleBody(
     // DeepSeek V4 thinking mode. `thinking.type=disabled` is the most
     // important path for ingestion/rewrite tasks: it prevents the model
     // from spending the whole response on `reasoning_content` with no
-    // final `content`.
+    // final `content`. Ladder modes send reasoning_effort (low/medium
+    // are accepted; the server maps them up per official docs).
     if (supportsDeepSeekThinkingParam(config)) {
       if (reasoning.mode === "off") {
         body.thinking = { type: "disabled" }
       } else if (reasoning.mode !== "auto") {
         body.thinking = { type: "enabled" }
-        if (reasoning.mode === "high" || reasoning.mode === "max") {
-          body.reasoning_effort = reasoning.mode
-        }
+        body.reasoning_effort = reasoning.mode
       }
     }
     return body
@@ -596,20 +596,33 @@ function buildOpenAiCompatibleBody(
   if (config.provider === "custom" && isBigModelEndpoint(config.customEndpoint)) {
     // Zhipu BigModel GLM-4.5+ exposes the same `thinking.type` switch as
     // DeepSeek. GLM thinks by default, which spends the response budget
-    // on `reasoning_content`; "off" maps to the documented disabled value.
+    // on `reasoning_content`; "off" maps to the documented disabled value,
+    // ladder modes map to enabled (GLM exposes no effort ladder).
     if (reasoning.mode === "off") {
       body.thinking = { type: "disabled" }
+    } else if (reasoning.mode !== "auto") {
+      body.thinking = { type: "enabled" }
     }
     return body
   }
 
   if (config.provider === "custom" && isArkEndpoint(config.customEndpoint)) {
     // Volcengine Ark (incl. Coding Plan): thinking.type=enabled is the
-    // documented DEFAULT for Doubao/DeepSeek/GLM thinking models, so
-    // "off" maps to the documented disabled value. glm-5-3-flash on Ark
-    // always thinks and never gets the off toggle.
+    // documented DEFAULT for Doubao/DeepSeek/GLM thinking models. Ladder
+    // modes send thinking enabled + reasoning_effort (Ark deep-thinking
+    // docs, chat v3 OpenAI-compatible form; probe-pending field shape is
+    // noted in plans/2026-10-22-wiki2024-quality-audit/修复方案.md C.3).
+    // glm-5-3-flash always thinks and rejects disabled — its "off" maps
+    // to reasoning_effort "minimal" (server-side equivalent of low).
     if (reasoning.mode === "off") {
-      body.thinking = { type: "disabled" }
+      if (supportsArkThinkingOff(config.model)) {
+        body.thinking = { type: "disabled" }
+      } else {
+        body.reasoning_effort = "minimal"
+      }
+    } else if (reasoning.mode !== "auto") {
+      body.thinking = { type: "enabled" }
+      body.reasoning_effort = reasoning.mode
     }
     return body
   }
@@ -652,12 +665,16 @@ function buildOpenAiCompatibleBody(
     if (reasoning.mode === "off") {
       // GPT-5.1+ accepts the official no-reasoning effort "none";
       // earlier reasoning models (gpt-5, o-series) answer 400 for it
-      // and never get the off toggle, and non-reasoning models never
-      // think, so off legitimately sends nothing there.
+      // and non-reasoning models never think, so off legitimately sends
+      // nothing there.
       if (isGpt51OrLater(config.model)) body.reasoning_effort = "none"
-    } else if (reasoning.mode === "low" || reasoning.mode === "medium" || reasoning.mode === "high") {      body.reasoning_effort = reasoning.mode
+    } else if (reasoning.mode === "low" || reasoning.mode === "medium" || reasoning.mode === "high") {
+      body.reasoning_effort = reasoning.mode
     } else if (reasoning.mode === "max") {
-      body.reasoning_effort = "xhigh"
+      // OpenAI's documented enum is low|medium|high(+none for 5.1+) —
+      // no "max". Degrade to high instead of gambling on an
+      // undocumented value (a direct 400 kills the whole call).
+      body.reasoning_effort = "high"
     }
   }
 
@@ -785,6 +802,33 @@ function buildAnthropicBodyWithReasoning(
     return body
   }
 
+  // Volcengine Ark Coding Plan (/api/coding): Anthropic Messages wire
+  // with the effort ladder carried in output_config.effort instead of
+  // budget_tokens (Ark deep-thinking docs; off is handled above via
+  // anthropicWireOffDisablesThinking → thinking.type=disabled).
+  if (
+    config.provider === "custom" &&
+    (config.apiMode ?? "chat_completions") === "anthropic_messages" &&
+    isArkEndpoint(config.customEndpoint)
+  ) {
+    body.thinking = { type: "enabled" }
+    body.output_config = {
+      effort: reasoning.mode === "custom" ? "high" : reasoning.mode,
+    }
+    return body
+  }
+
+  // MiniMax Messages wire only documents enabled/disabled — no
+  // budget_tokens. Sending a budget would 400, so ladder modes map to a
+  // plain enabled switch (the model's own default depth applies).
+  const isMiniMaxWire =
+    config.provider === "minimax" ||
+    (config.provider === "custom" && isMiniMaxAnthropicEndpoint(config.customEndpoint))
+  if (isMiniMaxWire) {
+    body.thinking = { type: "enabled" }
+    return body
+  }
+
   const budget =
     reasoning.mode === "custom" && reasoning.budgetTokens !== undefined
       ? reasoning.budgetTokens
@@ -792,8 +836,10 @@ function buildAnthropicBodyWithReasoning(
         ? 1024
         : reasoning.mode === "medium"
           ? 4096
-        : 8192
-  const budgetTokens = Math.max(1024, budget)
+        : reasoning.mode === "high"
+          ? 16_384
+        : 32_768 // max — the documented budget ceiling
+  const budgetTokens = Math.max(1024, Math.min(32_768, budget))
   if ((body.max_tokens as number) <= budgetTokens) {
     body.max_tokens = budgetTokens + 1
   }
@@ -1019,12 +1065,17 @@ function buildGoogleBody(
   }
   const reasoning = effectiveReasoning(config, overrides)
   if (reasoning.mode === "off") {
-    generationConfig.thinkingConfig = { thinkingBudget: 0 }
+    // Gemini 3 (thinkingLevel wire) has no documented off — thinkingBudget:0
+    // is not part of that contract, so omit and let the server default
+    // apply. Budget-wire Gemini models accept thinkingBudget: 0 as real off.
+    if (!isGeminiThinkingLevelModel(config)) {
+      generationConfig.thinkingConfig = { thinkingBudget: 0 }
+    }
   } else if (reasoning.mode !== "auto") {
     if (isGeminiThinkingLevelModel(config)) {
       const thinkingLevel = reasoning.mode === "low" || reasoning.mode === "medium"
         ? reasoning.mode
-        : "high"
+        : "high" // high 与 max（Gemini 3 无 max 枚举，降级 high）
       generationConfig.thinkingConfig = { thinkingLevel }
     } else {
       const budget =
@@ -1034,7 +1085,9 @@ function buildGoogleBody(
             ? 1024
             : reasoning.mode === "medium"
               ? 4096
-              : 8192
+              : reasoning.mode === "high"
+                ? 16_384
+                : 24_576 // max
       generationConfig.thinkingConfig = { thinkingBudget: budget }
     }
   }
