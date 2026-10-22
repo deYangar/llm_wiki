@@ -1512,6 +1512,7 @@ describe("qa-split — questionTitle strips the leading question number (B4)", (
       questionNoIsGenerated: false,
       startLine: 0,
       replyStartLine: 1,
+      endLine: 2,
     }
     return questionTitle(question, roundMeta)
   }

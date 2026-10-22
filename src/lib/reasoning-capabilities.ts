@@ -51,16 +51,6 @@ function isGemini3(model: string): boolean {
   return /gemini[-_.]?3(?:[-_.]|$)/i.test(model)
 }
 
-function isOpenAiReasoningModel(config: LlmConfig): boolean {
-  if (config.provider === "azure" && config.azureModelFamily === "gpt5") return true
-  const model = config.model.trim().toLowerCase()
-  return /^(?:gpt-(?:[5-9]|\d{2,})|o\d+)(?:[.\-_]|$)/.test(model)
-}
-
-function isOpenAiFutureReasoningModel(config: LlmConfig): boolean {
-  return /^gpt-(?:[6-9]|\d{2,})(?:[.\-_]|$)/.test(config.model.trim().toLowerCase())
-}
-
 /**
  * GPT-5.1 (Nov 2025) added `reasoning_effort: "none"` — a real "no
  * reasoning" mode. Only 5.1-and-later accept it: gpt-5/gpt-5-codex/
