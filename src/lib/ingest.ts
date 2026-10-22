@@ -23,7 +23,8 @@ import {
   sourceSummarySlugCandidatesFromIdentity,
   sourceSummarySlugFromIdentity,
 } from "@/lib/source-identity"
-import { parseSources, writeSources } from "@/lib/sources-merge"
+import { parseSources, writeSources, parseFrontmatterArray, writeFrontmatterArray } from "@/lib/sources-merge"
+import { validateTagsForPage } from "@/lib/tag-vocabulary"
 import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import {
   buildQaSplitReportEntry,
@@ -2856,6 +2857,22 @@ async function writeFileBlocks(
     }
     if (!isLogPath(relativePath) && !isListingPath(relativePath)) {
       content = canonicalizeSourcesField(content, sourceFileName)
+      // B3（2026-10-22 审计 S8）：落盘前按 schema 标签词表校验 tags 值域。
+      // 枚举外值/错挂轴剔除并记 warning（如实披露），页面照写不丢弃。
+      const tagsOnPage = parseFrontmatterArray(content, "tags")
+      if (tagsOnPage.length > 0) {
+        const parsedType = parseFrontmatter(content).frontmatter?.type
+        const pageType = typeof parsedType === "string" ? parsedType : ""
+        const { kept, dropped } = validateTagsForPage(pageType, tagsOnPage)
+        if (dropped.length > 0) {
+          warnings.push(
+            `Dropped ${dropped.length} tag(s) from "${relativePath}" — ${dropped
+              .map((d) => `${d.tag}（${d.reason}）`)
+              .join("; ")}`,
+          )
+          content = writeFrontmatterArray(content, "tags", kept)
+        }
+      }
     }
     if (sourceSummaryPath && relativePath === sourceSummaryPath) {
       content = sourceSummaryMediaRefsForExternalMarkdown(content)
@@ -2931,7 +2948,11 @@ async function writeFileBlocks(
     try {
       if (isLogPath(relativePath)) {
         const existing = await tryReadFile(fullPath)
-        const appended = existing ? `${existing}\n\n${content.trim()}` : content.trim()
+        // B2：追加前去尾空行、保底单空行分隔——模型块与程序兜底两路写入
+        // 交替时尾部空行不再逐次垫高。
+        const appended = existing
+          ? `${existing.trimEnd()}\n\n${content.trim()}\n`
+          : `${content.trim()}\n`
         await writeFile(fullPath, appended)
       } else if (
         isListingPath(relativePath) ||
