@@ -429,8 +429,9 @@ describe("mergeDuplicateGroup", () => {
     expect(parseFrontmatterArray(result.canonicalContent, "tags").sort()).toEqual(
       ["ebpr", "microbiology", "paos", "propionate"].sort(),
     )
+    // related normalizes to the wrapped [[slug]] form (B1, 2026-10-22)
     expect(parseFrontmatterArray(result.canonicalContent, "related").sort()).toEqual(
-      ["dpao", "pha", "vfa"].sort(),
+      ["[[dpao]]", "[[pha]]", "[[vfa]]"].sort(),
     )
 
     // Updated stamped to today
