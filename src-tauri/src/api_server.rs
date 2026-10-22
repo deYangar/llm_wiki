@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read};
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -8,6 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::Local;
 use futures::FutureExt;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -55,6 +57,68 @@ static IN_FLIGHT_CHAT_STREAMS: AtomicUsize = AtomicUsize::new(0);
 static IN_FLIGHT_PAGE_EMBEDS: AtomicUsize = AtomicUsize::new(0);
 static APP_STATE_CACHE: OnceLock<Mutex<Option<CachedAppState>>> = OnceLock::new();
 static RATE_LIMIT: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
+/// Holder identity seen in the last port-conflict probe, so a persistently
+/// busy port logs one line per holder change instead of one per retry.
+static LAST_HOLDER_IDENTITY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Compile-time identity injected by build.rs (short commit hash, `-dirty`
+/// when built with uncommitted tracked changes). Two instances can share a
+/// version number — this fork vs upstream, or two local builds — so /health
+/// carries this field to tell them apart.
+pub fn build_id() -> &'static str {
+    env!("LLM_WIKI_BUILD_ID")
+}
+
+static PROCESS_STARTED_AT: OnceLock<u64> = OnceLock::new();
+
+fn process_started_at_unix() -> u64 {
+    *PROCESS_STARTED_AT.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
+}
+
+/// Effective API port: `LLM_WIKI_API_PORT` when set to a valid port number,
+/// otherwise the fixed default. The override lets a test or portable instance
+/// run beside the installed one instead of fighting over 19828; consumers
+/// (ipoanswer) keep using the default.
+fn api_port() -> u16 {
+    parse_api_port(std::env::var("LLM_WIKI_API_PORT").ok().as_deref())
+}
+
+fn parse_api_port(raw: Option<&str>) -> u16 {
+    match raw.map(str::trim) {
+        Some(value) => match value.parse::<u16>() {
+            Ok(port) if port != 0 => port,
+            _ => {
+                eprintln!("[API Server] ignoring invalid LLM_WIKI_API_PORT={value:?}, using {PORT}");
+                PORT
+            }
+        },
+        None => PORT,
+    }
+}
+
+/// pid/exePath in /health exist for local ops ("which exe is serving this
+/// port"); gate them on a loopback peer so enable-LAN setups don't publish
+/// the local user's paths to the network. A missing peer (tests, in-process
+/// callers) is treated as local.
+fn peer_is_local(peer: Option<SocketAddr>) -> bool {
+    peer.map(|addr| addr.ip().is_loopback()).unwrap_or(true)
+}
+
+fn apply_local_identity_fields(body: &mut Value, include_local: bool) {
+    body["buildId"] = json!(build_id());
+    body["startedAt"] = json!(process_started_at_unix());
+    if include_local {
+        body["pid"] = json!(std::process::id());
+        if let Ok(exe) = std::env::current_exe() {
+            body["exePath"] = json!(exe.to_string_lossy().into_owned());
+        }
+    }
+}
 
 #[derive(Clone)]
 struct CachedAppState {
@@ -80,7 +144,23 @@ pub fn invalidate_config_cache() {
 }
 
 pub fn start_api_server(app: AppHandle) {
-    thread::spawn(move || loop {
+    thread::spawn(move || {
+        let port = api_port();
+        log_server_event(
+            &app,
+            &format!(
+                "starting: buildId={} version={} port={port}{} pid={}",
+                build_id(),
+                env!("CARGO_PKG_VERSION"),
+                if port == PORT {
+                    " (default)".to_string()
+                } else {
+                    format!(" (LLM_WIKI_API_PORT override, default {PORT})")
+                },
+                std::process::id(),
+            ),
+        );
+        loop {
         API_STATUS.store(0, Ordering::Relaxed);
         let (server, addr) = match bind_server_with_retry(&app) {
             Some(bound) => bound,
@@ -119,28 +199,187 @@ pub fn start_api_server(app: AppHandle) {
         }
 
         API_STATUS.store(3, Ordering::Relaxed);
-        eprintln!("[API Server] server loop exited; restarting");
+        log_server_event(&app, "server loop exited; restarting");
         thread::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS));
+        }
     });
 }
 
 fn bind_server_with_retry(app: &AppHandle) -> Option<(Server, String)> {
     let host = server_bind::configured_bind_host(app);
-    let addr = server_bind::bind_addr(&host, PORT);
+    let addr = server_bind::bind_addr(&host, api_port());
     for attempt in 1..=MAX_BIND_RETRIES {
         match Server::http(&addr) {
-            Ok(server) => return Some((server, addr)),
+            Ok(server) => {
+                log_server_event(app, &format!("bound http://{addr}{API_PREFIX} (buildId={})", build_id()));
+                return Some((server, addr));
+            }
             Err(err) => {
                 eprintln!(
                     "[API Server] Failed to bind {addr} (attempt {attempt}/{MAX_BIND_RETRIES}): {err}"
                 );
+                if attempt == 1 {
+                    log_port_conflict(app, &addr);
+                }
                 if attempt < MAX_BIND_RETRIES {
                     thread::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS));
                 }
             }
         }
     }
+    log_server_event(
+        app,
+        &format!("port {addr} still busy after {MAX_BIND_RETRIES} attempts; retrying in {BIND_RETRY_DELAY_SECS}s"),
+    );
     None
+}
+
+/// The bind fight between two instances used to be invisible: the loser
+/// silently retried in the background and seized the port the moment the
+/// holder exited. Log who holds the port so the state is observable.
+fn log_port_conflict(app: &AppHandle, addr: &str) {
+    let identity = match probe_holder_identity(addr) {
+        Some(holder) => holder.render(),
+        None => "no llm-wiki health response (unknown holder)".to_string(),
+    };
+    let changed = LAST_HOLDER_IDENTITY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map(|mut last| {
+            if last.as_deref() == Some(identity.as_str()) {
+                false
+            } else {
+                *last = Some(identity.clone());
+                true
+            }
+        })
+        .unwrap_or(true);
+    if changed {
+        log_server_event(app, &format!("port {addr} busy; holder: {identity}"));
+    }
+}
+
+struct HolderIdentity {
+    build_id: Option<String>,
+    version: Option<String>,
+    exe_path: Option<String>,
+}
+
+impl HolderIdentity {
+    fn from_health(value: &Value) -> Option<Self> {
+        if value.get("ok")?.as_bool()? != true {
+            return None;
+        }
+        Some(HolderIdentity {
+            build_id: value
+                .get("buildId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            version: value
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            exe_path: value
+                .get("exePath")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    fn render(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(id) = &self.build_id {
+            parts.push(format!("buildId={id}"));
+        }
+        if let Some(version) = &self.version {
+            parts.push(format!("version={version}"));
+        }
+        if let Some(exe) = &self.exe_path {
+            parts.push(format!("exe={exe}"));
+        }
+        let base = parts.join(" ");
+        if self.build_id.is_none() {
+            if base.is_empty() {
+                "no identity fields (pre-identity build)".to_string()
+            } else {
+                format!("{base} (no buildId: upstream or pre-identity build)")
+            }
+        } else {
+            base
+        }
+    }
+}
+
+/// Addresses to try when probing whoever currently holds the port. A
+/// wildcard bind (0.0.0.0 / [::]) is not connectable on Windows, but the
+/// holder serving a wildcard socket answers on loopback.
+fn probe_connect_targets(addr: &str) -> Vec<String> {
+    let Some((host, port)) = addr.trim_start_matches("http://").rsplit_once(':') else {
+        return Vec::new();
+    };
+    match host {
+        "0.0.0.0" | "" => vec![format!("127.0.0.1:{port}")],
+        "[::]" | "::" => vec![format!("[::1]:{port}"), format!("127.0.0.1:{port}")],
+        host => vec![format!("{host}:{port}")],
+    }
+}
+
+fn probe_holder_identity(addr: &str) -> Option<HolderIdentity> {
+    // Minimal HTTP/1.0 GET over a raw socket: this thread has no async
+    // runtime and reqwest's blocking client is not compiled in. /health is
+    // served pre-auth by design, so no token is needed.
+    let mut raw = Vec::new();
+    let mut response_text = None;
+    for target in probe_connect_targets(addr) {
+        let Ok(mut stream) = std::net::TcpStream::connect(&target) else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        use std::io::Write as _;
+        if stream
+            .write_all(format!("GET /health HTTP/1.0\r\nHost: {target}\r\n\r\n").as_bytes())
+            .is_err()
+        {
+            continue;
+        }
+        raw.clear();
+        if stream.read_to_end(&mut raw).is_ok() && !raw.is_empty() {
+            response_text = Some(String::from_utf8_lossy(&raw).into_owned());
+            break;
+        }
+    }
+    let text = response_text?;
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    let value: Value = serde_json::from_str(body.trim_start_matches('\u{feff}')).ok()?;
+    HolderIdentity::from_health(&value)
+}
+
+/// Server lifecycle lines (start, bind, port conflict, seize) go to stderr
+/// and to `<app-data>/api-server.log`. stderr is invisible for the Windows
+/// GUI build, so the file is what makes the port fight observable.
+fn log_server_event(app: &AppHandle, message: &str) {
+    eprintln!("[API Server] {message}");
+    let Some(dir) = app.path().app_data_dir().ok() else {
+        return;
+    };
+    let line = format!(
+        "{} [api-server] {}\n",
+        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        message
+    );
+    let _ = fs::create_dir_all(&dir);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("api-server.log"))
+    {
+        use std::io::Write as _;
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 struct RequestSlot;
@@ -264,8 +503,9 @@ fn process_request(app: AppHandle, mut request: tiny_http::Request) {
         return;
     }
 
+    let peer = request.remote_addr().copied();
     let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle_request(&app, &method, &url, &body, &headers)
+        handle_request(&app, &method, &url, &body, &headers, peer)
     }))
     .unwrap_or_else(|payload| {
         eprintln!("[API Server] request panicked: {payload:?}");
@@ -358,6 +598,7 @@ fn handle_request(
     url: &str,
     body: &str,
     headers: &[(String, String)],
+    peer: Option<SocketAddr>,
 ) -> ApiResponse {
     let (path, query) = split_url(url);
     if path == "/health" || path == format!("{API_PREFIX}/health") {
@@ -366,7 +607,7 @@ fn handle_request(
         // "Enabled / disabled / port_conflict" line, and curl-from-
         // terminal users need a way to confirm the server is alive
         // before they go hunting for why other endpoints 503.
-        return ok(json!({
+        let mut health = json!({
             "ok": true,
             "status": get_api_status(),
             "version": env!("CARGO_PKG_VERSION"),
@@ -382,7 +623,9 @@ fn handle_request(
                 "streaming": true,
                 "streamProtocol": "sse",
             },
-        }));
+        });
+        apply_local_identity_fields(&mut health, peer_is_local(peer));
+        return ok(health);
     }
     if !path.starts_with(API_PREFIX) {
         return err(404, "Not found");
@@ -3608,6 +3851,90 @@ mod tests {
         let path = std::env::temp_dir().join(format!("llm-wiki-api-test-{id}-{seq}"));
         fs::create_dir_all(path.join("wiki")).unwrap();
         path
+    }
+
+    #[test]
+    fn parse_api_port_accepts_override_and_falls_back() {
+        assert_eq!(parse_api_port(None), PORT);
+        assert_eq!(parse_api_port(Some("")), PORT);
+        assert_eq!(parse_api_port(Some("  ")), PORT);
+        assert_eq!(parse_api_port(Some("not-a-port")), PORT);
+        assert_eq!(parse_api_port(Some("0")), PORT);
+        assert_eq!(parse_api_port(Some("99999")), PORT);
+        assert_eq!(parse_api_port(Some("19829")), 19829);
+        assert_eq!(parse_api_port(Some(" 19830 ")), 19830);
+    }
+
+    #[test]
+    fn build_id_is_never_empty() {
+        // Valid ids: a git short hash, possibly "-dirty", or "unknown" when
+        // git is unavailable. The contract is just "present and non-empty"
+        // so /health always identifies this build.
+        assert!(!build_id().is_empty());
+    }
+
+    #[test]
+    fn health_identity_fields_gated_on_loopback() {
+        let mut remote = json!({});
+        apply_local_identity_fields(&mut remote, false);
+        assert!(!remote["buildId"].as_str().unwrap().is_empty());
+        assert!(remote["startedAt"].as_u64().unwrap() > 0);
+        assert!(remote.get("pid").is_none());
+        assert!(remote.get("exePath").is_none());
+
+        let mut local = json!({});
+        apply_local_identity_fields(&mut local, true);
+        assert_eq!(local["buildId"], remote["buildId"]);
+        assert!(local["pid"].as_u64().unwrap() > 0);
+        assert!(local["exePath"].as_str().unwrap().contains("llm-wiki"));
+    }
+
+    #[test]
+    fn peer_is_local_treats_loopback_and_missing_as_local() {
+        assert!(peer_is_local(None));
+        assert!(peer_is_local(Some("127.0.0.1:5000".parse().unwrap())));
+        assert!(peer_is_local(Some("[::1]:5000".parse().unwrap())));
+        assert!(!peer_is_local(Some("192.168.1.5:5000".parse().unwrap())));
+    }
+
+    #[test]
+    fn holder_identity_from_health_flags_missing_build_id() {
+        let with_id: Value =
+            serde_json::from_str(r#"{"ok":true,"version":"0.6.13","buildId":"abc1234","exePath":"C:\\x\\llm-wiki.exe"}"#).unwrap();
+        let holder = HolderIdentity::from_health(&with_id).unwrap();
+        let rendered = holder.render();
+        assert!(rendered.contains("buildId=abc1234"));
+        assert!(rendered.contains("version=0.6.13"));
+        assert!(rendered.contains("exe=C:\\x\\llm-wiki.exe"));
+
+        let upstream: Value =
+            serde_json::from_str(r#"{"ok":true,"version":"0.6.13"}"#).unwrap();
+        let holder = HolderIdentity::from_health(&upstream).unwrap();
+        assert!(holder.render().contains("no buildId"));
+
+        let failing: Value = serde_json::from_str(r#"{"ok":false}"#).unwrap();
+        assert!(HolderIdentity::from_health(&failing).is_none());
+    }
+
+    #[test]
+    fn probe_connect_targets_normalizes_wildcards() {
+        assert_eq!(
+            probe_connect_targets("0.0.0.0:19828"),
+            vec!["127.0.0.1:19828".to_string()]
+        );
+        assert_eq!(
+            probe_connect_targets("[::]:19828"),
+            vec!["[::1]:19828".to_string(), "127.0.0.1:19828".to_string()]
+        );
+        assert_eq!(
+            probe_connect_targets("127.0.0.1:19828"),
+            vec!["127.0.0.1:19828".to_string()]
+        );
+        assert_eq!(
+            probe_connect_targets("192.168.1.5:19828"),
+            vec!["192.168.1.5:19828".to_string()]
+        );
+        assert!(probe_connect_targets("no-port-here").is_empty());
     }
 
     #[test]
