@@ -36,6 +36,7 @@ import {
   splitQaDocument,
   splitReplySections,
   type LlmFallbackUsage,
+  type QaPathMeta,
 } from "@/lib/qa-split"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
 import { mergePageContent, type MergeFn } from "@/lib/page-merge"
@@ -755,6 +756,92 @@ export function buildDeterministicIngestLog(
   return existing.trim()
     ? `${existing.trimEnd()}\n\n${entry}\n`
     : `# Wiki Log\n\n${entry}\n`
+}
+
+/**
+ * B7（2026-10-22 审计 S1+S2）：qa-split 文件入库后，向同项目 case 页追加
+ * 该文件到 `sources`（纯规则、走 sources-merge 的写回路径）。匹配条件：
+ * case 页 `company` 与路径 company 互为包含（路径是短名「德力佳」，case 页
+ * 是全称），case 页有 `deal`/`year` 平键时必须与路径一致（防同名跨项目
+ * 误并）。无匹配 case 页时静默跳过——补建 case 归收尾批（A3），本通道
+ * 只回写已存在的。失败如实记 warning，不阻断入库主流程。
+ */
+export async function syncCaseSourcesFromQaSplit(
+  projectPath: string,
+  pathMeta: QaPathMeta,
+  sourceIdentity: string,
+): Promise<{ updatedCasePaths: string[]; warnings: string[] }> {
+  const updatedCasePaths: string[] = []
+  const warnings: string[] = []
+  const company = pathMeta.company?.trim()
+  if (!company) return { updatedCasePaths, warnings }
+  const casesDir = `${projectPath}/wiki/cases`
+  let nodes
+  try {
+    nodes = await listDirectory(casesDir)
+  } catch {
+    return { updatedCasePaths, warnings } // 目录不存在 = 无可回写
+  }
+  const refKey = sourceReferenceIdentity(sourceIdentity).toLowerCase()
+  const today = currentWikiDate()
+  for (const node of nodes) {
+    if (node.is_dir || !node.name.toLowerCase().endsWith(".md")) continue
+    const absPath = node.path || `${casesDir}/${node.name}`
+    const relPath = `wiki/cases/${node.name}`
+    try {
+      const content = await tryReadFile(absPath)
+      if (!content) continue
+      const fm = parseFrontmatter(content).frontmatter
+      if (!fm || fm.type !== "case") continue
+      const caseCompany = typeof fm.company === "string" ? fm.company.trim() : ""
+      if (!caseCompany) continue
+      if (
+        caseCompany !== company &&
+        !caseCompany.includes(company) &&
+        !company.includes(caseCompany)
+      ) {
+        continue
+      }
+      if (
+        pathMeta.deal &&
+        typeof fm.deal === "string" &&
+        fm.deal.trim() &&
+        fm.deal.trim() !== pathMeta.deal
+      ) {
+        continue
+      }
+      if (
+        pathMeta.year &&
+        fm.year != null &&
+        String(fm.year).trim() !== String(pathMeta.year).trim()
+      ) {
+        continue
+      }
+      const sources = parseSources(content)
+      if (
+        sources.some((source) => sourceReferenceIdentity(source).toLowerCase() === refKey)
+      ) {
+        continue // 已并入
+      }
+      let next = writeSources(content, [...sources, sourceIdentity])
+      // 只 touch updated，不动 created（case 页是归纳通道产物，created 是首次时间戳）
+      const fmBlock = next.match(/^(---\s*\r?\n)([\s\S]*?)(\r?\n---\s*(?:\r?\n|$))/)
+      if (fmBlock) {
+        let payload = fmBlock[2]
+        payload = /^updated:/m.test(payload)
+          ? payload.replace(/^updated:.*$/m, `updated: ${today}`)
+          : `${payload}\nupdated: ${today}`
+        next = `${fmBlock[1]}${payload}${fmBlock[3]}${next.slice(fmBlock[0].length)}`
+      }
+      await writeFile(absPath, next)
+      updatedCasePaths.push(relPath)
+    } catch (err) {
+      warnings.push(
+        `[qa-split→case] 回写 ${relPath} 的 sources 失败：${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+  return { updatedCasePaths, warnings }
 }
 
 async function appendIngestWarningLog(
@@ -2212,6 +2299,21 @@ async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]>
         await appendIngestWarningLog(pp, sourceIdentity, [
           `Deterministic log update failed: ${err instanceof Error ? err.message : String(err)}`,
         ])
+      }
+    }
+
+    // B7（2026-10-22 审计 S1+S2 治本）：qa-split 入库成功后把该文件并入同项目
+    // case 页的 sources——schema「sources 保留全部」在 96% 走问答函通道的库上
+    // 真正兑现，case 全貌页不再依赖归纳文件碰巧触发。纯规则零 token；平键
+    // 抽取仍归 A1 收尾批（拆题保持零 LLM）。
+    if (!signal?.aborted && writeResult.hardFailures.length === 0) {
+      const caseSync = await syncCaseSourcesFromQaSplit(pp, pathMeta, sourceIdentity)
+      for (const casePath of caseSync.updatedCasePaths) {
+        writtenPaths.push(casePath)
+        onFileWritten?.(casePath)
+      }
+      if (caseSync.warnings.length > 0) {
+        await appendIngestWarningLog(pp, sourceIdentity, caseSync.warnings)
       }
     }
 
