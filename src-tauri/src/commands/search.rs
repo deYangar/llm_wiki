@@ -1371,7 +1371,13 @@ fn score_file(
         score,
         vector_score: None,
         images: extract_image_refs(content),
-        content: include_content.then_some(content.to_string()),
+        // R3 §八：include_content 的正文同样剥 frontmatter——消费端展示
+        // 面不需要裸 YAML；结构化字段走 pages/query 的 fields。
+        content: include_content.then(|| {
+            split_frontmatter(content)
+                .map(|(body_start, _)| content[body_start..].to_string())
+                .unwrap_or_else(|| content.to_string())
+        }),
         graph_related_to: Vec::new(),
     })
 }
@@ -2102,6 +2108,14 @@ fn doubao_multimodal_embedding_body(model: &str, text: &str) -> Value {
 }
 
 pub fn build_snippet(content: &str, query: &str) -> String {
+    // R3 §八（2026-10-24）：snippet 从正文切，不切 frontmatter 段——此前
+    // 直接在原始 md 上 find，查询词命中 frontmatter（inquiry-stage/related
+    // slug 等）时把裸 YAML 切进 snippet 打到消费端渲染面。
+    // split_frontmatter 的元组第二项是 frontmatter 块本身；正文在
+    // body_start 之后。
+    let content = crate::frontmatter::split_frontmatter(content)
+        .map(|(body_start, _)| &content[body_start..])
+        .unwrap_or(content);
     let lower = content.to_lowercase();
     let q = query.to_lowercase();
     let idx = lower.find(&q).unwrap_or(0);
@@ -2701,6 +2715,20 @@ mod tests {
         assert_eq!(results[0].vector_score, Some(0.82));
         assert!(results[0].snippet.contains("Current qualified chunk"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snippet_never_cuts_into_frontmatter_block() {
+        // R3 §八：查询词命中 frontmatter（如 slug 里的词）时，snippet 必须仍
+        // 从正文切——裸 YAML 打到渲染面是需求 11.1/11.2 实锤形态。
+        let page = "---\ntype: question\ntitle: T\ninquiry-stage: 信息披露\nrelated:\n  - \"[[16-slug--63-6-4-doc--19uikew]]\"\n---\n\n## 监管问题\n\n题干正文里有 19uikew 这个词。\n";
+        let snippet = build_snippet(page, "19uikew");
+        assert!(snippet.contains("题干正文里有"));
+        assert!(!snippet.contains("inquiry-stage"));
+        assert!(!snippet.contains("related:"));
+        // 无 frontmatter 的纯正文不受影响
+        let plain = build_snippet("正文 abc def", "abc");
+        assert!(plain.contains("abc"));
     }
 
     #[test]

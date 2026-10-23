@@ -1264,6 +1264,12 @@ fn handle_file_content(app: &AppHandle, project_id: &str, query: &str) -> ApiRes
         Ok(project) => project,
         Err(e) => return err(404, e),
     };
+    file_content_response(&project, query)
+}
+
+/// Split from `handle_file_content` so tests can drive the whole validation
+/// and response-shaping chain against a temp project without an AppHandle.
+fn file_content_response(project: &ProjectEntry, query: &str) -> ApiResponse {
     let params = parse_query(query);
     let Some(rel) = params.get("path") else {
         return err(400, "Missing path query parameter");
@@ -1288,15 +1294,112 @@ fn handle_file_content(app: &AppHandle, project_id: &str, query: &str) -> ApiRes
     if meta.len() > MAX_FILE_CONTENT_BYTES {
         return err(413, "File is too large to return via API");
     }
+    let include_frontmatter = params
+        .get("include_frontmatter")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     match fs::read_to_string(&path) {
-        Ok(content) => ok(json!({
-            "ok": true,
-            "projectId": project.id,
-            "path": rel,
-            "content": content,
-        })),
+        Ok(content) => {
+            // R3 §八（2026-10-24）：wiki 页默认返回剥掉 frontmatter 段的正文
+            // （裸 YAML 打到消费端渲染面是需求 11.1/11.2 实锤形态）；
+            // 结构化字段以独立 `frontmatter` 对象提供（消费端 metaChips/tags
+            // 区依赖），`?include_frontmatter=1` 保留原始全文（调试用）。
+            // 非 wiki 页与二进制文本不受影响，保持原样返回。
+            let is_wiki_md = rel.starts_with("wiki/")
+                && rel.to_lowercase().ends_with(".md");
+            if !is_wiki_md {
+                return ok(json!({
+                    "ok": true,
+                    "projectId": project.id,
+                    "path": rel,
+                    "content": content,
+                }));
+            }
+            let fm_json = (|| {
+                let block = crate::frontmatter::split_frontmatter(&content)
+                    .map(|(_, block)| block)
+                    .unwrap_or("");
+                let parsed = crate::frontmatter::Frontmatter::parse(block);
+                let mut fields = serde_json::Map::new();
+                for (key, values, is_scalar) in parsed.iter_fields() {
+                    let value = if is_scalar && values.len() <= 1 {
+                        match values.first() {
+                            Some(scalar) => Value::String(scalar.clone()),
+                            None => Value::String(String::new()),
+                        }
+                    } else {
+                        Value::Array(
+                            values.iter().map(|v| Value::String(v.clone())).collect(),
+                        )
+                    };
+                    fields.insert(key.to_string(), value);
+                }
+                Value::Object(fields)
+            })();
+            let body = crate::frontmatter::split_frontmatter(&content)
+                .map(|(body_start, _)| content[body_start..].to_string())
+                .unwrap_or_else(|| content.clone());
+            let returned_content =
+                if include_frontmatter { content.clone() } else { body.clone() };
+            let rendered_body = render_wikilinks_for_api(&project.path, &body);
+            ok(json!({
+                "ok": true,
+                "projectId": project.id,
+                "path": rel,
+                "content": returned_content,
+                "frontmatter": fm_json,
+                "renderedBody": rendered_body,
+            }))
+        }
         Err(_) => err(415, "File is not valid UTF-8 text"),
     }
+}
+
+/// R3 §八：`[[wikilink]]` → `[标题](页面路径)` 的渲染体（files/content 附
+/// 带 `renderedBody`，消费端渲染面只用这个字段——wikilink 语法对 markdown
+/// 渲染器不可见）。解析按文件名 stem 匹配 PageMetaIndex（大小写不敏感，
+/// 一次建表）；未解析的链接保留原样（如实，不造死链）。rel_path 相对项目
+/// 根、自带 `wiki/` 前缀，直接作链接目标。
+fn render_wikilinks_for_api(project_path: &str, body: &str) -> String {
+    let index = crate::frontmatter::page_meta_index_cached(project_path);
+    let by_stem: std::collections::HashMap<String, &str> = index
+        .entries()
+        .iter()
+        .map(|meta| {
+            let file = meta.rel_path.rsplit('/').next().unwrap_or("");
+            let stem = file.strip_suffix(".md").unwrap_or(file);
+            (stem.to_lowercase(), meta.rel_path.as_str())
+        })
+        .collect();
+    let resolve = |target: &str| -> Option<&str> {
+        by_stem.get(target.trim().to_lowercase().as_str()).copied()
+    };
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("]]") {
+            Some(end) => {
+                let inner = &after[..end];
+                // [[target|display]] / [[target]] / [[target|]] 三形态
+                let (target, display) = match inner.split_once('|') {
+                    Some((t, d)) => (t, if d.trim().is_empty() { t } else { d }),
+                    None => (inner, inner),
+                };
+                match resolve(target) {
+                    Some(rel) => out.push_str(&format!("[{display}]({rel})")),
+                    None => out.push_str(&rest[start..start + 2 + end + 2]),
+                }
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str(rest);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn handle_media(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
@@ -3894,6 +3997,83 @@ mod tests {
         let path = std::env::temp_dir().join(format!("llm-wiki-api-test-{id}-{seq}"));
         fs::create_dir_all(path.join("wiki")).unwrap();
         path
+    }
+
+    #[test]
+    fn file_content_strips_frontmatter_and_renders_wikilinks() {
+        let root = test_project_dir();
+        fs::create_dir_all(root.join("wiki/questions")).unwrap();
+        fs::create_dir_all(root.join("wiki/cases")).unwrap();
+        fs::write(
+            root.join("wiki/cases/CompanyA.md"),
+            "---\ntype: case\ntitle: CompanyA\n---\n\n案例正文。\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("wiki/questions/question-1.md"),
+            "---\ntype: question\ntitle: 问题一\ninquiry-stage: 核心技术\nrelated:\n  - \"[[CompanyA]\"\n---\n\n## 监管问题\n\n题干正文引用 [[CompanyA]] 与 [[Missing|缺页]] 链接。\n",
+        )
+        .unwrap();
+        let project = ProjectEntry {
+            id: "p1".to_string(),
+            name: "proj".to_string(),
+            path: root.to_string_lossy().to_string(),
+            current: true,
+        };
+        let response = file_content_response(
+            &project,
+            "path=wiki/questions/question-1.md",
+        );
+        assert_eq!(response.status, 200);
+        let content = response.body["content"].as_str().unwrap();
+        assert!(content.contains("题干正文引用"));
+        assert!(!content.contains("inquiry-stage"), "raw frontmatter keys must be gone");
+        // 结构化字段独立提供（消费端 metaChips/tags 区依赖）
+        let fm = &response.body["frontmatter"];
+        assert_eq!(fm["type"].as_str().unwrap(), "question");
+        assert_eq!(fm["title"].as_str().unwrap(), "问题一");
+        // wikilink 渲染：已解析 → 相对路径链接；未解析 → 原样保留
+        let rendered = response.body["renderedBody"].as_str().unwrap();
+        assert!(rendered.contains("[CompanyA](wiki/cases/CompanyA.md)"));
+        assert!(rendered.contains("[[Missing|缺页]]"));
+    }
+
+    #[test]
+    fn file_content_include_frontmatter_flag_keeps_raw() {
+        let root = test_project_dir();
+        fs::write(
+            root.join("wiki/a.md"),
+            "---\ntype: concept\n---\n\n正文。\n",
+        )
+        .unwrap();
+        let project = ProjectEntry {
+            id: "p1".to_string(),
+            name: "proj".to_string(),
+            path: root.to_string_lossy().to_string(),
+            current: true,
+        };
+        let response =
+            file_content_response(&project, "path=wiki/a.md&include_frontmatter=1");
+        assert_eq!(response.status, 200);
+        let content = response.body["content"].as_str().unwrap();
+        assert!(content.starts_with("---"), "flag keeps the raw document");
+    }
+
+    #[test]
+    fn file_content_non_wiki_text_is_passthrough() {
+        let root = test_project_dir();
+        fs::write(root.join("purpose.md"), "---\nraw: yaml\n---\n正文").unwrap();
+        let project = ProjectEntry {
+            id: "p1".to_string(),
+            name: "proj".to_string(),
+            path: root.to_string_lossy().to_string(),
+            current: true,
+        };
+        let response = file_content_response(&project, "path=purpose.md");
+        assert_eq!(response.status, 200);
+        // 非 wiki/ 前缀文件不做剥离（源文件视角保持原样）
+        assert!(response.body["content"].as_str().unwrap().contains("raw: yaml"));
+        assert!(response.body.get("frontmatter").is_none());
     }
 
     #[test]
