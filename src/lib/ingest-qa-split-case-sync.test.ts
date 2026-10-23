@@ -118,10 +118,14 @@ describe("syncCaseSourcesFromQaSplit (B7)", () => {
 
     const result = await syncCaseSourcesFromQaSplit("pp", pathMeta(), IDENTITY)
 
+    // R3 §7.3：sources 已并入的页不再重复 append（幂等）；但顺带的
+    // 基本信息抽取仍可补键（seed 正文无可抽事实时则零改动）——
+    // sources 计数是幂等性的硬断言。
+    const written = files.get("pp/wiki/cases/德力佳（沪主板再融资·2024）.md")!
+    expect(parseSources(written)).toEqual([IDENTITY])
+    expect(result.warnings).toEqual([])
+    // 基本信息抽无可抽（seed 无中介机构事实句）→ enrich 零变化 → 不落盘
     expect(result.updatedCasePaths).toEqual([])
-    expect(parseSources(files.get("pp/wiki/cases/德力佳（沪主板再融资·2024）.md")!)).toEqual([
-      IDENTITY,
-    ])
   })
 
   it("skips same-name case pages whose deal or year disagrees", async () => {

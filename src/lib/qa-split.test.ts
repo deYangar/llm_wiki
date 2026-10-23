@@ -891,6 +891,7 @@ describe("qa-split — extractPathMeta", () => {
       board: "主板",
       status: "注册",
       company: "嘉德利",
+      financingType: "首发",
     })
   })
 

@@ -24,6 +24,7 @@ import {
   sourceSummarySlugFromIdentity,
 } from "@/lib/source-identity"
 import { parseSources, writeSources, parseFrontmatterArray, writeFrontmatterArray } from "@/lib/sources-merge"
+import { applyCaseInfoFacts, extractCaseInfoFacts } from "@/lib/case-info"
 import { validateTagsForPage } from "@/lib/tag-vocabulary"
 import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import {
@@ -818,12 +819,16 @@ export async function syncCaseSourcesFromQaSplit(
         continue
       }
       const sources = parseSources(content)
-      if (
-        sources.some((source) => sourceReferenceIdentity(source).toLowerCase() === refKey)
-      ) {
-        continue // 已并入
+      const alreadyMerged = sources.some(
+        (source) => sourceReferenceIdentity(source).toLowerCase() === refKey,
+      )
+      // R3 §7.3：匹配到的 case 页顺带补齐基本信息平键（幂等，已有键不动）
+      // ——sources 已并入的页也跑（此前导入的页缺结构化键）。
+      let next = applyCaseInfoFacts(content, extractCaseInfoFacts(content, today))
+      if (!alreadyMerged) {
+        next = writeSources(next, [...parseSources(next), sourceIdentity])
       }
-      let next = writeSources(content, [...sources, sourceIdentity])
+      if (next === content) continue
       // 只 touch updated，不动 created（case 页是归纳通道产物，created 是首次时间戳）
       const fmBlock = next.match(/^(---\s*\r?\n)([\s\S]*?)(\r?\n---\s*(?:\r?\n|$))/)
       if (fmBlock) {
@@ -2963,9 +2968,10 @@ async function writeFileBlocks(
       // 枚举外值/错挂轴剔除并记 warning（如实披露），页面照写不丢弃。
       const tagsOnPage = parseFrontmatterArray(content, "tags")
       if (tagsOnPage.length > 0) {
-        const parsedType = parseFrontmatter(content).frontmatter?.type
-        const pageType = typeof parsedType === "string" ? parsedType : ""
-        const { kept, dropped } = validateTagsForPage(pageType, tagsOnPage)
+        const parsedFm = parseFrontmatter(content).frontmatter
+        const pageType = typeof parsedFm?.type === "string" ? parsedFm.type : ""
+        const pageTitle = typeof parsedFm?.title === "string" ? parsedFm.title : undefined
+        const { kept, dropped } = validateTagsForPage(pageType, tagsOnPage, pageTitle)
         if (dropped.length > 0) {
           warnings.push(
             `Dropped ${dropped.length} tag(s) from "${relativePath}" — ${dropped

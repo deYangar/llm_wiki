@@ -145,6 +145,8 @@ export interface QaPathMeta {
   deal?: string
   board?: string
   status?: string
+  /** deal 的融资类型细分（R3 §7.2 零 LLM 推导；IPO→首发，重组无值）。 */
+  financingType?: string | null
 }
 
 export interface QaRoundMeta {
@@ -892,13 +894,15 @@ export function extractPathMeta(sourceIdentity: string): QaPathMeta {
     // B5（2026-10-22 审计 S6）：北交所无板块层，但北交所股票全部在
     // 「北交所」板块——board 直接补「北交所」，不再产出 428 页无 board
     // 的 question 页（存量由 A5④ 数据 PATCH 补齐）。
+    const normalizedDeal = rest[2] ? (DEAL_NORMALIZE[rest[2]] ?? rest[2]) : undefined
     return {
       year,
       exchange,
       board: "北交所",
-      deal: DEAL_NORMALIZE[rest[2]] ?? rest[2],
+      deal: normalizedDeal,
       status: rest[3],
       company: rest[4] ?? fileStem,
+      financingType: deriveFinancingType(normalizedDeal, sourceIdentity),
     }
   }
   return {
@@ -908,7 +912,30 @@ export function extractPathMeta(sourceIdentity: string): QaPathMeta {
     board,
     status,
     company: company ?? fileStem,
+    financingType: deriveFinancingType(deal ? (DEAL_NORMALIZE[deal] ?? deal) : undefined, sourceIdentity),
   }
+}
+
+/** financing_type 细分（R3 §7.2，2026-10-24，零 LLM）：deal 的再融资细分
+ *  由文件名关键词推导——路径只给到 deal 粒度（IPO/再融资/重大资产重组），
+ *  「（北交所再融资·2025）」+ 文件名「向不特定对象发行可转换公司债券」
+ *  类关键词交叉细化。值域（schema V1.5）：首发/再融资-定增/再融资-配股/
+ *  再融资-向不特定对象发行/再融资-公开发行可转债/再融资-定向可转债/
+ *  公开发行公司债。IPO→首发；重大资产重组不在融资类型轴上（null）。 */
+export function deriveFinancingType(deal: string | undefined, sourceIdentity: string): string | null {
+  if (!deal) return null
+  if (deal === "IPO") return "首发"
+  if (deal !== "再融资") return null
+  const fileName = sourceIdentity.split("/").pop() ?? ""
+  if (/优先股/.test(fileName)) return "再融资-优先股"
+  if (/配股/.test(fileName)) return "再融资-配股"
+  if (/可转换公司债券|可转债/.test(fileName)) {
+    return /向特定对象/.test(fileName) ? "再融资-定向可转债" : "再融资-公开发行可转债"
+  }
+  if (/公司债/.test(fileName)) return "公开发行公司债"
+  if (/向不特定对象发行/.test(fileName)) return "再融资-向不特定对象发行"
+  if (/向特定对象发行/.test(fileName)) return "再融资-定增"
+  return null
 }
 
 // ---- W7.3 question 页生成 ------------------------------------------------
@@ -1064,6 +1091,9 @@ export function buildQuestionFileBlocks(
     if (pathMeta.deal) fm.push(`deal: ${yamlScalar(pathMeta.deal)}`)
     if (pathMeta.year) fm.push(`year: ${yamlScalar(pathMeta.year)}`)
     if (pathMeta.status) fm.push(`status: ${yamlScalar(pathMeta.status)}`)
+    if (pathMeta.financingType) {
+      fm.push(`financing_type: ${yamlScalar(pathMeta.financingType)}`)
+    }
     if (roundMeta.roundNo !== null) fm.push(`round_no: ${roundMeta.roundNo}`)
     fm.push(
       `round_kind: ${yamlScalar(roundMeta.roundKind)}`,

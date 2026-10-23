@@ -119,13 +119,21 @@ export interface TagValidationResult {
  * 按页面 type 校验 tags 值域。pageType 传空串时跳过适用性检查（type
  * 无法判定是异常形态，交给既有 routing/解析告警，不在这里二次惩罚），
  * 只做枚举值校验。
+ *
+ * R3 §7.4 核心技术消歧（2026-10-24，需求 10.1）：可选 pageTitle 提供
+ * 标题上下文——标题含「研发费用/研发投入/研发支出」的页挂
+ * `inquiry-stage:核心技术` 属误归类（研发费用归「财务数据真实性」族），
+ * 剔除并记 warning，供人工复核队列回写正确值（PATCH /pages/frontmatter）。
  */
 export function validateTagsForPage(
   pageType: string,
   tags: readonly string[],
+  pageTitle?: string,
 ): TagValidationResult {
   const kept: string[] = []
   const dropped: { tag: string; reason: string }[] = []
+  const rdExpenseTitle =
+    pageTitle !== undefined && /研发(费用|投入|支出)/.test(pageTitle)
   for (const tag of tags) {
     const parsed = splitTag(tag)
     if (!parsed) {
@@ -160,6 +168,13 @@ export function validateTagsForPage(
       continue
     }
     if (axis === "inquiry-stage") {
+      if (value === "核心技术" && rdExpenseTitle) {
+        dropped.push({
+          tag,
+          reason: "核心技术消歧（R3 §7.4）：标题含研发费用/投入/支出，归财务真实性族复核",
+        })
+        continue
+      }
       if (INQUIRY_STAGE_ALL_FORMS.has(value)) kept.push(tag)
       else dropped.push({ tag, reason: "inquiry-stage 枚举外值" })
       continue
