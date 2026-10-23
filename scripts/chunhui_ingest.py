@@ -112,8 +112,21 @@ def build_page(manifest_entry: dict, page: dict) -> str:
 
 
 def safe_filename(title: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', "―", title).strip()
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "―", title).strip()
     return name[:80] or "untitled"
+
+
+def looks_garbled(title: str) -> bool:
+    """GBK 解码坏页的标题混大量控制符/生僻乱字——可打印常用字符占比过低
+    即判定乱码，跳过入库（如实进 skipped 清单，不硬造）。"""
+    if not title:
+        return True
+    clean = re.sub(r"[\x00-\x1f]", "", title)
+    if len(clean) < max(4, len(title) * 0.7):
+        return True
+    # 常用域：中日文/字母/数字/常用标点
+    common = re.findall(r"[\u4e00-\u9fffA-Za-z0-9（）〔〕【】《》——、，。；：！？·\-\s]", clean)
+    return len(common) < len(clean) * 0.85
 
 
 def cmd_build(limit, out):
@@ -123,6 +136,7 @@ def cmd_build(limit, out):
     os.makedirs(out, exist_ok=True)
     written = []
     dup_in_batch = 0
+    garbled = []
     seen_titles = set()
     for fname in sorted(os.listdir(pages_dir)):
         if limit is not None and len(written) >= limit:
@@ -134,6 +148,28 @@ def cmd_build(limit, out):
         if not entry or entry["status"] != "现行有效":
             continue
         title = page["title"]
+        # 老页面（2000 年代）行结构碎：标题拆行/&nbsp; 残留/文号截断——
+        # 标题不可靠时回退列表页标题（manifest 侧文字可靠），正文照常保留。
+        if (
+            looks_garbled(title)
+            or "&nbsp;" in title
+            or len(title.replace(" ", "")) < 8
+        ):
+            fallback = entry["title"]
+            if not looks_garbled(fallback):
+                page = dict(page, title=fallback)
+                title = fallback
+            elif looks_garbled(title) and looks_garbled(
+                " ".join(page.get("body_lines", [])[:3])
+            ):
+                garbled.append(fname)
+                continue
+        page = dict(
+            page,
+            body_lines=[
+                re.sub(r"&nbsp;|&#160;", " ", l) for l in page.get("body_lines", [])
+            ],
+        )
         if title in seen_titles:
             dup_in_batch += 1
             continue
@@ -142,7 +178,9 @@ def cmd_build(limit, out):
         dest = os.path.join(out, safe_filename(title) + ".md")
         io.open(dest, "w", encoding="utf-8", newline="\n").write(md)
         written.append(dest)
-    print(f"built {len(written)} pages (batch-internal dup skipped: {dup_in_batch}) -> {out}")
+    print(f"built {len(written)} pages (batch-internal dup skipped: {dup_in_batch}, garbled skipped: {len(garbled)}) -> {out}")
+    for g in garbled[:10]:
+        print("  garbled:", g)
 
 
 def cmd_dedup_check(wiki_dir):
