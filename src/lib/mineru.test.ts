@@ -179,6 +179,85 @@ describe("MinerU API helpers", () => {
     expect(markdown).toContain("| ![Chart](media/paper/mineru/images/chart.png) | A |")
   })
 
+  // ── R3 §五 cheerio 版表格转换（2026-10-24）：多年份财务表串行形态 ──
+
+  async function tableToMarkdown(tableHtml: string): Promise<string> {
+    mockHttpFetch.mockResolvedValueOnce(await zipResponse({ "full.md": tableHtml }))
+    return __mineruTest.downloadAndExtractMarkdown("https://cdn/result.zip")
+  }
+
+  it("expands colspan headers so multi-level financial tables stay aligned", async () => {
+    // 多年份财务表的两级表头：「2024年12月31日」跨「账面价值/占比」两子列。
+    // 正则版 colspan 不展开 → 后续行整体左移错位（需求 3.9 串行的真根因）。
+    const md = await tableToMarkdown([
+      "<table>",
+      "<thead>",
+      "<tr><th rowspan=\"2\">项目</th><th colspan=\"2\">2024年12月31日</th><th colspan=\"2\">2023年12月31日</th></tr>",
+      "<tr><th>账面价值</th><th>占比</th><th>账面价值</th><th>占比</th></tr>",
+      "</thead>",
+      "<tbody>",
+      "<tr><td>货币资金</td><td>1,000.00</td><td>12.34%</td><td>900.00</td><td>10.00%</td></tr>",
+      "</tbody>",
+      "</table>",
+    ].join("\n"))
+    const lines = md.split("\n").filter((l) => l.startsWith("|"))
+    // 表头+分隔线+数据行全部 5 列等宽（6 个管道符）
+    expect(lines).toHaveLength(4)
+    for (const line of lines) expect(line.match(/\|/g)).toHaveLength(6)
+    expect(lines[0]).toContain("项目")
+    expect(lines[0]).toContain("2024年12月31日")
+    // colspan 展开为重复值：第 3 列与第 2 列同值（账面价值/占比上方）
+    expect(lines[0].split("|")[2]?.trim()).toBe("2024年12月31日")
+    expect(lines[0].split("|")[3]?.trim()).toBe("2024年12月31日")
+    // rowspan 展开：第二表头行（markdown 单行表头限制下进数据区）首列重复「项目」
+    expect(lines[2].split("|")[1]?.trim()).toBe("项目")
+    // 数据行五列对齐不错位
+    expect(lines[lines.length - 1]).toBe("| 货币资金 | 1,000.00 | 12.34% | 900.00 | 10.00% |")
+  })
+
+  it("expands rowspan so vertically merged category labels fill every row", async () => {
+    const md = await tableToMarkdown([
+      "<table>",
+      "<tr><th>类别</th><th>公司</th><th>金额</th></tr>",
+      "<tr><td rowspan=\"2\">同行业可比</td><td>公司A</td><td>100</td></tr>",
+      "<tr><td>公司B</td><td>200</td></tr>",
+      "</table>",
+    ].join("\n"))
+    const lines = md.split("\n").filter((l) => l.startsWith("|"))
+    expect(lines[2]).toBe("| 同行业可比 | 公司A | 100 |")
+    expect(lines[3]).toBe("| 同行业可比 | 公司B | 200 |")
+  })
+
+  it("keeps leading empty cells as the row-label indent column", async () => {
+    // MinerU 前导空格子＝行标签层级缩进（「其中：」子项），保留不删；
+    // 修复点是 colspan/rowspan 展开后的列对齐，不是删空列。
+    const md = await tableToMarkdown([
+      "<table>",
+      "<tr><th></th><th>项目</th><th>金额</th></tr>",
+      "<tr><td></td><td>营业收入</td><td>500</td></tr>",
+      "<tr><td></td><td>其中：主营</td><td>480</td></tr>",
+      "</table>",
+    ].join("\n"))
+    expect(md).toContain("|  | 项目 | 金额 |")
+    expect(md).toContain("|  | 其中：主营 | 480 |")
+  })
+
+  it("lifts caption above the table and uses thead rows as header", async () => {
+    const md = await tableToMarkdown([
+      "<table>",
+      "<caption>报告期主要财务数据</caption>",
+      "<thead><tr><th>年度</th><th>营收</th></tr></thead>",
+      "<tbody><tr><td>2024</td><td>1,200</td></tr></tbody>",
+      "</table>",
+    ].join("\n"))
+    const tableLine = md.split("\n").findIndex((l) => l.startsWith("| 年度"))
+    const captionLine = md.split("\n").findIndex((l) => l.includes("报告期主要财务数据"))
+    expect(tableLine).toBeGreaterThan(-1)
+    expect(captionLine).toBeGreaterThan(-1)
+    expect(captionLine).toBeLessThan(tableLine)
+    expect(md).toContain("| 2024 | 1,200 |")
+  })
+
   it("extracts MinerU zip images and rewrites Markdown image references", async () => {
     mockHttpFetch.mockResolvedValueOnce(await zipResponse({
       "full.md": [
@@ -928,40 +1007,33 @@ describe("cloud page-range segmentation", () => {
 
   it("submits one segmented task per page window and joins the markdown", async () => {
     fsMocks.getPdfPageCount.mockResolvedValue(202)
-    mockHttpFetch
-      // segment 1: batch submit → upload → poll → zip
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { batch_id: "batch-1", file_urls: ["https://upload/1"] },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 200 }))
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/1" }] },
-      }))
-      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Segment 1" }))
-      // segment 2
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { batch_id: "batch-2", file_urls: ["https://upload/2"] },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 200 }))
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/2" }] },
-      }))
-      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Segment 2" }))
-      // segment 3
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { batch_id: "batch-3", file_urls: ["https://upload/3"] },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 200 }))
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/3" }] },
-      }))
-      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Segment 3" }))
+    // R3 流水线：段 N 轮询期间段 N+1 上传已并发预发——顺序式
+    // mockResolvedValueOnce 与并发时序耦合会 flaky，改 URL 路由式分派。
+    mockHttpFetch.mockImplementation(async (url: string, opts?: RequestInit) => {
+      const u = String(url)
+      if (u.endsWith("/file-urls/batch")) {
+        const body = JSON.parse(String(opts?.body)) as { files: Array<{ page_ranges?: string }> }
+        const range = body.files[0].page_ranges ?? "1-202"
+        const idx = range === "1-100" ? 1 : range === "101-200" ? 2 : 3
+        return jsonResponse({
+          code: 0,
+          data: { batch_id: `batch-${idx}`, file_urls: [`https://upload/${idx}`] },
+        })
+      }
+      if (u.startsWith("https://upload/")) return new Response(null, { status: 200 })
+      if (u.includes("/extract-results/batch/")) {
+        const idx = Number(/batch-(\d+)/.exec(u)?.[1] ?? 1)
+        return jsonResponse({
+          code: 0,
+          data: { extract_result: [{ state: "done", full_zip_url: `https://zip/${idx}` }] },
+        })
+      }
+      if (u.startsWith("https://zip/")) {
+        const idx = Number(u.slice("https://zip/".length))
+        return zipResponse({ "full.md": `# Segment ${idx}` })
+      }
+      throw new Error(`unexpected url: ${u}`)
+    })
 
     await expect(parseWithMineru(cloudConfig, "/docs/big.pdf"))
       .resolves.toBe("# Segment 1\n\n# Segment 2\n\n# Segment 3")
@@ -1007,27 +1079,29 @@ describe("cloud page-range segmentation", () => {
       "full.md": "![img](images/1.jpg)",
       "images/1.jpg": "seg2-bytes",
     })
-    mockHttpFetch
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { batch_id: "batch-1", file_urls: ["https://upload/1"] },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 200 }))
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/1" }] },
-      }))
-      .mockResolvedValueOnce(zipOne)
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { batch_id: "batch-2", file_urls: ["https://upload/2"] },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 200 }))
-      .mockResolvedValueOnce(jsonResponse({
-        code: 0,
-        data: { extract_result: [{ state: "done", full_zip_url: "https://zip/2" }] },
-      }))
-      .mockResolvedValueOnce(zipTwo)
+    // R3 流水线并发预发上传——路由式 mock（与并发时序解耦）。
+    mockHttpFetch.mockImplementation(async (url: string, opts?: RequestInit) => {
+      const u = String(url)
+      if (u.endsWith("/file-urls/batch")) {
+        const body = JSON.parse(String(opts?.body)) as { files: Array<{ page_ranges?: string }> }
+        const idx = body.files[0].page_ranges === "1-100" ? 1 : 2
+        return jsonResponse({
+          code: 0,
+          data: { batch_id: `batch-${idx}`, file_urls: [`https://upload/${idx}`] },
+        })
+      }
+      if (u.startsWith("https://upload/")) return new Response(null, { status: 200 })
+      if (u.includes("/extract-results/batch/")) {
+        const idx = Number(/batch-(\d+)/.exec(u)?.[1] ?? 1)
+        return jsonResponse({
+          code: 0,
+          data: { extract_result: [{ state: "done", full_zip_url: `https://zip/${idx}` }] },
+        })
+      }
+      if (u === "https://zip/1") return zipOne
+      if (u === "https://zip/2") return zipTwo
+      throw new Error(`unexpected url: ${u}`)
+    })
 
     const result = await parseWithMineruResult(cloudConfig, "/docs/scan.pdf", undefined, undefined, undefined, {
       projectPath: "/proj",

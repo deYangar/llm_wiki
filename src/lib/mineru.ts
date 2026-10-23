@@ -1,4 +1,5 @@
 import JSZip from "jszip"
+import { load as loadTableDom } from "cheerio"
 import type { MineruConfig } from "@/stores/wiki-store"
 import { createDirectory, getFileSize, getPdfPageCount, readFileAsBase64, writeFileBase64 } from "@/commands/fs"
 import { getHttpFetch } from "@/lib/tauri-fetch"
@@ -401,35 +402,109 @@ function htmlCellToMarkdown(cell: string): string {
   ).replace(/\|/g, "\\|")
 }
 
+// ── HTML 表格 → Markdown（R3 §五 A 方案，2026-10-24 cheerio 重写） ──
+//
+// 正则版的三个结构性缺陷（多年份财务表串行的真根因）：
+// 1. colspan 不展开：合并单元格只占 1 列，后续整行左移错位——MinerU 对
+//    多级表头（「2024年12月31日」跨「账面价值/占比/…」子列）输出
+//    colspan，正则版全错位；
+// 2. rowspan 不展开：纵向合并（首列分类名合并 N 行）直接丢失归属；
+// 3. 无表头语义：永远拿首行当表头，thead/th 不看。
+// cheerio DOM 版：网格矩阵展开 rowspan/colspan（值重复填充——markdown
+// 无合并语义，重复让每行自含语义，检索/逐行切块友好），thead/th 优先
+// 当表头行，caption 提为表格前导文本。前导空格子是 MinerU 的行标签
+// 层级表达，保留不动。
+
+interface TableGridCell {
+  text: string
+}
+
+function clampSpan(raw: string | undefined, fallback: number): number {
+  const value = Number.parseInt(raw ?? "", 10)
+  if (!Number.isFinite(value) || value < 1) return fallback
+  return Math.min(value, 64)
+}
+
+function htmlTableElementToMarkdown(tableHtml: string): string | null {
+  // cheerio（1.2 起）parse 即解码实体，越界数字实体（&#9999999999;）会被
+  // 换成 U+FFFD 丢原文。load 前把越界实体包进私用区占位（值判断
+  // > 0x10FFFF，精确不误伤 7 位有效码点），转换后还原——表格 cell 的
+  // 零改写红线与正则版保持一致。
+  const placeholder = (prefix: string, digits: string) => `\uE000${prefix}${digits}\uE001`
+  const guarded = tableHtml
+    .replace(/&#(\d{4,});/g, (m, d: string) => (Number(d) > 0x10ffff ? placeholder("", d) : m))
+    .replace(/&#x([0-9a-fA-F]{4,});/g, (m, h: string) =>
+      Number.parseInt(h, 16) > 0x10ffff ? placeholder("x", h) : m,
+    )
+  const restore = (text: string) =>
+    text.replace(/\uE000(x?)([0-9a-fA-F]+)\uE001/g, (_m, x: string, digits: string) =>
+      x ? `&#x${digits};` : `&#${digits};`,
+    )
+
+  const $ = loadTableDom(guarded)
+  const $table = $("table").first()
+  if ($table.length === 0) return null
+
+  const caption = $table.children("caption").first().text().trim()
+  const trs = $table.find("tr").toArray()
+  if (trs.length === 0) return null
+
+  // 网格展开：grid[r][c]，rowspan/colspan 值重复填充；占位优先级——
+  // 上方 rowspan 的延伸先到先得，同格冲突后者让位（MinerU 输出不重叠，
+  // 冲突只可能来自畸形 HTML，取首值保守处理）。
+  const grid: (TableGridCell | undefined)[][] = []
+  trs.forEach((tr, r) => {
+    grid[r] = grid[r] ?? []
+    let c = 0
+    for (const cell of $(tr).children("td,th").toArray()) {
+      while (grid[r][c] !== undefined) c += 1
+      const $cell = $(cell)
+      const text = htmlCellToMarkdown($cell.html() ?? "")
+      const colspan = clampSpan($cell.attr("colspan"), 1)
+      const rowspan = clampSpan($cell.attr("rowspan"), 1)
+      for (let dr = 0; dr < rowspan; dr += 1) {
+        const rowIdx = r + dr
+        grid[rowIdx] = grid[rowIdx] ?? []
+        for (let dc = 0; dc < colspan; dc += 1) {
+          if (grid[rowIdx][c + dc] === undefined) {
+            grid[rowIdx][c + dc] = { text }
+          }
+        }
+      }
+      c += colspan
+    }
+  })
+
+  const rows = grid.filter((row) => row.length > 0)
+  if (rows.length === 0) return null
+  const width = Math.max(...rows.map((row) => row.length))
+  const padded = rows.map((row) => {
+    const out: string[] = []
+    for (let c = 0; c < width; c += 1) out.push(row[c]?.text ?? "")
+    return out
+  })
+
+  // 表头语义：markdown 表格只有单行表头语法——首行做表头（thead 首行
+  // 在文档序天然居首），其余表头行进数据区（两级表头的子列行原样保留，
+  // 信息不丢、渲染可读）；caption 提为表格前导文本。
+  const line = (cells: string[]) => `| ${cells.join(" | ")} |`
+  const out: string[] = []
+  if (caption) out.push("", caption)
+  out.push(
+    "",
+    line(padded[0]),
+    `| ${Array.from({ length: width }, () => "---").join(" | ")} |`,
+  )
+  for (let r = 1; r < padded.length; r += 1) out.push(line(padded[r]))
+  // 多行表头的剩余行（thead 第 2+ 行）是数据行的一部分，紧跟分隔线输出
+  out.push("")
+  return restore(out.join("\n"))
+}
+
 function convertHtmlTablesInSegment(segment: string): string {
   return segment.replace(/<table\b[\s\S]*?<\/table>/gi, (tableHtml) => {
-    const rows: string[][] = []
-    for (const rowMatch of tableHtml.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
-      const rowHtml = rowMatch[1] ?? ""
-      const cells: string[] = []
-      for (const cellMatch of rowHtml.matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)) {
-        cells.push(htmlCellToMarkdown(cellMatch[1] ?? ""))
-      }
-      if (cells.length > 0) rows.push(cells)
-    }
-    if (rows.length === 0) return tableHtml
-
-    const width = Math.max(...rows.map((row) => row.length))
-    const padded = rows.map((row) => {
-      const out = [...row]
-      while (out.length < width) out.push("")
-      return out
-    })
-    const header = padded[0]
-    const separator = Array.from({ length: width }, () => "---")
-    const body = padded.slice(1)
-    return [
-      "",
-      `| ${header.join(" | ")} |`,
-      `| ${separator.join(" | ")} |`,
-      ...body.map((row) => `| ${row.join(" | ")} |`),
-      "",
-    ].join("\n")
+    const converted = htmlTableElementToMarkdown(tableHtml)
+    return converted ?? tableHtml
   })
 }
 
@@ -1345,22 +1420,42 @@ async function parseCloudMineruSegmented(
   throwIfAborted(signal)
   const { base64 } = await readFileAsBase64(sourcePath)
 
-  const markdowns: string[] = []
-  const savedImages: SavedImage[] = []
-  for (let i = 0; i < ranges.length; i++) {
-    const range = ranges[i]
-    throwIfAborted(signal)
-    onProgress?.(`MinerU: segment ${i + 1}/${ranges.length} (pages ${range})...`)
-    const segmentPageCount = Number(range.split("-")[1]) - Number(range.split("-")[0]) + 1
-
-    const { batchId } = await uploadFileForTask(
+  // R3 §五 流水线（2026-10-24）：段 N 轮询等待期间预发段 N+1 上传——
+  // 云端排队/解析是纯等待，上传是独立任务，重叠后总时长 ≈ max(段耗时)
+  // 之和 − 上传时间 × (N-1)。下载/解压/图片落盘仍串行（zip 解压与
+  // media 目录写入有副作用，重叠收益小且引入乱序风险）。预发 promise
+  // 的错误延后到本段 await 时抛（不产生 unhandled rejection）。
+  const startUpload = (index: number) => {
+    const range = ranges[index]
+    return uploadFileForTask(
       config.token,
       fileName,
       base64,
       config.modelVersion,
       signal,
       range,
+    ).then(
+      (result) => ({ ok: true as const, result }),
+      (error: unknown) => ({ ok: false as const, error }),
     )
+  }
+
+  const markdowns: string[] = []
+  const savedImages: SavedImage[] = []
+  let nextUpload = ranges.length > 0 ? startUpload(0) : null
+  for (let i = 0; i < ranges.length; i++) {
+    const range = ranges[i]
+    throwIfAborted(signal)
+    onProgress?.(`MinerU: segment ${i + 1}/${ranges.length} (pages ${range})...`)
+    const segmentPageCount = Number(range.split("-")[1]) - Number(range.split("-")[0]) + 1
+
+    const upload = nextUpload
+    nextUpload = i + 1 < ranges.length ? startUpload(i + 1) : null
+    if (!upload) throw new Error("MinerU: segment upload not started")
+    const uploaded = await upload
+    if (!uploaded.ok) throw uploaded.error
+    const { batchId } = uploaded.result
+
     const zipUrl = await pollBatchTaskWithExtension(
       config.token,
       batchId,
