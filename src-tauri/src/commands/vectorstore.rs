@@ -1209,6 +1209,687 @@ pub async fn vector_drop_legacy(project_path: String) -> Result<(), String> {
 // (that lives on the TS side).
 // ──────────────────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────────────────
+// Index verification & v1 stem-id migration (R3 2026-10-24)
+//
+// `verify_vector_table_inner` answers "is the chunk table healthy": row
+// counts by id form (v1 bare-stem vs v2 qualified), vector dim, degenerate
+// (zero-norm) vectors, page_id resolvability against the wiki tree, index
+// presence, and a sampled duplicate-vector check. Bad pages are reported
+// grouped by page_id — the list feeds the per-page delete+re-embed repair
+// lane; nothing is deleted by verification itself.
+//
+// `migrate_stem_ids_inner` rewrites v1 bare-stem page_ids to their v2
+// qualified form when exactly one wiki page owns the stem (measured
+// 2026-10-24: 99.6% of stems qualify). Vectors are carried over verbatim —
+// zero re-embedding cost. Ambiguous (multi-owner) and orphan (no file)
+// stems are quarantined in the report, never silently dropped. Idempotent:
+// re-running on a migrated table is a no-op.
+//
+// `prune_missing_vector_pages_inner` deletes rows whose backing page no
+// longer exists — the delete-side lane of the repair flow.
+// ──────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VectorBadPage {
+    pub page_id: String,
+    pub rows: usize,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VectorVerifyReport {
+    pub table_exists: bool,
+    pub total_rows: usize,
+    pub distinct_pages: usize,
+    pub stem_rows: usize,
+    pub qualified_rows: usize,
+    pub vector_dim: i32,
+    pub degenerate_vectors: usize,
+    pub sampled_duplicate_vectors: usize,
+    pub vector_index: String,
+    pub page_id_index: String,
+    pub pages_missing_file: usize,
+    pub stem_ambiguous_pages: usize,
+    pub stem_orphan_pages: usize,
+    pub bad_pages: Vec<VectorBadPage>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct QuarantineEntry {
+    pub stem: String,
+    pub reason: String,
+    pub owners: Vec<String>,
+    pub rows: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct StemMigrationReport {
+    pub dry_run: bool,
+    pub stem_pages: usize,
+    pub stem_rows: usize,
+    pub migrated_pages: usize,
+    pub migrated_rows: usize,
+    pub quarantined_pages: usize,
+    pub quarantined_rows: usize,
+    pub quarantine: Vec<QuarantineEntry>,
+}
+
+/// Map lowercase file stem → qualified page ids (wiki-relative, no .md)
+/// for every markdown file under <project>/wiki. Shared by verify
+/// (resolvability), migrate (ownership) and prune (missing-page checks).
+fn wiki_md_stem_owners(project_path: &str) -> HashMap<String, Vec<String>> {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use walkdir::WalkDir;
+
+    let wiki_root = Path::new(project_path).join("wiki");
+    let mut owners: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in WalkDir::new(&wiki_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_md = path
+            .extension()
+            .and_then(|v| v.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md"));
+        if !is_md {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        let Some(rel) = path.strip_prefix(&wiki_root).ok().and_then(|r| r.to_str()) else {
+            continue;
+        };
+        // rel ends with .md (checked above, case-insensitive) — strip 3 chars.
+        let qualified = rel[..rel.len() - 3].replace('\\', "/");
+        owners.entry(stem.to_lowercase()).or_default().push(qualified);
+    }
+    owners
+}
+
+/// L2 norm of one row inside a FixedSizeList vector column. Returns 0.0
+/// when the row slice contains non-finite values so those count as
+/// degenerate too.
+fn row_vector_norm(vector_col: &FixedSizeListArray, row: usize) -> f32 {
+    let values = vector_col.values().as_any().downcast_ref::<Float32Array>();
+    let dim = vector_col.value_length() as usize;
+    let Some(values) = values else {
+        return 0.0;
+    };
+    let offset = row * dim;
+    let mut sum = 0.0f32;
+    for i in 0..dim {
+        let v = values.value(offset + i);
+        if !v.is_finite() {
+            return 0.0;
+        }
+        sum += v * v;
+    }
+    sum.sqrt()
+}
+
+pub async fn verify_vector_table_inner(
+    project_path: &str,
+    duplicate_sample_size: usize,
+) -> Result<VectorVerifyReport, String> {
+    use futures::TryStreamExt;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+
+    let lock = vectorstore_v2_lock(project_path);
+    let _guard = lock.read().await;
+
+    let mut report = VectorVerifyReport {
+        table_exists: false,
+        total_rows: 0,
+        distinct_pages: 0,
+        stem_rows: 0,
+        qualified_rows: 0,
+        vector_dim: 0,
+        degenerate_vectors: 0,
+        sampled_duplicate_vectors: 0,
+        vector_index: "missing-table".to_string(),
+        page_id_index: "missing-table".to_string(),
+        pages_missing_file: 0,
+        stem_ambiguous_pages: 0,
+        stem_orphan_pages: 0,
+        bad_pages: Vec::new(),
+    };
+
+    let db = connect(&db_path(project_path))
+        .execute()
+        .await
+        .map_err(|e| format!("DB connect error: {e}"))?;
+    let tables = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(|e| format!("List tables error: {e}"))?;
+    if !tables.contains(&TABLE_V2.to_string()) {
+        return Ok(report);
+    }
+    report.table_exists = true;
+
+    let table = db
+        .open_table(TABLE_V2)
+        .execute()
+        .await
+        .map_err(|e| format!("Open table error: {e}"))?;
+
+    let schema = table
+        .schema()
+        .await
+        .map_err(|e| format!("Schema error: {e}"))?;
+    if let DataType::FixedSizeList(_, dim) = schema
+        .field_with_name("vector")
+        .map_err(|e| format!("vector field missing: {e}"))?
+        .data_type()
+    {
+        report.vector_dim = *dim;
+    }
+
+    let indices = table
+        .list_indices()
+        .await
+        .map_err(|e| format!("List indices error: {e}"))?;
+    let indexed = |column: &str| {
+        indices
+            .iter()
+            .any(|cfg| cfg.columns.iter().any(|c| c == column))
+    };
+    report.vector_index = if indexed("vector") { "exists" } else { "missing" }.to_string();
+    report.page_id_index = if indexed("page_id") { "exists" } else { "missing" }.to_string();
+
+    let stream = table
+        .query()
+        .execute()
+        .await
+        .map_err(|e| format!("Scan error: {e}"))?;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| format!("Collect rows error: {e}"))?;
+
+    let mut page_rows: HashMap<String, usize> = HashMap::new();
+    let mut degenerate_pages: HashMap<String, usize> = HashMap::new();
+    let mut sampled_seen: HashSet<u64> = HashSet::new();
+    let mut dup_pages: HashSet<String> = HashSet::new();
+    let mut sampled_count = 0usize;
+    let mut sample_stride = 1usize;
+    report.total_rows = batches.iter().map(|b| b.num_rows()).sum();
+    if report.total_rows > duplicate_sample_size && duplicate_sample_size > 0 {
+        sample_stride = (report.total_rows + duplicate_sample_size - 1) / duplicate_sample_size;
+    }
+    let mut global_row = 0usize;
+    for batch in &batches {
+        let page_ids = batch
+            .column_by_name("page_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let vectors = batch
+            .column_by_name("vector")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
+        let (Some(page_ids), Some(vectors)) = (page_ids, vectors) else {
+            return Err("page_id/vector column missing or wrong type".to_string());
+        };
+        for i in 0..batch.num_rows() {
+            let pid = page_ids.value(i).to_string();
+            *page_rows.entry(pid.clone()).or_insert(0) += 1;
+            if pid.contains('/') {
+                report.qualified_rows += 1;
+            } else {
+                report.stem_rows += 1;
+            }
+            if row_vector_norm(vectors, i) <= 1e-12 {
+                report.degenerate_vectors += 1;
+                *degenerate_pages.entry(pid.clone()).or_insert(0) += 1;
+            }
+            if global_row % sample_stride.max(1) == 0 && sampled_count < duplicate_sample_size {
+                let dim = vectors.value_length() as usize;
+                let floats = vectors
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or("vector values not float32")?;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::{Hash, Hasher};
+                for k in 0..dim {
+                    floats.value(i * dim + k).to_bits().hash(&mut hasher);
+                }
+                if !sampled_seen.insert(hasher.finish()) {
+                    dup_pages.insert(pid.clone());
+                }
+                sampled_count += 1;
+            }
+            global_row += 1;
+        }
+    }
+    report.distinct_pages = page_rows.len();
+    report.sampled_duplicate_vectors = dup_pages.len();
+
+    // Resolvability against the wiki tree.
+    let owners = wiki_md_stem_owners(project_path);
+    let wiki_root = Path::new(project_path).join("wiki");
+    let mut missing: Vec<String> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    let mut orphan: Vec<String> = Vec::new();
+    for pid in page_rows.keys() {
+        if pid.contains('/') {
+            let page_file = wiki_root.join(format!("{}.md", pid.replace('/', "\\")));
+            if !page_file.is_file() {
+                missing.push(pid.clone());
+            }
+        } else {
+            match owners.get(&pid.to_lowercase()).map(|v| v.as_slice()) {
+                None | Some(&[]) => orphan.push(pid.clone()),
+                Some(&[_]) => {}
+                Some(_) => ambiguous.push(pid.clone()),
+            }
+        }
+    }
+    report.pages_missing_file = missing.len();
+    report.stem_ambiguous_pages = ambiguous.len();
+    report.stem_orphan_pages = orphan.len();
+
+    // Assemble per-page bad list, grouped and sorted for a stable report.
+    let mut bad_map: HashMap<String, Vec<String>> = HashMap::new();
+    for (pid, rows) in &degenerate_pages {
+        bad_map
+            .entry(pid.clone())
+            .or_default()
+            .push(format!("degenerate_vector_rows={rows}"));
+    }
+    for pid in &dup_pages {
+        bad_map
+            .entry(pid.clone())
+            .or_default()
+            .push("sampled_duplicate_vector".to_string());
+    }
+    for pid in &missing {
+        bad_map
+            .entry(pid.clone())
+            .or_default()
+            .push("missing_file".to_string());
+    }
+    for pid in &orphan {
+        bad_map
+            .entry(pid.clone())
+            .or_default()
+            .push("stem_orphan_no_file".to_string());
+    }
+    for pid in &ambiguous {
+        bad_map
+            .entry(pid.clone())
+            .or_default()
+            .push("stem_ambiguous_multi_owner".to_string());
+    }
+    let mut bad_pages: Vec<VectorBadPage> = bad_map
+        .into_iter()
+        .map(|(page_id, mut reasons)| {
+            reasons.sort();
+            let rows = page_rows.get(&page_id).copied().unwrap_or(0);
+            VectorBadPage {
+                page_id,
+                rows,
+                reasons,
+            }
+        })
+        .collect();
+    bad_pages.sort_by(|a, b| b.rows.cmp(&a.rows).then(a.page_id.cmp(&b.page_id)));
+    report.bad_pages = bad_pages;
+
+    Ok(report)
+}
+
+/// Rewrite v1 bare-stem page_ids to v2 qualified ids. Only stems with
+/// exactly one wiki owner are migrated; the rest are quarantined. Rows are
+/// re-inserted with the new id (merge upsert on chunk_id — idempotent
+/// across interrupted runs) and only afterwards are the old stem rows
+/// deleted, so a crash mid-migration can at worst leave a page indexed
+/// under both ids (harmless: search understands both), never unindexed.
+pub async fn migrate_stem_ids_inner(
+    project_path: &str,
+    dry_run: bool,
+) -> Result<StemMigrationReport, String> {
+    use futures::TryStreamExt;
+    use std::collections::HashMap;
+
+    let lock = vectorstore_v2_lock(project_path);
+    let _guard = lock.write().await;
+
+    let mut report = StemMigrationReport {
+        dry_run,
+        stem_pages: 0,
+        stem_rows: 0,
+        migrated_pages: 0,
+        migrated_rows: 0,
+        quarantined_pages: 0,
+        quarantined_rows: 0,
+        quarantine: Vec::new(),
+    };
+
+    let db = connect(&db_path(project_path))
+        .execute()
+        .await
+        .map_err(|e| format!("DB connect error: {e}"))?;
+    let tables = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(|e| format!("List tables error: {e}"))?;
+    if !tables.contains(&TABLE_V2.to_string()) {
+        return Ok(report);
+    }
+    let table = db
+        .open_table(TABLE_V2)
+        .execute()
+        .await
+        .map_err(|e| format!("Open table error: {e}"))?;
+
+    let schema = table
+        .schema()
+        .await
+        .map_err(|e| format!("Schema error: {e}"))?;
+    let dim = match schema
+        .field_with_name("vector")
+        .map_err(|e| format!("vector field missing: {e}"))?
+        .data_type()
+    {
+        DataType::FixedSizeList(_, dim) => *dim,
+        other => return Err(format!("Unexpected vector column type: {other}")),
+    };
+
+    let stream = table
+        .query()
+        .execute()
+        .await
+        .map_err(|e| format!("Scan error: {e}"))?;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| format!("Collect rows error: {e}"))?;
+
+    // stem -> its row references (batch_idx, row_idx) in scan order.
+    let mut by_stem: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for (bi, batch) in batches.iter().enumerate() {
+        let page_ids = batch
+            .column_by_name("page_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or("page_id column missing")?;
+        for i in 0..batch.num_rows() {
+            let pid = page_ids.value(i);
+            if !pid.contains('/') {
+                by_stem.entry(pid.to_string()).or_default().push((bi, i));
+            }
+        }
+    }
+    report.stem_pages = by_stem.len();
+    report.stem_rows = by_stem.values().map(|v| v.len()).sum();
+    if report.stem_rows == 0 {
+        return Ok(report);
+    }
+
+    let owners = wiki_md_stem_owners(project_path);
+
+    // Partition stems into migratable / quarantined.
+    struct Migration {
+        stem: String,
+        qualified: String,
+        rows: Vec<(usize, usize)>, // (batch_idx, row_idx)
+    }
+    let mut migrations: Vec<Migration> = Vec::new();
+    for (stem, refs) in &by_stem {
+        match owners.get(&stem.to_lowercase()).map(|v| v.as_slice()) {
+            Some([qualified]) => migrations.push(Migration {
+                stem: stem.clone(),
+                qualified: qualified.to_string(),
+                rows: refs.clone(),
+            }),
+            other => {
+                let reason = match other {
+                    None | Some(&[]) => "orphan_no_file".to_string(),
+                    Some(_) => "ambiguous_multi_owner".to_string(),
+                };
+                report.quarantine.push(QuarantineEntry {
+                    stem: stem.clone(),
+                    reason,
+                    owners: other.unwrap_or(&[]).to_vec(),
+                    rows: refs.len(),
+                });
+            }
+        }
+    }
+    report.quarantine.sort_by(|a, b| a.stem.cmp(&b.stem));
+    report.quarantined_pages = report.quarantine.len();
+    report.quarantined_rows = report.quarantine.iter().map(|q| q.rows).sum();
+
+    if dry_run {
+        report.migrated_pages = migrations.len();
+        report.migrated_rows = migrations.iter().map(|m| m.rows.len()).sum();
+        return Ok(report);
+    }
+
+    // Build rewritten rows per migration batch. New rows carry the same
+    // vector/text/heading and original chunk_index; page_id/chunk_id use
+    // the qualified form.
+    let target_schema = make_schema_v2(dim);
+    const MIGRATION_WRITE_BATCH: usize = 2_000;
+    let mut pending: Vec<RecordBatch> = Vec::new();
+
+    async fn flush_pending(
+        table: &lancedb::table::Table,
+        pending: &mut Vec<RecordBatch>,
+        target_schema: &Arc<Schema>,
+    ) -> Result<(), String> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let batches_ref: Vec<Result<RecordBatch, arrow_schema::ArrowError>> =
+            pending.drain(..).map(Ok).collect();
+        let data = RecordBatchIterator::new(batches_ref, target_schema.clone());
+        let mut merge = table.merge_insert(&["chunk_id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge
+            .execute(Box::new(data))
+            .await
+            .map_err(|e| format!("Merge migrated rows error: {e}"))?;
+        Ok(())
+    }
+
+    for m in &migrations {
+        let mut chunk_ids: Vec<String> = Vec::with_capacity(m.rows.len());
+        let mut page_ids: Vec<String> = Vec::with_capacity(m.rows.len());
+        let mut indexes: Vec<u32> = Vec::with_capacity(m.rows.len());
+        let mut texts: Vec<String> = Vec::with_capacity(m.rows.len());
+        let mut headings: Vec<String> = Vec::with_capacity(m.rows.len());
+        let mut flat_vectors: Vec<f32> = Vec::with_capacity(m.rows.len() * dim as usize);
+
+        for &(bi, ri) in &m.rows {
+            let src = &batches[bi];
+            let idx = src
+                .column_by_name("chunk_index")
+                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
+                .ok_or("chunk_index column missing")?
+                .value(ri);
+            let text = src
+                .column_by_name("chunk_text")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or("chunk_text column missing")?
+                .value(ri)
+                .to_string();
+            let heading = src
+                .column_by_name("heading_path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or("heading_path column missing")?
+                .value(ri)
+                .to_string();
+            let vectors = src
+                .column_by_name("vector")
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+                .ok_or("vector column missing")?;
+            let values = vectors
+                .values()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or("vector values not float32")?;
+            let start = ri * dim as usize;
+            flat_vectors.extend_from_slice(&values.values()[start..start + dim as usize]);
+
+            chunk_ids.push(format!("{}#{}", m.qualified, idx));
+            page_ids.push(m.qualified.clone());
+            indexes.push(idx);
+            texts.push(text);
+            headings.push(heading);
+        }
+
+        let chunk_ids_arr: ArrayRef = Arc::new(StringArray::from(chunk_ids));
+        let page_ids_arr: ArrayRef = Arc::new(StringArray::from(page_ids));
+        let indexes_arr: ArrayRef = Arc::new(UInt32Array::from(indexes));
+        let texts_arr: ArrayRef = Arc::new(StringArray::from(texts));
+        let headings_arr: ArrayRef = Arc::new(StringArray::from(headings));
+        let values_arr = Float32Array::from(flat_vectors);
+        let vector_arr: ArrayRef = Arc::new(FixedSizeListArray::new(
+            Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+            dim,
+            Arc::new(values_arr),
+            None,
+        ));
+        let new_batch = RecordBatch::try_new(
+            target_schema.clone(),
+            vec![
+                chunk_ids_arr,
+                page_ids_arr,
+                indexes_arr,
+                texts_arr,
+                headings_arr,
+                vector_arr,
+            ],
+        )
+        .map_err(|e| format!("Batch error: {e}"))?;
+        pending.push(new_batch);
+
+        report.migrated_pages += 1;
+        report.migrated_rows += m.rows.len();
+        if pending.iter().map(|b| b.num_rows()).sum::<usize>() >= MIGRATION_WRITE_BATCH {
+            flush_pending(&table, &mut pending, &target_schema).await?;
+        }
+    }
+    flush_pending(&table, &mut pending, &target_schema).await?;
+
+    // All new rows are durable — now remove the old stem rows, batched.
+    const DELETE_BATCH: usize = 100;
+    let stems: Vec<String> = migrations.iter().map(|m| m.stem.clone()).collect();
+    for chunk in stems.chunks(DELETE_BATCH) {
+        table
+            .delete(&page_id_in_predicate(chunk))
+            .await
+            .map_err(|e| format!("Delete migrated stem rows error: {e}"))?;
+    }
+
+    Ok(report)
+}
+
+/// Prune vector rows whose backing wiki page no longer exists:
+/// qualified ids whose `wiki/<id>.md` is gone, and orphan bare-stem ids
+/// with no same-named markdown anywhere. Rows for live pages are never
+/// touched. This is the delete-side lane of the "verify → locate bad
+/// blocks → per-page delete + re-embed" repair flow (R3 2026-10-24);
+/// re-embedding a pruned page that reappears happens automatically the
+/// next time it is ingested/embedded.
+///
+/// Returns (pruned_pages, pruned_rows) — counts are computed even under
+/// dry-run (where nothing is deleted).
+pub async fn prune_missing_vector_pages_inner(
+    project_path: &str,
+    dry_run: bool,
+) -> Result<(usize, usize), String> {
+    use futures::TryStreamExt;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    let lock = vectorstore_v2_lock(project_path);
+    let _guard = lock.write().await;
+
+    let db = connect(&db_path(project_path))
+        .execute()
+        .await
+        .map_err(|e| format!("DB connect error: {e}"))?;
+    let tables = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(|e| format!("List tables error: {e}"))?;
+    if !tables.contains(&TABLE_V2.to_string()) {
+        return Ok((0, 0));
+    }
+    let table = db
+        .open_table(TABLE_V2)
+        .execute()
+        .await
+        .map_err(|e| format!("Open table error: {e}"))?;
+
+    let stream = table
+        .query()
+        .execute()
+        .await
+        .map_err(|e| format!("Scan error: {e}"))?;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| format!("Collect rows error: {e}"))?;
+
+    let mut page_rows: HashMap<String, usize> = HashMap::new();
+    for batch in &batches {
+        let page_ids = batch
+            .column_by_name("page_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or("page_id column missing")?;
+        for i in 0..batch.num_rows() {
+            *page_rows.entry(page_ids.value(i).to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let owners = wiki_md_stem_owners(project_path);
+    let wiki_root = Path::new(project_path).join("wiki");
+    let mut doomed: Vec<String> = Vec::new();
+    for pid in page_rows.keys() {
+        let missing = if pid.contains('/') {
+            !wiki_root
+                .join(format!("{}.md", pid.replace('/', "\\")))
+                .is_file()
+        } else {
+            matches!(
+                owners.get(&pid.to_lowercase()).map(|v| v.as_slice()),
+                None | Some(&[])
+            )
+        };
+        if missing {
+            doomed.push(pid.clone());
+        }
+    }
+
+    let pruned_rows: usize = doomed.iter().map(|p| page_rows[p]).sum();
+    if dry_run || doomed.is_empty() {
+        return Ok((doomed.len(), pruned_rows));
+    }
+
+    for chunk in doomed.chunks(100) {
+        table
+            .delete(&page_id_in_predicate(chunk))
+            .await
+            .map_err(|e| format!("Delete missing-page rows error: {e}"))?;
+    }
+    Ok((doomed.len(), pruned_rows))
+}
+
 #[cfg(test)]
 mod tests_v2 {
     use super::*;
@@ -1768,4 +2449,230 @@ mod tests_v2 {
         // Should just return Ok(()), not error.
         vector_drop_legacy(pp).await.unwrap();
     }
+    fn write_wiki_page(project: &PathBuf, rel: &str, content: &str) {
+        let path = project.join("wiki").join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_reports_id_forms_and_missing_files() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        // qualified id with a real file, qualified id with no file,
+        // stem id with a unique owner file.
+        write_wiki_page(&p, "dirA/exists.md", "# exists");
+        vector_upsert_chunks(
+            pp.clone(),
+            "dirA/exists".into(),
+            make_chunks("dirA/exists", 2, 16),
+        )
+        .await
+        .unwrap();
+        vector_upsert_chunks(
+            pp.clone(),
+            "dirA/ghost".into(),
+            make_chunks("dirA/ghost", 1, 16),
+        )
+        .await
+        .unwrap();
+        write_wiki_page(&p, "dirB/unique-stem.md", "# unique");
+        vector_upsert_chunks(
+            pp.clone(),
+            "unique-stem".into(),
+            make_chunks("unique-stem", 3, 16),
+        )
+        .await
+        .unwrap();
+
+        let report = verify_vector_table_inner(&pp, 64).await.unwrap();
+        assert!(report.table_exists);
+        assert_eq!(report.total_rows, 6);
+        assert_eq!(report.stem_rows, 3);
+        assert_eq!(report.qualified_rows, 3);
+        assert_eq!(report.vector_dim, 16);
+        assert_eq!(report.degenerate_vectors, 0);
+        assert_eq!(report.pages_missing_file, 1);
+        assert_eq!(report.stem_ambiguous_pages, 0);
+        assert_eq!(report.stem_orphan_pages, 0);
+        let ghost = report
+            .bad_pages
+            .iter()
+            .find(|b| b.page_id == "dirA/ghost")
+            .expect("ghost page flagged");
+        assert!(ghost.reasons.contains(&"missing_file".to_string()));
+    }
+
+    #[tokio::test]
+    async fn verify_detects_degenerate_vectors() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+        write_wiki_page(&p, "d/zero.md", "# zero");
+
+        let mut chunks = make_chunks("d/zero", 1, 16);
+        chunks[0].embedding = vec![0.0; 16];
+        vector_upsert_chunks(pp.clone(), "d/zero".into(), chunks)
+            .await
+            .unwrap();
+
+        let report = verify_vector_table_inner(&pp, 64).await.unwrap();
+        assert_eq!(report.degenerate_vectors, 1);
+        assert!(report.bad_pages.iter().any(|b| b.page_id == "d/zero"
+            && b.reasons.iter().any(|r| r.starts_with("degenerate"))));
+    }
+
+    #[tokio::test]
+    async fn migrate_rewrites_unique_owner_stem_and_keeps_vectors() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        write_wiki_page(&p, "cases/company-x/overview.md", "# overview");
+        let chunks = make_chunks("overview", 3, 16);
+        let expected_vectors: Vec<Vec<f32>> = chunks.iter().map(|c| c.embedding.clone()).collect();
+        vector_upsert_chunks(pp.clone(), "overview".into(), chunks)
+            .await
+            .unwrap();
+        // A v2 row that must not be touched.
+        write_wiki_page(&p, "other/page-y.md", "# y");
+        vector_upsert_chunks(
+            pp.clone(),
+            "other/page-y".into(),
+            make_chunks("other/page-y", 2, 16),
+        )
+        .await
+        .unwrap();
+
+        let report = migrate_stem_ids_inner(&pp, false).await.unwrap();
+        assert!(!report.dry_run);
+        assert_eq!(report.stem_pages, 1);
+        assert_eq!(report.migrated_pages, 1);
+        assert_eq!(report.migrated_rows, 3);
+        assert_eq!(report.quarantined_pages, 0);
+
+        let verify = verify_vector_table_inner(&pp, 64).await.unwrap();
+        assert_eq!(verify.stem_rows, 0);
+        assert_eq!(verify.total_rows, 5);
+        assert_eq!(verify.distinct_pages, 2);
+
+        // The migrated rows keep their vectors: search under the new id
+        // must still return all 3 chunks.
+        let probe = expected_vectors[0].clone();
+        let hits = vector_search_chunks(
+            pp.clone(),
+            probe,
+            10,
+            Some(vec!["cases/company-x/overview".to_string()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits
+            .iter()
+            .all(|h| h.page_id == "cases/company-x/overview"));
+
+        // Idempotent: second run is a no-op.
+        let again = migrate_stem_ids_inner(&pp, false).await.unwrap();
+        assert_eq!(again.stem_pages, 0);
+        assert_eq!(again.migrated_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn migrate_quarantines_ambiguous_and_orphan_stems() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        // Ambiguous: same stem under two directories.
+        write_wiki_page(&p, "a/dup.md", "# dup a");
+        write_wiki_page(&p, "b/dup.md", "# dup b");
+        vector_upsert_chunks(pp.clone(), "dup".into(), make_chunks("dup", 2, 16))
+            .await
+            .unwrap();
+        // Orphan: no wiki file at all.
+        vector_upsert_chunks(
+            pp.clone(),
+            "nowhere".into(),
+            make_chunks("nowhere", 1, 16),
+        )
+        .await
+        .unwrap();
+
+        let report = migrate_stem_ids_inner(&pp, false).await.unwrap();
+        assert_eq!(report.migrated_pages, 0);
+        assert_eq!(report.quarantined_pages, 2);
+        assert_eq!(report.quarantined_rows, 3);
+        let reasons: Vec<&str> = report
+            .quarantine
+            .iter()
+            .map(|q| q.reason.as_str())
+            .collect();
+        assert!(reasons.contains(&"ambiguous_multi_owner"));
+        assert!(reasons.contains(&"orphan_no_file"));
+
+        // Nothing was written: stem rows survive untouched.
+        let verify = verify_vector_table_inner(&pp, 64).await.unwrap();
+        assert_eq!(verify.stem_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn migrate_dry_run_writes_nothing() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        write_wiki_page(&p, "solo/only.md", "# only");
+        vector_upsert_chunks(pp.clone(), "only".into(), make_chunks("only", 2, 16))
+            .await
+            .unwrap();
+
+        let report = migrate_stem_ids_inner(&pp, true).await.unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.migrated_pages, 1);
+        assert_eq!(report.migrated_rows, 2);
+
+        let verify = verify_vector_table_inner(&pp, 64).await.unwrap();
+        assert_eq!(verify.stem_rows, 2, "dry-run must not rewrite rows");
+    }
+
+    #[tokio::test]
+    async fn prune_removes_missing_pages_and_keeps_live_ones() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        write_wiki_page(&p, "live/page.md", "# live");
+        vector_upsert_chunks(
+            pp.clone(),
+            "live/page".into(),
+            make_chunks("live/page", 2, 16),
+        )
+        .await
+        .unwrap();
+        // Qualified ghost + orphan stem.
+        vector_upsert_chunks(
+            pp.clone(),
+            "live/gone".into(),
+            make_chunks("live/gone", 1, 16),
+        )
+        .await
+        .unwrap();
+        vector_upsert_chunks(
+            pp.clone(),
+            "lonely".into(),
+            make_chunks("lonely", 1, 16),
+        )
+        .await
+        .unwrap();
+
+        let (pages, rows) = prune_missing_vector_pages_inner(&pp, true).await.unwrap();
+        assert_eq!((pages, rows), (2, 2), "dry-run counts only");
+        assert_eq!(vector_count_chunks(pp.clone()).await.unwrap(), 4);
+
+        let (pages, rows) = prune_missing_vector_pages_inner(&pp, false).await.unwrap();
+        assert_eq!((pages, rows), (2, 2));
+        assert_eq!(vector_count_chunks(pp.clone()).await.unwrap(), 2);
+
+        let verify = verify_vector_table_inner(&pp, 64).await.unwrap();
+        assert_eq!(verify.pages_missing_file, 0);
+        assert_eq!(verify.stem_orphan_pages, 0);
+    }
+
 }
