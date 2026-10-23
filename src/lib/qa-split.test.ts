@@ -14,7 +14,7 @@ import {
   splitQaDocument,
   splitReplySections,
 } from "./qa-split"
-import type { QaRoundMeta, SplitQuestion } from "./qa-split"
+import type { QaSplitResult, SplitQuestion } from "./qa-split"
 import { FILE_BLOCK_REGEX } from "./ingest"
 
 /**
@@ -1494,14 +1494,7 @@ describe("qa-split — sanitizeFallbackTags value domain (附录 B 全量枚举)
 
 // ── B4（2026-10-22 审计 S7）：question 页 title 题号前缀清洗 ──────────
 
-describe("qa-split — questionTitle strips the leading question number (B4)", () => {
-  const roundMeta: QaRoundMeta = {
-    roundKind: "审核问询函",
-    roundNo: 1,
-    issuer: "交易所",
-    basis: "test",
-  }
-
+describe("qa-split — questionTitle is the bare stem (R3 §六.4, B4 prefix retained on dup)", () => {
   function titleOf(stem: string, questionNo: number): string {
     const question: SplitQuestion = {
       questionNo,
@@ -1514,33 +1507,190 @@ describe("qa-split — questionTitle strips the leading question number (B4)", (
       replyStartLine: 1,
       endLine: 2,
     }
-    return questionTitle(question, roundMeta)
+    return questionTitle(question)
   }
 
-  it("strips the duplicated arabic-number prefix (第1轮·问题7·7、关于…)", () => {
-    expect(titleOf("7、关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+  it("strips the duplicated arabic-number prefix (7、关于…)", () => {
+    expect(titleOf("7、关于股份支付", 7)).toBe("关于股份支付")
   })
 
   it("strips dot and fullwidth-dot separators", () => {
-    expect(titleOf("7.关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
-    expect(titleOf("7．关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+    expect(titleOf("7.关于股份支付", 7)).toBe("关于股份支付")
+    expect(titleOf("7．关于股份支付", 7)).toBe("关于股份支付")
   })
 
   it("strips the chinese-number prefix", () => {
-    expect(titleOf("七、关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+    expect(titleOf("七、关于股份支付", 7)).toBe("关于股份支付")
   })
 
   it("strips a bracket-wrapped number", () => {
-    expect(titleOf("(七)关于股份支付", 7)).toBe("第1轮·问题7·关于股份支付")
+    expect(titleOf("(七)关于股份支付", 7)).toBe("关于股份支付")
   })
 
   it("keeps numeric-open headings without a separator (7个交易日)", () => {
-    expect(titleOf("7个交易日的资金占用", 7)).toBe(
-      "第1轮·问题7·7个交易日的资金占用",
-    )
+    expect(titleOf("7个交易日的资金占用", 7)).toBe("7个交易日的资金占用")
   })
 
   it("keeps a heading whose number is another question's", () => {
-    expect(titleOf("8、关于股份支付", 7)).toBe("第1轮·问题7·8、关于股份支付")
+    expect(titleOf("8、关于股份支付", 7)).toBe("8、关于股份支付")
+  })
+})
+
+describe("qa-split — R3 first-question recognition (2026-10-24 三案例)", () => {
+  /** 上能电气形态：裸行「问题一」题边界（题号后无分隔符），深交所定增
+   *  回复实测——此前 H3 全落空坠 H4，Q2 混入 11 万字符多题。 */
+  const shangnengDoc = [
+    "关于上能电气股份有限公司",
+    "申请向特定对象发行股票的审核问询函的回复",
+    "",
+    "目录",
+    "问题一............................................ 3",
+    "问题二.......................................... 118",
+    "问题三.......................................... 204",
+    "其他问题 ....................................... 220",
+    "",
+    "1-3",
+    "问题一",
+    "1．根据申报材料，发行人主营业务收入主要来源于光伏逆变器。",
+    "请发行人说明业绩波动的原因及合理性。",
+    "回复：",
+    "一、业绩波动原因",
+    "报告期业绩情况如下。",
+    "（表格省略）",
+    "",
+    "问题二",
+    "2．根据申报材料，发行人本次发行拟募集资金165,000万元。",
+    "请发行人说明募投项目的合理性与必要性。",
+    "回复：",
+    "一、募集资金投向",
+    "本次募集资金投向以下项目。",
+    "",
+    "问题三",
+    "3．根据申报材料，发行人实际控制人为吴强、吴超。",
+    "请发行人说明控制权稳定性。",
+    "回复：",
+    "一、控制权情况",
+    "控制权稳定。",
+  ].join("\n")
+
+  it("上能电气：裸行「问题一」边界走 H3 拆 3 题", () => {
+    const kind = classifyQaDocument(shangnengDoc)
+    expect(kind).toBe("reply")
+    const result = splitQaDocument(shangnengDoc, kind!)
+    expect(result.channel).toBe("H3")
+    expect(result.questions).toHaveLength(3)
+    expect(result.questions[0].questionNo).toBe(1)
+    expect(result.questions[0].title).toContain("根据申报材料")
+    // 裸行「问题一」边界行在题干里（逐字转录），题干含「请发行人说明」
+    expect(result.questions[0].questionText).toContain("问题一")
+    expect(result.questions[0].questionText).toContain("请发行人说明业绩波动")
+    expect(result.questions[1].questionNo).toBe(2)
+    // 目录题号对账：中文题号+半角点线收得到
+    expect(result.tocNumbers).toEqual([1, 2, 3])
+  })
+
+  it("上能电气：句中「问题一的回复」不误命中裸行边界", () => {
+    const doc = "前言。\n问题一的回复内容见下文。\n回复：\n正文。"
+    const markers = splitQaDocument(doc, "reply")
+    // 「问题一的回复」不带分隔符也不在行尾，不作题边界——全文无题边界
+    expect(markers.channel).toBe("H4")
+  })
+
+  /** 华泰核查意见形态：单题文件，「回复：」前是封面+致函+字体说明，
+   *  此前 title=「华泰联合证券有限责任公司」（保荐机构名）。 */
+  const huataiDoc = [
+    "6-2-1-1",
+    "华泰联合证券有限责任公司",
+    "关于国旅文化投资集团股份有限公司申请注册环节反馈意见落实函的回复之核查意见",
+    "独立财务顾问",
+    "签署日期：二〇二六年六月",
+    "6-2-1-2",
+    "中国证券监督管理委员会、上海证券交易所：",
+    "华泰联合证券作为独立财务顾问对落实函所提问题进行了认真讨论分析，",
+    "现将相关回复说明如下。",
+    "落实函所列问题",
+    "黑体（加粗）",
+    "落实函所列问题的回复、对重组报告书的引用",
+    "宋体",
+    "",
+    "6-2-1-3",
+    "上市公司年报审计机构中审华会计师事务所(特殊普通合伙)被暂停从事证",
+    "券服务业务6个月。",
+    "请公司说明上述新增事项对本次发行的影响。",
+    "请独立财务顾问和会计师核查并发表明确意见。",
+    "回复：",
+    "一、影响分析",
+    "经核查，影响可控。",
+  ].join("\n")
+
+  it("华泰核查意见：H4 首题剥离封面/致函，title 为题干而非机构名", () => {
+    const kind = classifyQaDocument(huataiDoc)
+    expect(kind).toBe("reply")
+    const result = splitQaDocument(huataiDoc, kind!)
+    expect(result.channel).toBe("H4")
+    expect(result.questions).toHaveLength(1)
+    const q1 = result.questions[0]
+    expect(q1.title).not.toContain("华泰联合证券有限责任公司")
+    expect(q1.title).not.toContain("独立财务顾问")
+    expect(q1.title).toContain("上市公司年报审计机构")
+    // 题干段=致函收尾（宋体行）之后的内容，封面/致函不进题干
+    expect(q1.questionText).toContain("上市公司年报审计机构")
+    expect(q1.questionText).not.toContain("签署日期")
+    expect(q1.questionText).not.toContain("现将相关回复说明如下")
+  })
+
+  it("机构名整行白名单：含机构关键词的题干长句不误杀", () => {
+    // 题干中段含「会计师事务所(特殊普通合伙)」但括号后还有正文——不是
+    // 整行机构名，必须保留为标题候选（华泰实测曾误杀跳行取断句中段）。
+    const doc = [
+      "封面页",
+      "华泰联合证券有限责任公司（XY HUATAI UNITED SECURITIES CO.,LTD.）",
+      "说明如下。",
+      "上市公司年报审计机构中审华会计师事务所(特殊普通合伙)被暂停从事证",
+      "请公司说明影响。",
+      "回复：",
+      "经核查，无重大影响。",
+    ].join("\n")
+    const result = splitQaDocument(doc, "reply")
+    expect(result.questions[0].title).toContain("上市公司年报审计机构")
+  })
+
+  it("前言剥离过猛回退：题干区剥空则保持整块", () => {
+    const doc = ["题干内容。", "说明如下。", "回复：", "经核查无影响。"].join("\n")
+    const result = splitQaDocument(doc, "reply")
+    // 收尾行紧贴「回复：」——剥空回退整块，题干不丢
+    expect(result.questions[0].questionText).toContain("题干内容")
+  })
+
+  it("buildQuestionFileBlocks：纯标题制 + 批内重复回退问题N前缀", () => {
+    const split: QaSplitResult = {
+      kind: "reply",
+      channel: "H3",
+      questions: [
+        {
+          questionNo: 1, title: "关于同业竞争", questionText: "题干一", replyText: "回复一",
+          channel: "H3", questionNoIsGenerated: false, startLine: 0, replyStartLine: 1, endLine: 2,
+        },
+        {
+          questionNo: 2, title: "关于同业竞争", questionText: "题干二", replyText: "回复二",
+          channel: "H3", questionNoIsGenerated: false, startLine: 3, replyStartLine: 4, endLine: 5,
+        },
+      ],
+      tocNumbers: [1, 2],
+      manualQueue: null,
+    }
+    const build = buildQuestionFileBlocks(
+      "题干一\n回复一\n题干二\n回复二",
+      split,
+      { company: "测试公司", year: "2025" },
+      { roundNo: 1, roundKind: "审核问询函", issuer: "交易所", basis: "test" },
+      "scheduled-import/问答/2025/test/test.pdf",
+      "slug-x",
+    )
+    expect(build.verbatimViolations).toEqual([])
+    const titles = [...build.fileBlocksText.matchAll(/^title: (.+)$/gm)].map((m) => m[1])
+    // 第一题纯标题，第二题重复回退「问题2·」前缀
+    expect(titles.some((t) => t.includes("关于同业竞争") && !t.includes("问题"))).toBe(true)
+    expect(titles.some((t) => t.includes("问题2·关于同业竞争"))).toBe(true)
   })
 })

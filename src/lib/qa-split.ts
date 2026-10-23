@@ -63,8 +63,10 @@ const H2_BARE_LINE = new RegExp(
 /** 结构三段式佐证行：问询题干起始段的典型句式（问什么/怎么答的标志）。 */
 const QUESTION_CONTEXT_LINE =
   /^\s*(?:#{0,4}\s*)?回复\s*[：:]|请\s*(?:发行人|保荐人|保荐机构|会计师|律师)|首轮问询回复及申报材料|申报材料(?:及问询回复|显示)|根据.{0,30}(?:申报材料|问询回复)/
-/** H3: `问题N、`/`问题N：`/`问题N.`（后者排除小数 N. 后跟数字）。用于行内任意位置。 */
-const H3_ANYWHERE = /问题\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*[、．:：]|问题\s*([0-9]{1,3})\.(?!\d)/g
+/** H3: `问题N、`/`问题N：`/`问题N.`（后者排除小数 N. 后跟数字）。用于行内任意位置。
+ *  2026-10-24 R3 补：中文题号后跟半角点（目录「问题一...... 3」点线形态，
+ *  上能电气实测——原正则中文分支只认全角分隔符，toc 收不到中文题号）。 */
+const H3_ANYWHERE = /问题\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*[、．:：]|问题\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*\.(?!\d)/g
 /** H3 边界行（行首锚）。四种实测形态：
  *  1. 「问题N、/问题N：/问题N.」裸行（防小数 N. 后跟数字；北交所函件半角点形态）
  *  2. 「一. 关于问询问题 1.关于XX」——补充法律意见书：中文序数前缀（日播时尚实测）
@@ -76,9 +78,14 @@ const H3_ANYWHERE = /问题\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})
  *     核查意见族实测 2026-10-14：至正股份 6-5 `## 问题二（原问题七）、关于
  *     资产基础法评估`、日播时尚评估专项裸行同形态；注记限 ≤12 字防长括号
  *     内容误伤）。
+ *  6. 裸行「问题一」——题号后无分隔符直接行尾（上能电气定增回复实测
+ *     2026-10-24 R3：深交所函件题边界裸中文题号独行，原正则要求分隔符
+ *     全落空坠入 H4 兜底，Q2 混入 11 万字符多题）。分隔符组加行尾 `$`
+ *     锚：行首锚+题号后即行尾才命中——「问题一的回复如下」「问题 1 」
+ *     之类句中/带尾缀形态不收。
  *  引号开头的引用行（「"一.关于问询问题 1…"之"（三）」）不命中——前缀字符集不含引号。 */
 const H3_BODY_LINE =
-  /^[ \t]{0,8}(?:#{1,4}[ \t]+)?(?:[一二三四五六七八九十]{1,3}\s*[.、．]\s*)?(?:(?:《[^》]{2,60}》\s*)?(?:关于\s*)?(?:问询\s*)?问题\s*(?:[0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*(?:[（(][^)）]{0,12}[)）])?\s*(?:[、．:：]|\.(?!\d))|《[^》]{2,60}》\s*[0-9]{1,3}\s*(?:[、．:：]|\.(?!\d))\s*(?:关于|其他))/
+  /^[ \t]{0,8}(?:#{1,4}[ \t]+)?(?:[一二三四五六七八九十]{1,3}\s*[.、．]\s*)?(?:(?:《[^》]{2,60}》\s*)?(?:关于\s*)?(?:问询\s*)?问题\s*(?:[0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*(?:[（(][^)）]{0,12}[)）])?\s*(?:[、．:：]|\.(?!\d)|$)|《[^》]{2,60}》\s*[0-9]{1,3}\s*(?:[、．:：]|\.(?!\d))\s*(?:关于|其他))/
 /** 目录行特征：4+ 连续 `.` 或 2+ 连续 `…`（页码引导点线；中文省略号
  *  习惯「……」两字符成对，2026-10-12 埃泰克目录实测）。 */
 const TOC_DOT_LEADER = /\.{4,}|…{2,}/
@@ -352,6 +359,9 @@ function extractQuestionNo(line: string): number {
   if (dot) return cn2num(dot[1])
   const letterNum = line.match(/《[^》]{2,60}》\s*([0-9]{1,3})\s*(?:[、．:：]|\.(?!\d))\s*(?:关于|其他)/)
   if (letterNum) return cn2num(letterNum[1])
+  // 裸行「问题一」形态（R3 2026-10-24）：题号后直接行尾，整行无其他内容。
+  const bare = line.trim().match(/^问题\s*([一二三四五六七八九十]{1,3})$/)
+  if (bare) return cn2num(bare[1])
   return 0
 }
 
@@ -672,6 +682,12 @@ function cutQuestions(
   return out
 }
 
+/** 致函/封面收尾特征行（H4 首题前言剥离用，R3 2026-10-24）：中介核查
+ *  意见族（落实函回复之核查意见等单题文件）「回复：」之前的题目区是
+ *  封面+致函+字体说明，真题干在其后——最后一个此类行之后才是题干。
+ *  句尾收尾（说明如下/回复如下/请予审核）与独立字体说明行（黑体/宋体/楷体）。 */
+const PREFATORY_LINE = /(?:说明如下|回复如下|请予审核|予以审核|请审核|审核照鉴)[。：:！]?\s*$|^[ \t]*(?:黑体|宋体|楷体)/
+
 function cutByReplyBlocks(lines: string[], replyMarkers: number[]): SplitQuestion[] {
   const out: SplitQuestion[] = []
   for (let idx = 0; idx < replyMarkers.length; idx += 1) {
@@ -691,6 +707,18 @@ function cutByReplyBlocks(lines: string[], replyMarkers: number[]): SplitQuestio
       }
       if (tocCount >= 3 && lastToc + 1 < replyStart) {
         blockStart = lastToc + 1
+      }
+      // R3 前言剥离：无题号标记的核查意见族首块，题目区开头是封面+致函
+      // （「现将相关回复说明如下」/字体说明收尾）——真题干从最后一个致函
+      // 收尾行之后起。剥离过猛（题干区为空）则回退整块，宁可封面混入
+      // 不可题干丢失（题干为空由 §六 的空题干防线另行处理）。
+      let leadInEnd = -1
+      for (let i = blockStart; i < replyStart; i += 1) {
+        if (PREFATORY_LINE.test(lines[i])) leadInEnd = i
+      }
+      if (leadInEnd >= 0 && leadInEnd + 1 < replyStart) {
+        const stripped = lines.slice(leadInEnd + 1, replyStart).join("\n").trim()
+        if (stripped) blockStart = leadInEnd + 1
       }
     }
     const questionText = lines.slice(blockStart, replyStart).join("\n").trim()
@@ -712,6 +740,15 @@ function cutByReplyBlocks(lines: string[], replyMarkers: number[]): SplitQuestio
   return out
 }
 
+/** 机构名/页码/装饰行——不配当题标题（R3 2026-10-24 首题白名单防线）：
+ *  H4 首块封面以中介机构全称开头的形态（ST 联合华泰核查意见实测，
+ *  此前 title=「华泰联合证券有限责任公司」）跳过取实质行。判据：整行
+ *  是机构名（品牌前缀短 + 机构关键词 + 公司/事务所后缀 + 可选括号注释
+ *  后即行尾）——题干长句中段虽含「会计师事务所(特殊普通合伙)被暂停
+ *  从事证券服务…」（华泰实测误杀形态）但括号后仍有正文，行尾锚挡住。 */
+const NON_TITLE_LINE =
+  /^[\d\s-]{1,14}$|^[\u4e00-\u9fa5A-Za-z0-9]{2,16}(?:证券|会计师|律师|资产评估|评估|财务顾问|保荐)[\u4e00-\u9fa5]{0,10}(?:公司|事务所|中心|集团)?(?:[（(][^）)]{1,60}[)）])?\s*$/
+
 function titleFromBlock(
   lines: string[],
   start: number,
@@ -721,15 +758,18 @@ function titleFromBlock(
   for (let i = start; i <= end; i += 1) {
     const line = lines[i].trim()
     if (!line || line.startsWith("## Page") || /^[-—·\s]+$/.test(line)) continue
-    return line
+    if (NON_TITLE_LINE.test(line)) continue
+    const stripped = line
       .replace(/^#{1,4}\s*/, "")
       // 意见书前缀：「一.」「一、」「《审核问询函》」「关于问询」
       .replace(/^[一二三四五六七八九十]{1,3}\s*[.、．]\s*/, "")
       .replace(/^《[^》]{2,60}》\s*/, "")
       .replace(/^(?:关于\s*)?(?:问询\s*)?问题\s*[0-9一二三四五六七八九十]{1,3}\s*[、．:：.]?\s*/, "")
       .replace(/^问题\s*[0-9一二三四五六七八九十]{1,3}\s*/, "")
-      .slice(0, 40)
-      .trim() || `第${questionNo}题`
+      .trim()
+    // 剥空（裸题号行「问题一」上能电气形态）→ 继续找第一个实质行当标题
+    // （题干首句）；全块剥空才回退「第N题」。
+    if (stripped) return stripped.slice(0, 40).trim() || `第${questionNo}题`
   }
   return `第${questionNo}题`
 }
@@ -933,14 +973,17 @@ export function stripQuestionNoPrefix(stem: string, questionNo: number): string 
   return stem
 }
 
-export function questionTitle(
-  question: SplitQuestion,
-  roundMeta: QaRoundMeta,
-): string {
-  const round = roundMeta.roundNo ? `第${roundMeta.roundNo}轮` : roundMeta.roundKind
+/**
+ * question 页 title：真标题本体（R3 2026-10-24 §六.4 治本）——不再拼
+ * 「{轮次}·问题N·」前缀。轮次/题号信息由 frontmatter round_no/round_kind/
+ * question_no 结构化字段承载，展示层无需从 title 里剥；此前「审核问询函·
+ * 问题1·第1题」形态在消费端需展示层二次清洗（IPO 案例页实看实锤）。
+ * 同文档内标题重复时由调用方 buildQuestionFileBlocks 消歧（回退
+ * 「问题N·」前缀），questionTitle 本身保持单题纯标题。
+ */
+export function questionTitle(question: SplitQuestion): string {
   const cleaned = stripQuestionNoPrefix(question.title, question.questionNo)
-  const stem = cleaned.slice(0, TITLE_MAX).trim() || `第${question.questionNo}题`
-  return `${round}·问题${question.questionNo}·${stem}`
+  return cleaned.slice(0, TITLE_MAX).trim() || `第${question.questionNo}题`
 }
 
 /**
@@ -983,6 +1026,17 @@ export function buildQuestionFileBlocks(
       `> 题目与回复原文逐字转录于各 question 页；本页仅为来源索引，不承载题目内容。\n---END FILE---`,
   )
 
+  // R3 批内消歧：纯标题制（questionTitle 不再带题号前缀）下，同文档两题
+  // 撞标题时第二个起回退「问题N·」前缀——文件名唯一性不受影响，title
+  // 只承担展示区分。
+  const titleCounts = new Map<string, number>()
+  for (const question of split.questions) {
+    const base = questionTitle(question)
+    const seen = titleCounts.get(base) ?? 0
+    titleCounts.set(base, seen + 1)
+  }
+  const titleUsed = new Map<string, number>()
+
   for (const question of split.questions) {
     // 质量红线自检：题目/回复必须是 raw md 全文（行尾归一后）的连续子串
     if (!normalizedSource.includes(question.questionText)) {
@@ -992,9 +1046,17 @@ export function buildQuestionFileBlocks(
       violations.push(`q${question.questionNo}: 回复正文不是原文连续子串`)
     }
 
+    const baseTitle = questionTitle(question)
+    const dupRank = titleUsed.get(baseTitle) ?? 0
+    titleUsed.set(baseTitle, dupRank + 1)
+    const finalTitle =
+      (titleCounts.get(baseTitle) ?? 1) > 1 && dupRank > 0
+        ? `问题${question.questionNo}·${baseTitle}`
+        : baseTitle
+
     const fm: string[] = [
       "type: question",
-      `title: ${yamlScalar(questionTitle(question, roundMeta))}`,
+      `title: ${yamlScalar(finalTitle)}`,
       `company: ${yamlScalar(pathMeta.company)}`,
     ]
     if (pathMeta.exchange) fm.push(`exchange: ${yamlScalar(pathMeta.exchange)}`)
