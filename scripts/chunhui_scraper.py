@@ -35,8 +35,11 @@ MANIFEST = os.path.join(OUT_DIR, "manifest.jsonl")
 DELAY = 0.3
 
 # category 六分类轴（schema R3）：按标题关键词规则归类，basis 记规则可溯源。
+# 通用法规词（条例/办法/规定/通知）不能兜底证券——法律与行政法规按内容归
+# 会计/审计/税务，拿不准的归「证券」仅限证监会/交易所语境（2026-10-24
+# 实测「企业财务会计报告条例」被兜底证券的教训）。
 CATEGORY_RULES = [
-    ("会计", r"会计准则|企业会计|财会〔|财务报表|会计处理|会计估计|会计政策"),
+    ("会计", r"会计准则|企业会计|会计制度|财会〔|财务报表|财务会计|会计处理|会计估计|会计政策"),
     ("审计", r"审计准则|注册会计师|审计报告|会计师事务所|审计|审阅"),
     ("评估", r"资产评估|评估准则|评估机构|评估师"),
     ("内控", r"内部控制|内控|风险管理指引|合规管理"),
@@ -83,6 +86,15 @@ def parse_list() -> list[dict]:
         if re.search(r"已?废止|已失效|停止执行", tail_text[:80]):
             status = "已废止"
         cat, basis = classify(title)
+        # 非本站 HTML（pdf/doc 附件等）只入清单不抓详情——后续需要再走
+        # 对应解析通道，不在本抓取器范围。.doc 二进制若当 GBK 网页抓会
+        # 整页乱码（2026-10-24 实测 11 条漏进样本目录的教训）。
+        lower = fname.lower()
+        kind = "htm"
+        if lower.endswith(".pdf"):
+            kind = "pdf"
+        elif lower.endswith((".doc", ".docx", ".xls", ".xlsx", ".wps")):
+            kind = "doc"
         entries.append({
             "title": title,
             "url": BASE + href,
@@ -90,9 +102,7 @@ def parse_list() -> list[dict]:
             "status": status,
             "category": cat,
             "classify_basis": basis,
-            # 非本站 HTML（pdf 附件等）只入清单不抓详情——后续需要再走
-            # PDF 解析通道，不在本抓取器范围。
-            "kind": "pdf" if fname.lower().endswith(".pdf") else "htm",
+            "kind": kind,
         })
     return entries
 
@@ -161,41 +171,71 @@ def cmd_list():
     print(f"manifest -> {MANIFEST}")
 
 
-def cmd_fetch(limit=None):
+def cmd_fetch(limit=None, workers=8):
     entries = [json.loads(l) for l in io.open(MANIFEST, encoding="utf-8")]
     valid = [
         e for e in entries
         if e["status"] == "现行有效" and e.get("kind", "htm") == "htm"
     ]
     os.makedirs(PAGES_DIR, exist_ok=True)
-    done = 0
-    skipped = 0
-    for i, e in enumerate(valid):
-        slug = e["url"].rsplit("/", 1)[-1].replace(".htm", "")
-        out = os.path.join(PAGES_DIR, f"{e['year']}__{slug}.json")
-        if os.path.exists(out):
-            skipped += 1
-            continue
-        if limit is not None and done >= limit:
-            break
+
+    def out_path(e):
+        # slug 保留 fagui/ 之后的中间子目录（2023/xiehui/1.htm → xiehui__1），
+        # 否则 2023 年注册制配套规则 1.htm–30.htm 跨子目录同名互相覆盖
+        #（2026-10-24 实测 29 个文件名吞掉 79 条目、净丢 50 条）。
+        slug = (
+            e["url"].rsplit("fagui/", 1)[-1]
+            .replace(".htm", "")
+            .replace("/", "__")
+        )
+        return os.path.join(PAGES_DIR, f"{e['year']}__{slug}.json")
+
+    todo = [e for e in valid if not os.path.exists(out_path(e))]
+    if limit is not None:
+        todo = todo[:limit]
+    total = len(valid) - len(todo)
+    print(f"resume: done={total} todo={len(todo)} workers={workers}")
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    lock = threading.Lock()
+    state = {"done": 0, "fail": 0}
+
+    def worker(e):
         try:
             page = fetch_page(e)
+            with io.open(out_path(e), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(page, f, ensure_ascii=False)
+            ok = True
         except Exception as err:  # noqa: BLE001 — 逐条容错，失败如实记录后继续
-            print(f"[{i+1}/{len(valid)}] FAIL {e['url']}: {err}")
-            time.sleep(DELAY)
-            continue
-        with io.open(out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(page, f, ensure_ascii=False)
-        done += 1
-        if done % 50 == 0:
-            print(f"[{i+1}/{len(valid)}] fetched={done} skipped={skipped}")
-        time.sleep(DELAY)
-    print(f"done: fetched={done} skipped(resume)={skipped} -> {PAGES_DIR}")
+            ok = False
+            err_msg = str(err)
+        with lock:
+            if ok:
+                state["done"] += 1
+            else:
+                state["fail"] += 1
+                print(f"FAIL {e['url']}: {err_msg}")
+            n = state["done"] + state["fail"]
+            if n % 100 == 0:
+                print(f"progress {n}/{len(todo)} (done={state['done']} fail={state['fail']})")
+        time.sleep(DELAY)  # 每 worker 内限速，站端 QPS = workers/DELAY 有上限
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool.map(worker, todo)
+    print(f"done: fetched={state['done']} fail={state['fail']} -> {PAGES_DIR}")
 
 
 def cmd_stats():
     entries = [json.loads(l) for l in io.open(MANIFEST, encoding="utf-8")]
     valid = [e for e in entries if e["status"] == "现行有效"]
+    htm = [e for e in valid if e.get("kind") == "htm"]
+    # 兼容旧 manifest：url 是 .doc/.docx 等但 kind 还是 htm 的，如实归 doc
+    real_htm = [
+        e for e in htm
+        if not e["url"].lower().endswith((".doc", ".docx", ".xls", ".xlsx", ".wps"))
+    ]
     pages = [f for f in os.listdir(PAGES_DIR)] if os.path.isdir(PAGES_DIR) else []
     empty = 0
     for f in pages:
@@ -203,6 +243,7 @@ def cmd_stats():
         if len(doc.get("body_lines", [])) < 5:
             empty += 1
     print(f"manifest total={len(entries)} valid={len(valid)}")
+    print(f"valid htm={len(real_htm)} pdf={sum(1 for e in valid if e.get('kind')=='pdf')} doc={len(valid)-len(real_htm)-sum(1 for e in valid if e.get('kind')=='pdf')}")
     print(f"pages fetched={len(pages)} suspicious_short(<5 lines)={empty}")
 
 
@@ -214,7 +255,10 @@ if __name__ == "__main__":
         lim = None
         if "--limit" in args:
             lim = int(args[args.index("--limit") + 1])
-        cmd_fetch(lim)
+        workers = 8
+        if "--workers" in args:
+            workers = int(args[args.index("--workers") + 1])
+        cmd_fetch(lim, workers)
     elif args[0] == "stats":
         cmd_stats()
     else:
