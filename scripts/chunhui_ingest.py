@@ -105,6 +105,10 @@ def build_page(manifest_entry: dict, page: dict) -> str:
         related.append(f"[[{page['superseded_by']}]]")
     if page.get("supersedes"):
         related.extend(f"[[{t}]]" for t in page["supersedes"])
+    # 去重保序：同组同年份的版本标题会重复（公司法 1993 两条都生成
+    # 「（1993年版）」，2026-10-24 实测 related 出现重复 wikilink）
+    seen = set()
+    related = [r for r in related if not (r in seen or seen.add(r))]
     fm = [
         "type: regulation",
         f"title: {yaml_scalar(page['title'])}",

@@ -225,6 +225,14 @@ impl Frontmatter {
                 }
                 continue;
             }
+            // Empty list must round-trip as `key: []` — rendering it as a bare
+            // `key:` produces a YAML null scalar, which violates the schema
+            // value domain (string | string list) and breaks consumers that
+            // expect a list (2026-10-24 chunhui PATCH batch hit this).
+            if values.is_empty() {
+                out.push_str(&format!("{key}: []\n"));
+                continue;
+            }
             out.push_str(&format!("{key}:\n"));
             for value in values {
                 out.push_str(&format!("  - {}\n", quote_list_item(value)));
