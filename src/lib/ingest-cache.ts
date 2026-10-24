@@ -17,7 +17,24 @@ interface CacheEntry {
    * written before the field existed are summarize products.
    */
   mode?: string
+  /**
+   * Version of the extraction/processing logic that produced the cached
+   * artifacts. The cache key covers (file, mode, content hash) only — it
+   * cannot see that the summarize prompt or the qa-split rules changed.
+   * Without this field a logic change is silently swallowed by cache hits.
+   * Entries written before versioning existed default to
+   * LEGACY_LOGIC_VERSION (= the pipeline state when versioning shipped).
+   */
+  logicVersion?: string
 }
+
+/**
+ * Logic version assumed for cache entries saved before the logicVersion
+ * field existed. Bumping this re-ingests every legacy entry, so treat it
+ * as fixed history: pipeline changes bump the per-mode constants in
+ * ingest.ts (SUMMARIZE_LOGIC_VERSION / QA_SPLIT_LOGIC_VERSION), never this.
+ */
+const LEGACY_LOGIC_VERSION = "1"
 
 interface CacheData {
   entries: Record<string, CacheEntry> // keyed by source filename
@@ -75,6 +92,7 @@ export async function checkIngestCache(
   sourceFileName: string,
   sourceContent: string,
   mode: string = "summarize",
+  logicVersion: string = LEGACY_LOGIC_VERSION,
 ): Promise<string[] | null> {
   const cache = await loadCache(projectPath)
   const entry = cache.entries[sourceFileName]
@@ -82,6 +100,10 @@ export async function checkIngestCache(
   // Mode isolation: a summarize entry never satisfies a qa-split request and
   // vice versa — the two pipelines produce different file sets.
   if ((entry.mode ?? "summarize") !== mode) return null
+  // Logic-version isolation: entries produced by an older extraction prompt
+  // or splitter rule set must not be replayed as if they satisfied the
+  // current requirements.
+  if ((entry.logicVersion ?? LEGACY_LOGIC_VERSION) !== logicVersion) return null
 
   const currentHash = await sha256(sourceContent)
   if (entry.hash !== currentHash) return null
@@ -117,6 +139,7 @@ export async function saveIngestCache(
   sourceContent: string,
   filesWritten: string[],
   mode: string = "summarize",
+  logicVersion: string = LEGACY_LOGIC_VERSION,
 ): Promise<void> {
   const cache = await loadCache(projectPath)
   const hash = await sha256(sourceContent)
@@ -126,6 +149,7 @@ export async function saveIngestCache(
     timestamp: Date.now(),
     filesWritten,
     mode,
+    logicVersion,
   }
   await saveCache(projectPath, { entries: newEntries })
 }

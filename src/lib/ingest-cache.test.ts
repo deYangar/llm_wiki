@@ -94,3 +94,61 @@ describe("ingest-cache — checkIngestCache", () => {
     expect(result).toBeNull()
   })
 })
+
+describe("ingest-cache — logicVersion (extraction-requirement changes)", () => {
+  function primeCache(mode = "summarize", logicVersion = "1") {
+    let persisted = ""
+    mockReadFile.mockImplementation(async () => persisted || JSON.stringify({ entries: {} }))
+    mockWriteFile.mockImplementation(async (_p: string, c: string) => {
+      persisted = c
+    })
+    return {
+      seed: () =>
+        saveIngestCache("/project", "foo.pdf", "hello", ["wiki/sources/foo.md"], mode, logicVersion),
+      check: (mode2: string, version2: string) =>
+        checkIngestCache("/project", "foo.pdf", "hello", mode2, version2),
+      persistedRef: () => persisted,
+    }
+  }
+
+  beforeEach(() => {
+    mockFileExists.mockResolvedValue(true)
+  })
+
+  it("hits when the logic version matches", async () => {
+    const c = primeCache()
+    await c.seed()
+    const result = await c.check("summarize", "1")
+    expect(result).toEqual(["wiki/sources/foo.md"])
+  })
+
+  it("misses after the logic version is bumped (prompt/rule change must invalidate cache)", async () => {
+    const c = primeCache()
+    await c.seed()
+    const result = await c.check("summarize", "2")
+    expect(result).toBeNull()
+  })
+
+  it("treats legacy entries (no logicVersion field) as version \"1\" — versioned rollout must NOT re-ingest the whole library", async () => {
+    const c = primeCache()
+    await c.seed()
+    // Strip the field from the persisted entry to simulate a pre-versioning cache file.
+    const parsed = JSON.parse(c.persistedRef())
+    delete parsed.entries["foo.pdf"].logicVersion
+    mockReadFile.mockImplementation(async () => JSON.stringify(parsed))
+
+    // Current pipeline (version "1") still hits a legacy entry.
+    expect(await c.check("summarize", "1")).toEqual(["wiki/sources/foo.md"])
+    // After a future bump to "2", legacy entries are invalidated too —
+    // they were produced by the pre-bump logic.
+    expect(await c.check("summarize", "2")).toBeNull()
+  })
+
+  it("persists the logicVersion on save (round-trip visible in the cache file)", async () => {
+    const c = primeCache("qa-split", "7")
+    await c.seed()
+    const parsed = JSON.parse(c.persistedRef())
+    expect(parsed.entries["foo.pdf"].logicVersion).toBe("7")
+    expect(parsed.entries["foo.pdf"].mode).toBe("qa-split")
+  })
+})

@@ -63,6 +63,22 @@ import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { persistParsedMarkdown } from "@/lib/parsed-source-output"
 import { PROJECT_LOCAL_TERM_QUERY_RULES } from "@/lib/research-query-grounding"
 
+// ── Ingest logic versions ────────────────────────────────────────────────
+// The ingest cache key covers (file, mode, content hash) only. It cannot
+// detect that the extraction REQUIREMENTS changed (e.g. the summarize
+// prompt now asks for a new frontmatter field, or qa-split rules changed) —
+// without these versions a logic change is silently swallowed by cache
+// hits: re-running ingest reports success while replaying old artifacts.
+// Bump the matching constant whenever you change:
+//   - SUMMARIZE_LOGIC_VERSION: the generation prompt (frontmatter fields,
+//     page structure, output format) or the summarize post-processing
+//   - QA_SPLIT_LOGIC_VERSION: src/lib/qa-split.ts rules or the question
+//     page generation below
+// Both start at "1" (= the pipeline state when versioning shipped, matching
+// LEGACY_LOGIC_VERSION so existing caches keep hitting).
+const SUMMARIZE_LOGIC_VERSION = "1"
+const QA_SPLIT_LOGIC_VERSION = "1"
+
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
 const LONG_SOURCE_CHUNK_MIN = 12_000
@@ -1161,7 +1177,8 @@ async function autoIngestImpl(
   // 完整性审计：归纳管道把原文 7,896 题压到 2,606，33%）。
   const qaKind = classifyQaDocument(sourceContent)
   const ingestMode = qaKind ? "qa-split" : "summarize"
-  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent, ingestMode)
+  const ingestLogicVersion = qaKind ? QA_SPLIT_LOGIC_VERSION : SUMMARIZE_LOGIC_VERSION
+  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent, ingestMode, ingestLogicVersion)
   console.log(`[ingest:diag] cache check for "${sourceIdentity}" (mode=${ingestMode}):`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
     return runCommit(async () => {
@@ -1922,7 +1939,7 @@ async function autoIngestImpl(
     hardFailures.length === 0 &&
     unrecoveredTruncatedPaths.length === 0
   ) {
-    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, "summarize")
+    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, "summarize", SUMMARIZE_LOGIC_VERSION)
     await clearGenerationCheckpoint(generationProgressPath)
     if (longSourceCheckpointPath) {
       await clearLongSourceCheckpoint(longSourceCheckpointPath)
@@ -2322,7 +2339,7 @@ async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]>
       }
     }
 
-    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, "qa-split")
+    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, "qa-split", QA_SPLIT_LOGIC_VERSION)
 
     // 与归纳路径同款 embedding 步骤：question 页进向量索引才可被语义召回
     const embCfg = useWikiStore.getState().embeddingConfig
