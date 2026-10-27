@@ -42,17 +42,22 @@ MANIFEST = os.path.join(RAW, "manifest.jsonl")
 MINERU = "http://127.0.0.1:8000/v1"
 DELAY = 0.3
 
-# ---- 源清单（2026-10-27 kjs 列表页实勘）----
-# 单项页：cas_no -> (kjs URL, 标准名)。title 取通知《》内名（与库内现行页名对齐，
+# ---- 源清单（2026-10-27/28 kjs 列表 + gov.cn 政策库实勘）----
+# 单项页：cas_no -> (URL, 标准名)。title 取通知《》内名（与库内现行页名对齐，
 # 同名覆盖治本替换空壳/旧版）。
+# 源变更实勘（10-28）：kjs 站 2018/2019 年页面下线（302→404），7/12 号换
+# gov.cn 政策文件库；21 号（财会〔2018〕35号）kjs 下线+gov.cn 无收录+CASC
+# 附件 404+Wayback 无存档 = 官方在线源全灭，UNAVAILABLE 缺口如实（库内保留
+# 2006 旧版，synthesis 缺口页记录）。cas_no=0 = 基本准则（财政部令 76 号，
+# 国务院公报 htm 正文直出）。
 SINGLE_PAGES = {
+    0: ("http://www.gov.cn/gongbao/content/2014/content_2775514.htm", "企业会计准则——基本准则"),
     2: ("https://kjs.mof.gov.cn/zhengcefabu/201403/t20140319_1057127.htm", "企业会计准则第2号——长期股权投资"),
-    7: ("https://kjs.mof.gov.cn/zhengcefabu/201905/t20190516_3598937.htm", "企业会计准则第7号——非货币性资产交换"),
+    7: ("https://www.gov.cn/zhengce/zhengceku/2019-10/15/content_5440251.htm", "企业会计准则第7号——非货币性资产交换"),
     9: ("https://kjs.mof.gov.cn/zhengcefabu/201401/t20140129_1040561.htm", "企业会计准则第9号——职工薪酬"),
-    12: ("https://kjs.mof.gov.cn/zhengcefabu/201905/t20190529_3599229.htm", "企业会计准则第12号——债务重组"),
+    12: ("https://www.gov.cn/zhengce/zhengceku/2019-10/15/content_5440214.htm", "企业会计准则第12号——债务重组"),
     14: ("https://kjs.mof.gov.cn/zhengcefabu/201707/t20170719_2653110.htm", "企业会计准则第14号——收入"),
     16: ("https://kjs.mof.gov.cn/zhengcefabu/201705/t20170525_2608690.htm", "企业会计准则第16号——政府补助"),
-    21: ("https://kjs.mof.gov.cn/zhengcefabu/201812/t20181213_3116731.htm", "企业会计准则第21号——租赁"),
     22: ("https://kjs.mof.gov.cn/zhengcefabu/201704/t20170406_2575699.htm", "企业会计准则第22号——金融工具确认和计量"),
     23: ("https://kjs.mof.gov.cn/zhengcefabu/201704/t20170406_2575702.htm", "企业会计准则第23号——金融资产转移"),
     24: ("https://kjs.mof.gov.cn/zhengcefabu/201704/t20170406_2575705.htm", "企业会计准则第24号——套期会计"),
@@ -65,6 +70,8 @@ SINGLE_PAGES = {
     41: ("https://kjs.mof.gov.cn/zhengcefabu/201403/t20140327_1060353.htm", "企业会计准则第41号——在其他主体中权益的披露"),
     42: ("https://kjs.mof.gov.cn/zhengcefabu/201705/t20170516_2601445.htm", "企业会计准则第42号——持有待售的非流动资产、处置组和终止经营"),
 }
+# 官方在线源全灭的号（如实缺口，不硬造替代源）
+UNAVAILABLE = {21: "2018租赁修订版：kjs 下线 302→404、gov.cn 无收录、CASC 附件 404、Wayback 无存档（2026-10-28 实勘）"}
 # RAR 里的 2006 版（未再单独修订的号；38 号「首次执行」库内缺失属新增）
 RAR_2006_NUMBERS = [1, 3, 4, 5, 6, 8, 10, 11, 13, 15, 17, 18, 19, 20, 26, 27, 28, 29, 31, 32, 34, 35, 36, 38]
 # 已解析过的 PDF sha -> pages 条目（断点），1 号试点已验证
@@ -92,15 +99,20 @@ def mineru_markdown(pdf_bytes: bytes, name: str) -> str:
     req = urllib.request.Request(MINERU + "/uploads", data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
     up = json.load(urllib.request.urlopen(req, timeout=30))
-    uid = up["id"]
-    req = urllib.request.Request(f"{MINERU}/uploads/{uid}/content", data=pdf_bytes,
-                                 headers={"Content-Type": "application/pdf"}, method="PUT")
-    urllib.request.urlopen(req, timeout=300)
-    req = urllib.request.Request(f"{MINERU}/uploads/{uid}/complete",
-                                 data=json.dumps({"sha256sum": sha}).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    comp = json.load(urllib.request.urlopen(req, timeout=30))
-    fid = comp["file"]["id"]
+    # sha 内容寻址: 同 sha 文件已传过时会话直接 completed（file 现成），
+    # 跳过 PUT/complete 直接用 file id（PUT 会 409 upload_already_terminal）
+    if up.get("status") == "completed" and up.get("file"):
+        fid = up["file"]["id"]
+    else:
+        uid = up["id"]
+        req = urllib.request.Request(f"{MINERU}/uploads/{uid}/content", data=pdf_bytes,
+                                     headers={"Content-Type": "application/pdf"}, method="PUT")
+        urllib.request.urlopen(req, timeout=300)
+        req = urllib.request.Request(f"{MINERU}/uploads/{uid}/complete",
+                                     data=json.dumps({"sha256sum": sha}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        comp = json.load(urllib.request.urlopen(req, timeout=30))
+        fid = comp["file"]["id"]
     body = json.dumps({"files": [{"source": {"type": "file_id", "file_id": fid}}],
                        "tier": "standard", "output_formats": ["markdown"]}).encode()
     req = urllib.request.Request(MINERU + "/parse/jobs", data=body,
@@ -195,10 +207,13 @@ def fetch_one(no: int, st: dict) -> None:
         url, title = SINGLE_PAGES[no]
         e.update({"url": url, "title": title, "kind": "single"})
         raw = http_get(url)
-        # htm 正文 or PDF 附件
+        # htm 正文 or PDF 附件（直抽判据用抽取后正文本：整页剥标签长度含导航
+        # 页脚，2018/2019 附件页整页 >400 但 TRS 正文仅 215 字符，实测踩过）
         atts = re.findall(r'href="(\./[^"]+\.pdf)"', raw.decode("utf-8", errors="replace"), re.I)
-        if len(re.sub(r"<[^>]+>", "", raw.decode("utf-8", errors="replace")).strip()) > 400 and not atts:
+        lines = []
+        if not atts:
             lines = extract_htm(raw, url)
+        if sum(len(l) for l in lines) >= 400:
             doc_number = next((l for l in lines[:8] if DOC_NO.match(l)), "")
             body = lines
             e.update({"status": "fetched", "doc_number": doc_number, "body_lines": body})
@@ -256,12 +271,13 @@ def fetch_one(no: int, st: dict) -> None:
 def cmd_fetch(limit=None):
     os.makedirs(PAGES, exist_ok=True)
     st = load_manifest()
-    todo = [no for no in range(1, 43)
-            if no in SINGLE_PAGES or no in RAR_2006_NUMBERS]
+    todo = [no for no in range(0, 43)
+            if (no in SINGLE_PAGES or no in RAR_2006_NUMBERS) and no not in UNAVAILABLE]
     todo = [no for no in todo if st.get(no, {}).get("status") not in ("fetched",)]
     if limit:
         todo = todo[:limit]
-    print(f"[F fetch] 计划 {len([n for n in range(1,43) if n in SINGLE_PAGES or n in RAR_2006_NUMBERS])}"
+    plan = [n for n in range(0, 43) if (n in SINGLE_PAGES or n in RAR_2006_NUMBERS) and n not in UNAVAILABLE]
+    print(f"[F fetch] 计划 {len(plan)}（UNAVAILABLE: {sorted(UNAVAILABLE)}）"
           f" 已完成 {sum(1 for v in st.values() if v['status']=='fetched')} 本轮 todo={len(todo)}")
     for i, no in enumerate(todo, 1):
         print(f"[{i}/{len(todo)}] CAS{no} ...", flush=True)
@@ -274,7 +290,7 @@ def cmd_fetch(limit=None):
         time.sleep(DELAY)
     ok = sum(1 for v in st.values() if v["status"] == "fetched")
     bad = {k: v["status"] for k, v in st.items() if v["status"] not in ("fetched",)}
-    print(f"[收口] fetched={ok}/{42} 其余={json.dumps(bad, ensure_ascii=False)}")
+    print(f"[收口] fetched={ok}/{len(plan)} 其余={json.dumps(bad, ensure_ascii=False)}")
 
 
 def safe_filename(title: str) -> str:
