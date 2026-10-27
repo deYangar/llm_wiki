@@ -11,12 +11,22 @@ import argparse
 import json
 import sys
 import time
+import urllib.request
 from collections import Counter
 from pathlib import Path
 
 WIKI = Path("C:/library/wiki")
 QUEUE = WIKI / ".llm-wiki" / "ingest-queue.json"
 WARN = WIKI / ".llm-wiki" / "ingest-warnings.log"
+HEALTH = "http://127.0.0.1:19828/api/v1/health"
+
+
+def alive() -> bool:
+    try:
+        with urllib.request.urlopen(HEALTH, timeout=5) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 def snapshot():
@@ -45,17 +55,25 @@ def main():
     args = ap.parse_args()
 
     t0 = time.time()
+    s0 = snapshot()
+    initial = s0.get("total", 0)
     while True:
         s = snapshot()
         if "queue_err" in s:
             print(f"[{time.strftime('%H:%M:%S')}] queue_err={s['queue_err']}")
         else:
-            rate = (s["done"] / max((time.time() - t0) / 60, 0.1)) if s["done"] else 0.0
+            finished = max(initial - s["total"], 0)
+            rate = finished / max((time.time() - t0) / 60, 0.1) if finished else 0.0
             eta = (s["pending"] + s["processing"]) / rate if rate > 0 else -1
+            ok = alive()
             print(f"[{time.strftime('%H:%M:%S')}] 待{s['pending']} 处理中{s['processing']} "
-                  f"完{s['done']} 其他{s['other']} / 总{s['total']} | questions={s['questions']} "
-                  f"cases={s['cases']} | 速率{rate:.1f}/min ETA{'∞' if eta < 0 else f'{eta:.0f}min'}",
+                  f"完{finished} 其他{s['other']} / 总{initial} | questions={s['questions']} "
+                  f"cases={s['cases']} | 速率{rate:.1f}/min ETA{'∞' if eta < 0 else f'{eta:.0f}min'}"
+                  f" | health={'OK' if ok else '!!实例死亡需重启!!'}",
                   flush=True)
+            if not ok:
+                print(f"[{time.strftime('%H:%M:%S')}] ⚠️ 底座 19828 无响应（静默退出前科）——"
+                      f"需 Start-Process 安装版 exe 重启，队列文件在实例重启后自动续跑", flush=True)
             if s["total"] > 0 and s["pending"] + s["processing"] == 0:
                 print(f"[{time.strftime('%H:%M:%S')}] 队列全部终态，监控退出")
                 if WARN.exists():
