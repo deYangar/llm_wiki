@@ -502,7 +502,9 @@ pub fn read_head(path: &Path, max_head_bytes: usize) -> std::io::Result<String> 
 
 /// Scan ceiling shared with the search walk — one definition so the cache
 /// and the (uncached) search ceiling can never drift apart.
-pub const MAX_META_SCAN_FILES: usize = 50_000;
+/// 2026-10-27 (ipoanswer 落地-20261026 模块05 前置1): 50k → 200k — 案例库
+/// 49,795 md 距旧上限仅 205，重导拆题必然新增页面临顶（应用直接不工作）。
+pub const MAX_META_SCAN_FILES: usize = 200_000;
 
 #[derive(Debug, Clone)]
 pub struct PageMeta {
