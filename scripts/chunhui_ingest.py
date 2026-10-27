@@ -150,8 +150,12 @@ def build_page(manifest_entry: dict, page: dict) -> str:
 
 # E-1 超大页分片三重上限（方案 2026-10-26 模块E：字节数给 pages/write 上限
 # 留余量、字符数保 embed <512 chunk、行数兜底）
+# PART_MAX_CHARS 实测修正（2026-10-27）：语义切块按行/句边界断，PDF 转文本
+# 行均 ~24 字符时实际 ~788 字符/chunk（非 1000 字符假设），40 万字符/片实测
+# 528-530 chunks 超 512 上限（E-1 首推 12 片 embed 全 400）。降到 36 万：
+# ~476 chunks，留 7% 余量。
 PART_MAX_BYTES = 10 * 1024 * 1024
-PART_MAX_CHARS = 400_000
+PART_MAX_CHARS = 360_000
 PART_MAX_LINES = 20_000
 CN_NUM = "一二三四五六七八九十百千万零"
 
