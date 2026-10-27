@@ -258,6 +258,48 @@ describe("MinerU API helpers", () => {
     expect(md).toContain("| 2024 | 1,200 |")
   })
 
+  // ── 真实 MinerU 输出片段（模块 D 真样本验证，2026-10-27；样本 zip 留档
+  // plans/2026-10-26-r3-decisions/table-samples/，此处固化关键形态摘录） ──
+
+  it("real-sample wide table: dual-level header with rowspan anchor and colspan groups (腾信精密 表14)", async () => {
+    // 真实形态：合并/母公司两组各 colspan=3，首列 rowspan=2「项目」；
+    // 验证点＝colspan 展开 7 列、第二表头行进数据区、科目数字不错位。
+    const md = await tableToMarkdown([
+      "<table>",
+      "<tr><td rowspan=\"2\">项目</td><td colspan=\"3\">2022年12月31日(合并)</td><td colspan=\"3\">2022年12月31日(母公司)</td></tr>",
+      "<tr><td>调整前</td><td>调整后</td><td>调整金额</td><td>调整前</td><td>调整后</td><td>调整数</td></tr>",
+      "<tr><td>资产总额</td><td>77,229.50</td><td>77,229.50</td><td>-</td><td>70,019.73</td><td>70,019.73</td><td>-</td></tr>",
+      "<tr><td>未分配利润</td><td>33,924.45</td><td>23,561.35</td><td>-10,363.10</td><td>29,994.71</td><td>19,631.61</td><td>-10,363.10</td></tr>",
+      "</table>",
+    ].join("\n"))
+    const lines = md.split("\n").filter((l) => l.startsWith("|"))
+    // 表头行展开为 7 列（8 个管道符）；colspan 组值复制到每列
+    expect(lines[0].match(/\|/g)).toHaveLength(8)
+    expect(lines[0]).toContain("2022年12月31日(合并)")
+    expect(lines[0].match(/2022年12月31日\(合并\)/g)).toHaveLength(3)
+    // 第二表头行：rowspan 首列填「项目」，子表头列位对齐
+    expect(lines[2]).toContain("| 项目 | 调整前 | 调整后 | 调整金额 |")
+    // 数据行千分位/负号保真
+    expect(lines[3]).toContain("77,229.50")
+    expect(lines[4]).toContain("-10,363.10")
+  })
+
+  it("real-sample compliance table: rowspan capacity cell and long text cells (龙辰科技 表2)", async () => {
+    // 真实形态：年产能列 rowspan=2（两线共用产能），产品规格为 3μm-5μm 这类
+    // 单位符号混排——验证 rowspan 数值只占首行、文本原样保真。
+    const md = await tableToMarkdown([
+      "<table>",
+      "<tr><td>产线名称</td><td>产品规格范围</td><td>所属主体</td><td>年产能(吨)</td></tr>",
+      "<tr><td>一线[注]</td><td>3μm-5μm</td><td>龙辰科技</td><td rowspan=\"2\">3,257.79</td></tr>",
+      "<tr><td>二线[注]</td><td>6μm-11μm</td><td>龙辰科技</td></tr>",
+      "</table>",
+    ].join("\n"))
+    const lines = md.split("\n").filter((l) => l.startsWith("|"))
+    expect(lines[0]).toBe("| 产线名称 | 产品规格范围 | 所属主体 | 年产能(吨) |")
+    expect(lines[2]).toContain("| 一线[注] | 3μm-5μm | 龙辰科技 | 3,257.79 |")
+    expect(lines[3]).toContain("| 二线[注] | 6μm-11μm | 龙辰科技 | 3,257.79 |")
+  })
+
   it("extracts MinerU zip images and rewrites Markdown image references", async () => {
     mockHttpFetch.mockResolvedValueOnce(await zipResponse({
       "full.md": [

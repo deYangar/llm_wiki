@@ -470,6 +470,24 @@ export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResu
 
   if (bodyMarkers.length >= 2) {
     const { kept, manualQueue } = monotonicMarkers(bodyMarkers)
+    // 对账回退（2026-10-27 B-Step3 上能电气实测）：正文题号标记比目录
+    // 列的题号少（kept < toc）或回复块明显多于题数（delta >= 2）= 正文
+    // 有题的边界标记被解析通道丢失（「问题三」标题行在 .cache 产物里
+    // 缺失、题干直接顶上），H3 切出的题会吞并后续整题——回退 H4 按
+    // 回复块切（每块一题，题号按块序生成，不丢题）。目录与回复块都齐
+    // 的文档（kept == toc == reply）不受影响；无目录文档 toc=0 永不触发。
+    const keptNos = new Set(kept.map((k) => k.no))
+    const tocMissing = toc.filter((n) => !keptNos.has(n)).length
+    const replyDelta = replyMarkers.length - kept.length
+    const missesBoundary = kind === "reply" && replyMarkers.length >= 1 &&
+      (tocMissing >= 1 || replyDelta >= 2)
+    if (missesBoundary) {
+      return {
+        kind, channel: "H4",
+        questions: cutByReplyBlocks(lines, replyMarkers),
+        tocNumbers: toc, manualQueue: null,
+      }
+    }
     return {
       kind, channel: "H3",
       questions: cutQuestions(lines, kept, replyMarkers, "H3", opinionStyle),
@@ -747,9 +765,13 @@ function cutByReplyBlocks(lines: string[], replyMarkers: number[]): SplitQuestio
  *  此前 title=「华泰联合证券有限责任公司」）跳过取实质行。判据：整行
  *  是机构名（品牌前缀短 + 机构关键词 + 公司/事务所后缀 + 可选括号注释
  *  后即行尾）——题干长句中段虽含「会计师事务所(特殊普通合伙)被暂停
- *  从事证券服务…」（华泰实测误杀形态）但括号后仍有正文，行尾锚挡住。 */
+ *  从事证券服务…」（华泰实测误杀形态）但括号后仍有正文，行尾锚挡住。
+ *  2026-10-27 B-Step3 实跑补两类（华泰核查意见 .cache 形态）：
+ *  ①「如无特别说明，本回复所述…释义…」监管文书固定格式句（题干区
+ *  开头的简称/口径说明段）；② markdown 表格行（字体说明表等，任何
+ *  题的 title 都不应该是表格行）。 */
 const NON_TITLE_LINE =
-  /^[\d\s-]{1,14}$|^[\u4e00-\u9fa5A-Za-z0-9]{2,16}(?:证券|会计师|律师|资产评估|评估|财务顾问|保荐)[\u4e00-\u9fa5]{0,10}(?:公司|事务所|中心|集团)?(?:[（(][^）)]{1,60}[)）])?\s*$/
+  /^[\d\s-]{1,14}$|^\||^如无特别说明|^[\u4e00-\u9fa5A-Za-z0-9]{2,16}(?:证券|会计师|律师|资产评估|评估|财务顾问|保荐)[\u4e00-\u9fa5]{0,10}(?:公司|事务所|中心|集团)?(?:[（(][^）)]{1,60}[)）])?\s*$/
 
 function titleFromBlock(
   lines: string[],
