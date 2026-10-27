@@ -57,6 +57,7 @@ def main():
     t0 = time.time()
     s0 = snapshot()
     initial = s0.get("total", 0)
+    dead_streak = 0
     while True:
         s = snapshot()
         if "queue_err" in s:
@@ -72,8 +73,14 @@ def main():
                   f" | health={'OK' if ok else '!!实例死亡需重启!!'}",
                   flush=True)
             if not ok:
-                print(f"[{time.strftime('%H:%M:%S')}] ⚠️ 底座 19828 无响应（静默退出前科）——"
+                dead_streak += 1
+                print(f"[{time.strftime('%H:%M:%S')}] ⚠️ 底座 19828 无响应（静默退出前科，连续第{dead_streak}次）——"
                       f"需 Start-Process 安装版 exe 重启，队列文件在实例重启后自动续跑", flush=True)
+                if dead_streak >= 5:
+                    print(f"[{time.strftime('%H:%M:%S')}] 底座连续 5 分钟死亡，监控退出交人工/接力处理", flush=True)
+                    sys.exit(2)
+            else:
+                dead_streak = 0
             if s["total"] > 0 and s["pending"] + s["processing"] == 0:
                 print(f"[{time.strftime('%H:%M:%S')}] 队列全部终态，监控退出")
                 if WARN.exists():
