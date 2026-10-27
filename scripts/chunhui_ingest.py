@@ -105,6 +105,9 @@ def build_page(manifest_entry: dict, page: dict) -> str:
         related.append(f"[[{page['superseded_by']}]]")
     if page.get("supersedes"):
         related.extend(f"[[{t}]]" for t in page["supersedes"])
+    # 分片页（E-1 超大汇编）：part_no/total_parts 簿记 + 相邻片互链
+    if page.get("total_parts"):
+        related.extend(f"[[{p}]]" for p in page.pop("_sibling_links", []))
     # 去重保序：同组同年份的版本标题会重复（公司法 1993 两条都生成
     # 「（1993年版）」，2026-10-24 实测 related 出现重复 wikilink）
     seen = set()
@@ -126,6 +129,10 @@ def build_page(manifest_entry: dict, page: dict) -> str:
         fm.append(f"docNumber: {yaml_scalar(page['doc_number'])}")
     if publish_date:
         fm.append(f"publish_date: {publish_date}")
+    if page.get("part_no"):
+        fm.append(f"part_no: \"{page['part_no']}\"")
+    if page.get("total_parts"):
+        fm.append(f"total_parts: \"{page['total_parts']}\"")
     if related:
         fm.append("related:")
         fm.extend(f'  - "{r}"' for r in related)
@@ -139,6 +146,87 @@ def build_page(manifest_entry: dict, page: dict) -> str:
     body.append("")
     body.extend(page.get("body_lines", []))
     return "---\n" + "\n".join(fm) + "\n---\n\n" + "\n".join(body).rstrip() + "\n"
+
+
+# E-1 超大页分片三重上限（方案 2026-10-26 模块E：字节数给 pages/write 上限
+# 留余量、字符数保 embed <512 chunk、行数兜底）
+PART_MAX_BYTES = 10 * 1024 * 1024
+PART_MAX_CHARS = 400_000
+PART_MAX_LINES = 20_000
+CN_NUM = "一二三四五六七八九十百千万零"
+
+SECTION_ANCHOR = re.compile(
+    r"^(?:#{1,2}\s+\S|第[" + CN_NUM + r"0-9]{1,6}[章节部分编]|[" + CN_NUM + r"]{1,4}、\s*\S)"
+)
+
+
+def _part_measured(lines: list[str]) -> tuple[int, int]:
+    total = 0
+    for l in lines:
+        total += len(l.encode("utf-8")) + 1
+    return total, sum(len(l) for l in lines)
+
+
+def split_oversized(page: dict, anchor_pat=SECTION_ANCHOR) -> list[dict]:
+    """超大页分片（模块 E-1）：优先 H1/H2/「第X章」节锚切段，贪心装片到
+    三重上限内；无锚可切时退固定行数窗口。返回多片 page dict（title 加
+    （第N部分）、part_no/total_parts/相邻互链），调用方逐片出 md。"""
+    lines = page.get("body_lines", [])
+    data, chars = _part_measured(lines)
+    if data <= PART_MAX_BYTES and chars <= PART_MAX_CHARS and len(lines) <= PART_MAX_LINES:
+        return [page]
+    # 1. 按节锚切段（锚行起段）
+    segments: list[list[str]] = []
+    cur: list[str] = []
+    for line in lines:
+        if cur and anchor_pat.match(line.strip()):
+            segments.append(cur)
+            cur = []
+        cur.append(line)
+    if cur:
+        segments.append(cur)
+    # 2. 贪心装片（锚段不可拆；单片超限的锚段退固定行数窗口再切）
+    parts: list[list[str]] = []
+    buf: list[str] = []
+    buf_bytes = buf_chars = 0
+    def flush():
+        nonlocal buf, buf_bytes, buf_chars
+        if buf:
+            parts.append(buf)
+            buf, buf_bytes, buf_chars = [], 0, 0
+    for seg in segments:
+        seg_b, seg_c = _part_measured(seg)
+        if (seg_b > PART_MAX_BYTES or seg_c > PART_MAX_CHARS or len(seg) > PART_MAX_LINES):
+            flush()
+            # 固定行数窗口硬切
+            for i in range(0, len(seg), PART_MAX_LINES):
+                chunk = seg[i:i + PART_MAX_LINES]
+                parts.append(chunk)
+            continue
+        if buf_bytes + seg_b > PART_MAX_BYTES or buf_chars + seg_c > PART_MAX_CHARS or len(buf) + len(seg) > PART_MAX_LINES:
+            flush()
+        buf.extend(seg)
+        buf_bytes += seg_b
+        buf_chars += seg_c
+    flush()
+    # 3. 构造分片 page（title 后缀 + 相邻互链）
+    total = len(parts)
+    out = []
+    base_title = page["title"]
+    for n, part in enumerate(parts, 1):
+        p = dict(page)
+        p["title"] = f"{base_title}（第{'一二三四五六七八九十'[min(n,10)-1]}部分）" if n <= 10 else f"{base_title}（第{n}部分）"
+        p["part_no"] = str(n)
+        p["total_parts"] = str(total)
+        siblings = []
+        if n > 1:
+            siblings.append(f"{base_title}（第{'一二三四五六七八九十'[min(n-1,10)-1]}部分）" if n-1 <= 10 else f"{base_title}（第{n-1}部分）")
+        if n < total:
+            siblings.append(f"{base_title}（第{'一二三四五六七八九十'[min(n+1,10)-1]}部分）" if n+1 <= 10 else f"{base_title}（第{n+1}部分）")
+        p["_sibling_links"] = siblings
+        p["body_lines"] = part
+        out.append(p)
+    return out
 
 
 def safe_filename(title: str) -> str:
@@ -253,10 +341,13 @@ def cmd_build(limit, out):
                     (f"{title}（{doc_year(p)}年版）" if doc_year(p) else f"{title}（第{i + 1}版）")
                     for i, (_, p) in enumerate(group[:-1])
                 ]
-            md = build_page(entry, page)
-            dest = os.path.join(out, safe_filename(page["title"]) + ".md")
-            io.open(dest, "w", encoding="utf-8", newline="\n").write(md)
-            written.append(dest)
+            # E-1 超大页分片：超三重上限才切（正常页原样返回），每片独立
+            # 成页（title（第N部分）+ part_no/total_parts + 相邻互链）
+            for part_page in split_oversized(page):
+                md = build_page(entry, part_page)
+                dest = os.path.join(out, safe_filename(part_page["title"]) + ".md")
+                io.open(dest, "w", encoding="utf-8", newline="\n").write(md)
+                written.append(dest)
             if limit is not None and len(written) >= limit:
                 break
         if limit is not None and len(written) >= limit:
