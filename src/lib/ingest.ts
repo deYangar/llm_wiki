@@ -77,7 +77,10 @@ import { PROJECT_LOCAL_TERM_QUERY_RULES } from "@/lib/research-query-grounding"
 // Both start at "1" (= the pipeline state when versioning shipped, matching
 // LEGACY_LOGIC_VERSION so existing caches keep hitting).
 const SUMMARIZE_LOGIC_VERSION = "1"
-const QA_SPLIT_LOGIC_VERSION = "1"
+// "2" (2026-10-27): aa41a70 (10-24) changed qa-split rules (裸行题号 / H4 前言
+// 剥离 / title 纯标题制) without bumping — this bump makes that change visible
+// to the cache so re-ingest actually re-splits with the fixed rules.
+const QA_SPLIT_LOGIC_VERSION = "2"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
