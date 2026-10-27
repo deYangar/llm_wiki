@@ -289,6 +289,28 @@ fn vector_page_id(normalized_path: &str) -> Option<String> {
     (!relative.is_empty()).then_some(relative)
 }
 
+/// Derive the vector page_id for a wiki page path with the same rules as the
+/// embed endpoint (shared with the HTTP DELETE /pages/embedding handler).
+pub(crate) fn wiki_page_id_from_path(path: &str) -> Option<String> {
+    vector_page_id(path)
+}
+
+/// Public wrapper over `embedding_fingerprint` for the
+/// lance-fingerprint-backfill maintenance bin (module A Step 9): the bin must
+/// compute exactly the fingerprint the embed endpoint would, so future
+/// incremental embeds short-circuit on its backfilled revisions.
+pub fn fingerprint_for_backfill(revision: &str, config: &SearchEmbeddingConfig) -> String {
+    embedding_fingerprint(revision, config)
+}
+
+/// Drop the stored embedding revision fingerprint for a page. Used when the
+/// page's vector rows are deleted outright, so the fingerprint cannot
+/// outlive its vectors (a stale fingerprint alone is harmless — the revision
+/// match also requires live rows — but deleting keeps the state consistent).
+pub(crate) fn delete_revision(project_path: &str, page_id: &str) {
+    let _ = fs::remove_file(revision_path(project_path, page_id));
+}
+
 async fn remove_legacy_vector_id_if_safe(project_path: &str, page_id: &str) {
     let Some(legacy_id) = page_id.rsplit('/').next().filter(|_| page_id.contains('/')) else {
         return;
@@ -330,14 +352,14 @@ fn revision_path(project_path: &str, page_id: &str) -> PathBuf {
         .join(format!("{key}.revision"))
 }
 
-pub(crate) fn load_revision(project_path: &str, page_id: &str) -> Option<String> {
+pub fn load_revision(project_path: &str, page_id: &str) -> Option<String> {
     fs::read_to_string(revision_path(project_path, page_id))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn save_revision(
+pub fn save_revision(
     project_path: &str,
     page_id: &str,
     revision: &str,

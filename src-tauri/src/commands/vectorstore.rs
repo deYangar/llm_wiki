@@ -945,6 +945,80 @@ pub async fn vector_count_chunks(project_path: String) -> Result<usize, String> 
     .await
 }
 
+/// Read every (page_id, chunk_text) row from the v2 table, grouped by page
+/// and ordered by chunk_index within each page. Read-only maintenance scan
+/// shared by the lance-fingerprint-backfill bin (module A Step 9): the
+/// backfill reconciles on-disk page content against the stored chunk texts
+/// before writing revision fingerprints.
+pub async fn read_page_chunk_texts(
+    project_path: &str,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let lock = vectorstore_v2_lock(project_path);
+    let _guard = lock.read().await;
+
+    let db = connect(&db_path(project_path))
+        .execute()
+        .await
+        .map_err(|e| format!("DB connect error: {e}"))?;
+    let tables = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(|e| format!("List tables error: {e}"))?;
+    if !tables.contains(&TABLE_V2.to_string()) {
+        return Ok(HashMap::new());
+    }
+    let table = db
+        .open_table(TABLE_V2)
+        .execute()
+        .await
+        .map_err(|e| format!("Open table error: {e}"))?;
+
+    use futures::TryStreamExt;
+    let stream = table
+        .query()
+        .execute()
+        .await
+        .map_err(|e| format!("Scan error: {e}"))?;
+    let batches: Vec<arrow_array::RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| format!("Collect rows error: {e}"))?;
+
+    let mut out: HashMap<String, Vec<(u32, String)>> = HashMap::new();
+    for batch in &batches {
+        let Some(page_ids) = batch
+            .column_by_name("page_id")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+        else {
+            return Err("page_id column missing or wrong type".to_string());
+        };
+        let Some(texts) = batch
+            .column_by_name("chunk_text")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+        else {
+            return Err("chunk_text column missing or wrong type".to_string());
+        };
+        let indices = batch
+            .column_by_name("chunk_index")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>());
+        for row in 0..batch.num_rows() {
+            let page_id = page_ids.value(row).to_string();
+            let idx = indices.map(|a| a.value(row)).unwrap_or(row as u32);
+            out.entry(page_id)
+                .or_default()
+                .push((idx, texts.value(row).to_string()));
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|(page, mut rows)| {
+            rows.sort_by_key(|(idx, _)| *idx);
+            (page, rows.into_iter().map(|(_, text)| text).collect())
+        })
+        .collect())
+}
+
 /// Drop the v2 chunk table entirely. Used by Settings → Embedding
 /// "Re-index all pages" so a rebuild reflects the current wiki tree
 /// exactly and removes chunks for deleted/renamed pages.

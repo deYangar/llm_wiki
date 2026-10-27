@@ -682,6 +682,9 @@ fn handle_request(
         (&Method::Post, ["projects", project_id, "pages", "embed"]) => {
             handle_embed_page(app, project_id, body)
         }
+        (&Method::Delete, ["projects", project_id, "pages", "embedding"]) => {
+            handle_delete_page_embedding(app, project_id, query)
+        }
         (&Method::Post, ["projects", project_id, "pages", "write"]) => {
             handle_write_page(app, project_id, body)
         }
@@ -742,11 +745,13 @@ fn is_token_required_request(method: &Method, path: &str) -> bool {
     let Some(parts) = api_path_parts(path) else {
         return false;
     };
-    method == &Method::Post
+    (method == &Method::Post
         && matches!(
             parts.as_slice(),
             ["projects", _, "pages", "embed"] | ["projects", _, "pages", "write"]
-        )
+        ))
+        || method == &Method::Delete
+            && matches!(parts.as_slice(), ["projects", _, "pages", "embedding"])
         || method == &Method::Patch
             && matches!(parts.as_slice(), ["projects", _, "pages", "frontmatter"])
     // F8 (2026-10-12 拍板「读开放、写授权」): read endpoints (search /
@@ -2693,6 +2698,52 @@ fn handle_embed_page(app: &AppHandle, project_id: &str, body: &str) -> ApiRespon
             };
             err(status, error.message)
         }
+    }
+}
+
+fn handle_delete_page_embedding(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    delete_page_embedding_response(&project, query)
+}
+
+/// Shared body of the DELETE /pages/embedding endpoint (unit-testable without
+/// a live Tauri app). Removes the page's vector rows and its revision
+/// fingerprint so the page is fully un-indexed. Idempotent: deleting a page
+/// with no vectors succeeds.
+fn delete_page_embedding_response(project: &ProjectEntry, query: &str) -> ApiResponse {
+    let params = parse_query(query);
+    let path = params.get("path").map(String::as_str).unwrap_or("");
+    if path.trim().is_empty() {
+        return err(400, "path is required");
+    }
+    let Some(page_id) = commands::page_embedding::wiki_page_id_from_path(path) else {
+        return err(400, "Invalid wiki page name (expected a wiki/… .md path)");
+    };
+    if let Err(e) = commands::vectorstore::validate_page_id_for_v2(&page_id) {
+        return err(400, e);
+    }
+    // Same concurrency slot as embedding: deleting a page's vectors must not
+    // interleave with an in-flight embed of the same page.
+    let Some(_slot) = try_acquire_page_embed_slot() else {
+        return err(503, "Too many page indexing requests are already running");
+    };
+    match tauri::async_runtime::block_on(commands::vectorstore::vector_delete_page(
+        project.path.clone(),
+        page_id.clone(),
+    )) {
+        Ok(()) => {
+            commands::page_embedding::delete_revision(&project.path, &page_id);
+            ok(json!({
+                "ok": true,
+                "projectId": project.id,
+                "path": path,
+                "pageId": page_id,
+            }))
+        }
+        Err(e) => err(500, format!("Delete embedding error: {e}")),
     }
 }
 
@@ -6736,6 +6787,79 @@ mod tests {
             "write-path invalidation must beat the TTL window"
         );
         assert!(after.results[0].path.ends_with("cases/a.md"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_page_embedding_validates_path() {
+        let root = test_project_dir();
+        let project = ProjectEntry {
+            id: "p1".to_string(),
+            name: "proj".to_string(),
+            path: root.to_string_lossy().to_string(),
+            current: true,
+        };
+        let missing = delete_page_embedding_response(&project, "");
+        assert_eq!(missing.status, 400);
+        assert!(missing.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("path is required"));
+        let not_wiki = delete_page_embedding_response(&project, "path=raw/sources/a.pdf");
+        assert_eq!(not_wiki.status, 400);
+        assert!(not_wiki.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid wiki page name"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn delete_page_embedding_removes_rows_and_revision() {
+        let root = test_project_dir();
+        fs::create_dir_all(root.join("wiki/questions")).unwrap();
+        let page_path = root.join("wiki/questions/q1.md");
+        fs::write(&page_path, "---\ntype: question\ntitle: Q1\n---\n\n正文。\n").unwrap();
+        let pp = root.to_string_lossy().to_string();
+
+        // 模拟 embed 产物：向量行 + revision 指纹（对齐 tests_v2 的确定性 toy embedding）
+        let make_chunks = |page_id: &str, n: u32, dim: usize| {
+            (0..n)
+                .map(|i| commands::vectorstore::ChunkUpsertInput {
+                    chunk_index: i,
+                    chunk_text: format!("{page_id} chunk {i}"),
+                    heading_path: format!("## Heading {i}"),
+                    embedding: (0..dim)
+                        .map(|k| {
+                            let x = (i.wrapping_mul(2654435761) ^ (k as u32)) as f32;
+                            (x / u32::MAX as f32).sin()
+                        })
+                        .collect(),
+                })
+                .collect()
+        };
+        commands::vectorstore::vector_upsert_chunks(
+            pp.clone(),
+            "questions/q1".to_string(),
+            make_chunks("questions/q1", 2, 16),
+        )
+        .await
+        .unwrap();
+        commands::page_embedding::save_revision(&pp, "questions/q1", "sha256:abc").unwrap();
+        assert!(
+            commands::page_embedding::load_revision(&pp, "questions/q1").is_some(),
+            "revision fixture written"
+        );
+
+        // DELETE 语义：行删光 + revision 文件删掉 + 幂等（二次删除不报错）
+        commands::vectorstore::vector_delete_page(pp.clone(), "questions/q1".to_string())
+            .await
+            .unwrap();
+        commands::page_embedding::delete_revision(&pp, "questions/q1");
+        assert!(commands::page_embedding::load_revision(&pp, "questions/q1").is_none());
+        commands::vectorstore::vector_delete_page(pp.clone(), "questions/q1".to_string())
+            .await
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 }
