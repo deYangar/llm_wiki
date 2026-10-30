@@ -52,7 +52,10 @@ export const TAG_AXIS_VOCABULARY: Readonly<Record<string, readonly string[]>> = 
   ],
 }
 
-/** schema V1.4 平铺形态（2025 分册现行标准；与 V1.3 前缀形态过渡期并认）。 */
+/** inquiry-stage 主轴闭集（99 方案批次 3.2 双轴拆分，2026-10-30）：
+ *  8 主题粗标签全量打；原 21 值平铺里的 13 细分值迁 detail 轴（见
+ *  INQUIRY_STAGE_DETAIL_VALUES）。单一事实源=ipoanswer core/kb/inquiry_stages.py
+ *  （STAGE_MAJOR_VALUES / STAGE_DETAIL_VALUES），本文件为管线侧同步副本。 */
 const INQUIRY_STAGE_V14_FLAT_VALUES: readonly string[] = [
   "板块定位",
   "业务模式",
@@ -62,6 +65,10 @@ const INQUIRY_STAGE_V14_FLAT_VALUES: readonly string[] = [
   "合规经营",
   "信息披露",
   "募投项目",
+]
+
+/** inquiry-stage-detail 细分轴闭集（原后续系 7 + 注册系 6）。 */
+const INQUIRY_STAGE_DETAIL_VALUES: readonly string[] = [
   "问询分类",
   "财务数据真实性与业绩质量",
   "业务逻辑与持续经营能力",
@@ -82,6 +89,8 @@ const INQUIRY_STAGE_ALL_FORMS: ReadonlySet<string> = new Set([
   ...INQUIRY_STAGE_V14_FLAT_VALUES,
 ])
 
+const INQUIRY_STAGE_DETAIL_FORMS: ReadonlySet<string> = new Set(INQUIRY_STAGE_DETAIL_VALUES)
+
 /**
  * 各轴适用的页面 type（schema「标签体系」表「适用」列）。未列出的 type
  * 视为该轴不适用——已知树形轴挂到不适用 type（典型：entity 页挂
@@ -95,6 +104,7 @@ const AXIS_APPLICABLE_TYPES: Readonly<Record<string, readonly string[]>> = {
   role: ["issue", "case"],
   topic: ["issue", "case", "source", "question", "synthesis"],
   "inquiry-stage": ["question", "issue", "case"],
+  "inquiry-stage-detail": ["question", "issue", "case"],
   flow: ["case", "question", "synthesis"],
   "reg-nature": ["source", "synthesis"],
   year: ["case"],
@@ -177,6 +187,11 @@ export function validateTagsForPage(
       }
       if (INQUIRY_STAGE_ALL_FORMS.has(value)) kept.push(tag)
       else dropped.push({ tag, reason: "inquiry-stage 枚举外值" })
+      continue
+    }
+    if (axis === "inquiry-stage-detail") {
+      if (INQUIRY_STAGE_DETAIL_FORMS.has(value)) kept.push(tag)
+      else dropped.push({ tag, reason: "inquiry-stage-detail 枚举外值" })
       continue
     }
     const vocabulary = TAG_AXIS_VOCABULARY[axis]

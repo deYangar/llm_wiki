@@ -1284,7 +1284,9 @@ function questionSummaryTitle(
   roundMeta: QaRoundMeta,
   split: QaSplitResult,
 ): string {
-  const round = roundMeta.roundNo ? `第${roundMeta.roundNo}轮` : roundMeta.roundKind
+  // 无轮号时 round 置空只拼一次 roundKind——旧模板此处把 roundKind 拼了两次，
+  // 产出「ST联合 注册反馈注册反馈（qa-split H4·1题）」（99 方案 3.2 附带修复）
+  const round = roundMeta.roundNo ? `第${roundMeta.roundNo}轮` : ""
   return `${pathMeta.company} ${round}${roundMeta.roundKind}（qa-split ${split.channel}·${split.questions.length}题）`
 }
 
@@ -1483,6 +1485,21 @@ export const INQUIRY_STAGE_ALLOWED_VALUES: readonly string[] = [
   ),
 ]
 
+/** 批次 3.2 双轴拆分：主轴 8 主题平铺值 + detail 轴 13 细分平铺值。
+ *  单一事实源=ipoanswer core/kb/inquiry_stages.py（管线侧同步副本），
+ *  V1.3 树形态过渡期并认（tag-vocabulary.ts 同款口径）。 */
+export const INQUIRY_STAGE_MAJOR_FLAT: readonly string[] = [
+  "板块定位", "业务模式", "财务数据真实性", "关联交易",
+  "核心技术", "合规经营", "信息披露", "募投项目",
+]
+export const INQUIRY_STAGE_DETAIL_FLAT: readonly string[] = [
+  "问询分类", "财务数据真实性与业绩质量", "业务逻辑与持续经营能力",
+  "关联交易与资金往来", "信息披露与合规性", "重大资产重组与并购",
+  "核心技术来源·科创企业", "板块定位于产业政策", "财务真实性与业绩质量",
+  "公司治理与合规性", "业务与持续经营能力", "信息披露与文件合规性",
+  "会后事项与重大变化",
+]
+
 /** topic 主题词护栏上限（防 LLM 幻觉撒标签；超限丢弃记明细，不拒题）。 */
 const MAX_FALLBACK_TOPIC_TAGS = 6
 
@@ -1529,9 +1546,11 @@ const LLM_FALLBACK_SYSTEM_PROMPT = [
   "2. 题干起始行 = 问题标题行（如「4.关于成本核算的准确性与采购公允性」「问题 7、关于关联交易」「一、关于行业代表性」）；",
   "   不含封面、目录页、函件出具句、回复正文。",
   "3. no 用原文题号（会计师/律师文件可能只覆盖部分题，跳号是正常的）；无题号形态（单题意见书）用「主.子」形态（如 7.3）。",
-  "4. tags：一道题可同时属于多个大类，符合的都要挂（多标签，不设数量上限），前缀必须是 inquiry-stage: 或 topic:。",
-  "   inquiry-stage 只能取以下枚举值（枚举外一律不输出；光杆根=树级，叶值=大类标签）：",
-  INQUIRY_STAGE_ALLOWED_VALUES.map((value) => `   inquiry-stage:${value}`).join("\n"),
+  "4. tags：一道题可同时属于多个大类，符合的都要挂（多标签，不设数量上限），前缀必须是 inquiry-stage: / inquiry-stage-detail: / topic:。",
+  "   inquiry-stage 是主题粗轴（8 值闭集，每题至少 1 个）；inquiry-stage-detail 是问询细分轴（13 值闭集，轮次细分适用才挂）：",
+  "   inquiry-stage:板块定位 | 业务模式 | 财务数据真实性 | 关联交易 | 核心技术 | 合规经营 | 信息披露 | 募投项目",
+  "   inquiry-stage-detail:问询分类 | 财务数据真实性与业绩质量 | 业务逻辑与持续经营能力 | 关联交易与资金往来 | 信息披露与合规性 | 重大资产重组与并购 | 核心技术来源·科创企业 | 板块定位于产业政策 | 财务真实性与业绩质量 | 公司治理与合规性 | 业务与持续经营能力 | 信息披露与文件合规性 | 会后事项与重大变化",
+  "   （99 方案批次 3.2 双轴拆分；旧轮次前缀形态一律不再输出）",
   "   topic: 后接主题词（如 topic:收入确认），最多 6 个。",
   "",
   "示例（千分一二轮裸行形态，MinerU 对部分题边界不加 ## 标题）：",
@@ -1599,7 +1618,16 @@ export function sanitizeFallbackTags(tags: unknown): { kept: string[]; dropped: 
     const value = tag.trim()
     if (seen.has(value)) continue
     if (value.startsWith("inquiry-stage:")) {
-      if (INQUIRY_STAGE_ALLOWED_VALUES.includes(value.slice("inquiry-stage:".length))) {
+      // 批次 3.2 双轴：主轴认 8 主题平铺值（V1.3 树形态过渡期并认）
+      const v = value.slice("inquiry-stage:".length)
+      if (INQUIRY_STAGE_ALLOWED_VALUES.includes(v) || INQUIRY_STAGE_MAJOR_FLAT.includes(v)) {
+        kept.push(value)
+        seen.add(value)
+      } else {
+        dropped.push(value)
+      }
+    } else if (value.startsWith("inquiry-stage-detail:")) {
+      if (INQUIRY_STAGE_DETAIL_FLAT.includes(value.slice("inquiry-stage-detail:".length))) {
         kept.push(value)
         seen.add(value)
       } else {

@@ -114,3 +114,32 @@ describe("tag-vocabulary — validateTagsForPage (B3, 审计 S8)", () => {
     expect(TAG_AXIS_VOCABULARY["reg-nature"]).toContain("问询与处罚案例")
   })
 })
+
+describe("inquiry-stage 双轴拆分（99 方案批次 3.2）", () => {
+  it("主轴闭集=8 主题粗标签，细分值在主轴被剔", () => {
+    const { kept, dropped } = validateTagsForPage("question", [
+      "inquiry-stage:募投项目",
+      "inquiry-stage:财务数据真实性与业绩质量", // 细分值混主轴 → 剔
+    ])
+    expect(kept).toEqual(["inquiry-stage:募投项目"])
+    expect(dropped).toHaveLength(1)
+  })
+
+  it("detail 轴闭集=13 细分值，8 主题值在 detail 轴被剔", () => {
+    const { kept, dropped } = validateTagsForPage("question", [
+      "inquiry-stage-detail:信息披露与合规性",
+      "inquiry-stage-detail:信息披露", // 主题值混 detail 轴 → 剔
+    ])
+    expect(kept).toEqual(["inquiry-stage-detail:信息披露与合规性"])
+    expect(dropped).toHaveLength(1)
+  })
+
+  it("detail 轴适用于 question/issue/case", () => {
+    for (const t of ["question", "issue", "case"]) {
+      const { kept } = validateTagsForPage(t, ["inquiry-stage-detail:问询分类"])
+      expect(kept).toEqual(["inquiry-stage-detail:问询分类"])
+    }
+    const { dropped } = validateTagsForPage("source", ["inquiry-stage-detail:问询分类"])
+    expect(dropped).toHaveLength(1)
+  })
+})
