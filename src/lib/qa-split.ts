@@ -960,6 +960,65 @@ export function deriveFinancingType(deal: string | undefined, sourceIdentity: st
   return null
 }
 
+/** financing_type 题干兜底（99 方案批次 3.1，2026-10-30，零 LLM）：
+ *  文件名规则（deriveFinancingType）对「补充法律意见书/会计师专项说明」类
+ *  回复文书名不命中（同案例全部文书都可能无关键词，上能/中仑实测），此时
+ *  用题干里「本次发行/本次募集」句式锚定融资表述——「本次」限定排除
+ *  「隆利科技 2020 年向不特定对象发行可转债」这类他司/前次历史引用。
+ *  匹配窗：`本次` 后 40 字（不含句号换行）内出现关键词，关键词判定序与
+ *  deriveFinancingType 一致（优先股→配股→可转债→公司债→向不特定→向特定）。
+ *  值域同 deriveFinancingType（schema V1.5 八类）。 */
+export function deriveFinancingTypeFromBody(
+  deal: string | undefined,
+  body: string,
+): string | null {
+  if (deal !== "再融资") return null
+  // 页内品种频次取众（平频取最早位置命中）。最早位置规则会被「历史文书原文
+  // 里的本次」抢跑——上能实测：题干 15 处「本次向特定对象发行股票」混 1 处
+  // 「本次向不特定对象发行可转换公司债券首次董事会决议日（2022年…）」（旧
+  // 可转债文件原文自带「本次」字样），品种频次取众可吸收这类历史引用噪声。
+  const KEYWORDS = [
+    "优先股", "配股", "可转换公司债券", "可转债", "公司债", "向不特定对象发行", "向特定对象发行",
+  ] as const
+  const bucketOf: Record<string, string> = {
+    优先股: "优先股", 配股: "配股", 可转换公司债券: "可转债", 可转债: "可转债",
+    公司债: "公司债", 向不特定对象发行: "向不特定", 向特定对象发行: "定增",
+  }
+  const hits: Record<string, { count: number; firstPos: number; window: string }> = {}
+  for (let i = body.indexOf("本次"); i >= 0; i = body.indexOf("本次", i + 1)) {
+    const rest = body.slice(i + 2)
+    const stop = rest.search(/[。\n]/)
+    const window = stop >= 0 && stop <= 40 ? rest.slice(0, stop) : rest.slice(0, 40)
+    for (const kw of KEYWORDS) {
+      const p = window.indexOf(kw)
+      if (p < 0) continue
+      const bucket = bucketOf[kw]
+      const h = (hits[bucket] ??= { count: 0, firstPos: i + p, window })
+      h.count += 1
+      if (i + p < h.firstPos) {
+        h.firstPos = i + p
+        h.window = window
+      }
+    }
+  }
+  const ranked = Object.entries(hits).sort(
+    (a, b) => b[1].count - a[1].count || a[1].firstPos - b[1].firstPos,
+  )
+  const [bucket, h] = ranked[0] ?? ["", null as unknown as { window: string }]
+  if (!bucket) return null
+  const window: string = h.window
+  if (bucket === "优先股") return "再融资-优先股"
+  if (bucket === "配股") return "再融资-配股"
+  if (bucket === "可转债") {
+    return window.includes("向特定对象") ? "再融资-定向可转债" : "再融资-公开发行可转债"
+  }
+  if (bucket === "公司债") return "公开发行公司债"
+  if (bucket === "向不特定") {
+    return /可转换公司债券|可转债/.test(window) ? "再融资-公开发行可转债" : "再融资-向不特定对象发行"
+  }
+  return /可转换公司债券|可转债/.test(window) ? "再融资-定向可转债" : "再融资-定增"
+}
+
 // ---- W7.3 question 页生成 ------------------------------------------------
 
 export interface QuestionPageBuild {
@@ -1113,8 +1172,12 @@ export function buildQuestionFileBlocks(
     if (pathMeta.deal) fm.push(`deal: ${yamlScalar(pathMeta.deal)}`)
     if (pathMeta.year) fm.push(`year: ${yamlScalar(pathMeta.year)}`)
     if (pathMeta.status) fm.push(`status: ${yamlScalar(pathMeta.status)}`)
-    if (pathMeta.financingType) {
-      fm.push(`financing_type: ${yamlScalar(pathMeta.financingType)}`)
+    // 批次 3.1：文件名规则未命中（补充法律意见书类文书名）时题干「本次」句式兜底
+    const financingType =
+      pathMeta.financingType ??
+      deriveFinancingTypeFromBody(pathMeta.deal, question.questionText)
+    if (financingType) {
+      fm.push(`financing_type: ${yamlScalar(financingType)}`)
     }
     if (roundMeta.roundNo !== null) fm.push(`round_no: ${roundMeta.roundNo}`)
     fm.push(

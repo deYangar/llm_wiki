@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { applyCaseInfoFacts, extractCaseInfoFacts } from "./case-info"
-import { deriveFinancingType } from "./qa-split"
+import { deriveFinancingType, deriveFinancingTypeFromBody } from "./qa-split"
 
 const CASE_PAGE = `---
 type: case
@@ -57,5 +57,40 @@ describe("case-info — R3 §7.3 基本信息抽取", () => {
     expect(deriveFinancingType("再融资", "问答/2025/x/配股说明书.pdf")).toBe("再融资-配股")
     expect(deriveFinancingType("重大资产重组", "x.pdf")).toBeNull()
     expect(deriveFinancingType("再融资", "无关键词文件.pdf")).toBeNull()
+  })
+
+  it("deriveFinancingTypeFromBody anchors on 本次 to reject history references", () => {
+    // 上能 R2 实测形态：审议通过本次向特定对象发行股票的方案
+    expect(deriveFinancingTypeFromBody("再融资", "公司召开董事会审议通过本次向特定对象发行股票的方案及相关事项。"))
+      .toBe("再融资-定增")
+    // 万通形态：本次项目为向特定对象发行可转换公司债券
+    expect(deriveFinancingTypeFromBody("再融资", "本次项目为公司向特定对象发行可转换公司债券，募集资金总额不超过1.5亿元"))
+      .toBe("再融资-定向可转债")
+    // 本次+可转债无定向限定 → 公开发行
+    expect(deriveFinancingTypeFromBody("再融资", "公司本次发行可转换公司债券的方案"))
+      .toBe("再融资-公开发行可转债")
+    // 他司历史引用（隆利科技 2020 年向不特定对象发行可转债）不命中——无「本次」锚
+    expect(deriveFinancingTypeFromBody("再融资", "| 隆利科技 2020 年向不特定对象发行可转债 | Mini LED 显示模组新建项目 |"))
+      .toBeNull()
+    // 「前次发行的可转换公司债券」非本次——「本次」与关键词间超过 40 字窗或句号阻断
+    expect(deriveFinancingTypeFromBody("再融资", "应付债券为公司前次发行的可转换公司债券。请说明情况。"))
+      .toBeNull()
+    // 窗口阻断：本次与关键词跨句（句号）不联动
+    expect(deriveFinancingTypeFromBody("再融资", "本次募集资金到位后专户存储。前次可转债已全额转股。"))
+      .toBeNull()
+    // IPO/重组不走题干兜底（文件名层已定首发；重组不在轴上）
+    expect(deriveFinancingTypeFromBody("IPO", "本次向特定对象发行股票")).toBeNull()
+    expect(deriveFinancingTypeFromBody("重大资产重组", "本次发行股份购买资产")).toBeNull()
+    expect(deriveFinancingTypeFromBody(undefined, "本次向特定对象发行股票")).toBeNull()
+    // 配股/优先股句式
+    expect(deriveFinancingTypeFromBody("再融资", "本次配股募集资金总额不超过")).toBe("再融资-配股")
+    expect(deriveFinancingTypeFromBody("再融资", "本次发行的优先股股息率")).toBe("再融资-优先股")
+    // 上能实测形态：15 处「本次向特定对象发行股票」混 1 处旧可转债文件原文的
+    // 「本次向不特定对象发行可转换公司债券首次董事会决议日（2022年…）」——
+    // 品种频次取众吸收历史引用噪声
+    expect(deriveFinancingTypeFromBody("再融资",
+      "对照本次向不特定对象发行可转换公司债券首次董事会决议日（2022年7月28日），公司尚未就本次募投项目投入资金。"
+      + "本次向特定对象发行股票的募集资金规模不超过255,000万元。本次向特定对象发行股票的发行对象为不超过35名投资者。"))
+      .toBe("再融资-定增")
   })
 })
