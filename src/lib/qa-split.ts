@@ -1201,18 +1201,27 @@ export function buildQuestionFileBlocks(
     if (question.questionNoIsGenerated) {
       fm.push("question_no_generated: true")
     }
+    // 批次 3.5（M14，2026-10-30）：拆题元数据迁 frontmatter 结构化字段——
+    // 正文纯净原则（结构化信息一律 frontmatter），行号区间供 M5 回复段
+    // 回补/M4 排查复用；正文尾部的「## 拆题元数据」段不再产出。
+    fm.push(
+      "split:",
+      `  channel: ${question.channel}`,
+      `  question_range: [${question.startLine + 1}, ${(question.replyStartLine ?? question.endLine + 1)}]`,
+      ...(question.replyStartLine === null
+        ? ["  reply_range: null"]
+        : [`  reply_range: [${question.replyStartLine + 1}, ${question.endLine + 1}]`]),
+      ...(question.questionNoIsGenerated
+        ? []
+        : [`  source_no: ${question.questionNo}`]),
+      `  source_doc: "${yamlEscape(sourceIdentity)}"`,
+    )
 
     const body =
       `## 监管问题\n\n${question.questionText}\n\n` +
       (question.replyText
         ? `## 回复\n\n${question.replyText}\n\n`
-        : "") +
-      `## 拆题元数据\n\n` +
-      `- 识别通道: ${question.channel}\n` +
-      `- 题目边界: 第 ${question.startLine + 1}–${(question.replyStartLine ?? question.endLine + 1)} 行\n` +
-      `- 回复边界: ${question.replyStartLine === null ? "无（问询函原件）" : `第 ${question.replyStartLine + 1}–${question.endLine + 1} 行`}\n` +
-      `- 原文题号: ${question.questionNoIsGenerated ? "无（按回复块顺序生成）" : question.questionNo}\n` +
-      `- 来源文档: ${sourceIdentity}\n`
+        : "")
 
     blocks.push(
       `---FILE: wiki/questions/${slug}-q${question.questionNo}.md---\n---\n${fm.join("\n")}\n---\n\n${body}---END FILE---`,
