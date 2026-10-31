@@ -35,6 +35,11 @@ tauri-plugin-store = "2.4.2"
 tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
 tiny_http = "0.12"
+# §九 ingest 抓取（批次 5.2）：GBK 老站响应头无 charset，reqwest 会按 UTF-8
+# 解码出乱码。显式用 encoding_rs 做「charset 头 → <meta charset> → UTF-8
+# 合法性 → GBK」四层探测（encoding_rs 已是 reqwest 的传递依赖，这里只是
+# 显式声明以便直接调用，不新增下载）。
+encoding_rs = "0.8"
 zip = "2"
 calamine = "0.34.0"
 docx-rs = "0.4.20"

@@ -2442,10 +2442,27 @@ fn handle_ingest(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
             });
             continue;
         }
-        // 春晖是 GBK 老站；其它源多为 UTF-8。`resp.text()` 按 charset 头解码，
-        // 无 charset 时退 UTF-8 —— GBK 源的乱码由调用方在 title 里覆盖。
-        let html = match resp.text() {
-            Ok(t) => t,
+        // ⚠️ 必须取字节自行解码，不能 `resp.text()`：春晖等 GBK 老站的响应头
+        //    只有 `Content-Type: text/html`（**无 charset**，2026-10-31 实测），
+        //    reqwest 无 charset 时按 UTF-8 解码 → 中文正文全乱码（真入库首例
+        //    「上市公司章程指引」正文一堆 U+FFFD 的实证）。
+        //    改为：字节 + 三层编码探测（charset 头 → <meta charset> → 合法
+        //    UTF-8 判定 → 否则 GBK）。
+        let charset_hint = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|ct| {
+                ct.split(';').find_map(|part| {
+                    let part = part.trim();
+                    part.strip_prefix("charset=")
+                        .or_else(|| part.strip_prefix("charset ="))
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                })
+            })
+            .unwrap_or_default();
+        let bytes = match resp.bytes() {
+            Ok(b) => b,
             Err(e) => {
                 failed += 1;
                 outcomes.push(crate::ingest_api::IngestOutcome {
@@ -2453,13 +2470,15 @@ fn handle_ingest(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
                     status: "failed".into(),
                     path: None,
                     title: None,
-                    reason: Some(format!("decode failed: {e}")),
+                    reason: Some(format!("read body failed: {e}")),
                 });
                 continue;
             }
         };
+        let html = crate::ingest_api::decode_html_bytes(&bytes, &charset_hint);
 
-        let (page_title, body) = crate::ingest_api::extract_regulation_body(&html);
+        let (page_title, body, doc_number) =
+            crate::ingest_api::extract_regulation_body(&html);
         let title = {
             let t = item.title.trim();
             if t.is_empty() {
@@ -2481,8 +2500,13 @@ fn handle_ingest(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
         }
 
         let rel = crate::ingest_api::regulation_rel_path(&title);
-        let content =
-            crate::ingest_api::build_regulation_page(&title, url, "", "现行有效", &body);
+        // issuer 不能在端点里传空（2026-10-31 真入库首例实测：空 issuer 落到
+        // frontmatter `issuer: ""`，应用侧读出来是空数组——分类挂接与「发布
+        // 机构」展示都断链）。用与 chunhui_ingest.py 同一套规则推导。
+        let issuer = crate::ingest_api::derive_issuer(&doc_number, &body, &title);
+        let content = crate::ingest_api::build_regulation_page(
+            &title, url, &issuer, "现行有效", &body,
+        );
 
         if req.dry_run {
             outcomes.push(crate::ingest_api::IngestOutcome {

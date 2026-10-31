@@ -196,7 +196,7 @@ fn yaml_scalar(value: &str) -> String {
 /// 这里做**纯文本抽取**（剥标签 + 解码实体 + 按行切分），不引入 HTML
 /// 解析依赖 —— 与 `scripts/chunhui_scraper.py` 的抽取口径一致，便于
 /// 两侧产物对账。
-pub fn extract_regulation_body(html: &str) -> (String, String) {
+pub fn extract_regulation_body(html: &str) -> (String, String, String) {
     let text = strip_html_tags(&insert_block_breaks(html));
     let mut lines: Vec<&str> = text
         .lines()
@@ -204,7 +204,7 @@ pub fn extract_regulation_body(html: &str) -> (String, String) {
         .filter(|l| !l.is_empty())
         .collect();
     if lines.is_empty() {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), String::new());
     }
     let title = lines.first().copied().unwrap_or("").to_string();
     // 文号行判定：含「〔」或「[」且含「号」
@@ -215,9 +215,139 @@ pub fn extract_regulation_body(html: &str) -> (String, String) {
         .find(|l| (l.contains('〔') || l.contains('[')) && l.contains('号'))
         .map(|s| s.to_string())
         .unwrap_or_default();
-    // 正文去掉标题行与文号行
-    lines.retain(|l| *l != title && *l != doc_number);
-    (title, lines.join("\n"))
+    // 正文只剥标题行 —— 文号**保留**（它是法规正文的有用信息，且 batch 侧的
+    // frontmatter 也有 docNumber 键，内容重复不冲突）
+    lines.retain(|l| *l != title);
+    (title, lines.join("\n"), doc_number)
+}
+
+/// 从文号 / 正文 / 标题推导发布机构。
+///
+/// 规则逐条对齐 `scripts/chunhui_ingest.py::derive_issuer`（两侧产物要在同一个
+/// 库里共处，口径必须一致）：
+/// 1. 文号前缀映射（财会→财政部、证监→中国证监会…）；
+/// 2. 标题为「中华人民共和国××法」→ 全国人大常委会；
+/// 3. 标题为条例/规定/办法且正文前 5 行有「总理 / 国务院令 / 中华人民共和国
+///    国务院」→ 国务院；
+/// 4. 正文前 30 行里有机构名单独成行 → 该机构；
+/// 5. 都不命中 → 「其他」（**如实兜底，不硬猜**）。
+pub fn derive_issuer(doc_number: &str, body: &str, title: &str) -> String {
+    const PREFIX: &[(&str, &str)] = &[
+        ("财会", "财政部"),
+        ("财金", "财政部"),
+        ("财税", "财政部 国家税务总局"),
+        ("财综", "财政部"),
+        ("国税", "国家税务总局"),
+        ("国家税务总局", "国家税务总局"),
+        ("证监", "中国证监会"),
+        ("会监", "中国证监会"),
+        ("上证发", "上海证券交易所"),
+        ("深证", "深圳证券交易所"),
+        ("北证", "北京证券交易所"),
+        ("股转", "全国中小企业股份转让系统"),
+        ("银保监", "国家金融监督管理总局"),
+        ("金规", "国家金融监督管理总局"),
+        ("人民银行", "中国人民银行"),
+        ("发改", "国家发展改革委"),
+        ("国资", "国务院国资委"),
+        ("工信部", "工业和信息化部"),
+    ];
+    let dn = doc_number.trim();
+    for (prefix, issuer) in PREFIX {
+        if dn.starts_with(prefix) {
+            return (*issuer).to_string();
+        }
+    }
+    let body_lines: Vec<&str> = body.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let head5 = body_lines.iter().take(5).copied().collect::<Vec<_>>().join("");
+    // 「中华人民共和国×法」（不含「实施条例」这类）
+    if title.contains("中华人民共和国") && title.ends_with('法') {
+        return "全国人大常委会".to_string();
+    }
+    if (title.ends_with("条例") || title.ends_with("规定") || title.ends_with("办法"))
+        && (head5.contains("总理") || head5.contains("国务院令") || head5.contains("中华人民共和国国务院"))
+    {
+        return "国务院".to_string();
+    }
+    // 正文落款：机构名独立成行
+    let mut known: Vec<String> = PREFIX.iter().map(|(_, i)| i.to_string()).collect();
+    for extra in [
+        "最高人民法院",
+        "最高人民检察院",
+        "国务院",
+        "中国证券登记结算有限责任公司",
+        "全国人大常委会",
+        "全国人民代表大会常务委员会",
+    ] {
+        known.push(extra.to_string());
+    }
+    let known_norm: Vec<String> = known.iter().map(|k| k.replace(' ', "")).collect();
+    for line in body_lines.iter().take(30) {
+        let ls = line.replace(' ', "");
+        if known_norm.iter().any(|k| *k == ls) {
+            return if ls.contains("人大常委会") {
+                "全国人大常委会".to_string()
+            } else {
+                ls
+            };
+        }
+    }
+    "其他".to_string()
+}
+
+/// 按四层探测把 HTML 字节解码为文本。
+///
+/// ## 为什么必须自己做（2026-10-31 真入库首例的缺陷）
+///
+/// 春晖等 GBK 老站的响应头只有 `Content-Type: text/html` —— **没有 charset**。
+/// `reqwest::Response::text()` 在无 charset 时按 UTF-8 解码，GBK 页面的中文
+/// 正文于是全部变成 U+FFFD（实证：真入库「上市公司章程指引」正文一堆乱码）。
+/// 这不是「调用方可以用 title 覆盖」能兜住的 —— 正文本身就是产物。
+///
+/// 探测顺序：
+/// 1. HTTP 头里显式 charset（最可信）
+/// 2. 正文 `<meta charset=` 声明（只看前 4KB）
+/// 3. 字节本身是合法 UTF-8 → 按 UTF-8（覆盖绝大多数现代站点）
+/// 4. 兜底 GBK（中文老站的实际编码；encoding_rs::GBK 即 GB18030 兼容超集）
+pub fn decode_html_bytes(bytes: &[u8], charset_hint: &str) -> String {
+    // ① HTTP 头
+    if let Some(enc) = charset_to_encoding(charset_hint) {
+        let (text, _, _) = enc.decode(bytes);
+        return text.into_owned();
+    }
+    // ② <meta> 声明（meta 必在 head 里，只看前 4KB）
+    let head_len = bytes.len().min(4096);
+    let head = String::from_utf8_lossy(&bytes[..head_len]).to_string();
+    let lower = head.to_ascii_lowercase();
+    if let Some(pos) = lower.find("charset=") {
+        let tail = &head[pos + "charset=".len()..];
+        let name: String = tail
+            .trim_start_matches(['"', '\''])
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if let Some(enc) = charset_to_encoding(&name) {
+            let (text, _, _) = enc.decode(bytes);
+            return text.into_owned();
+        }
+    }
+    // ③ 合法 UTF-8
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    // ④ 兜底 GBK
+    let (text, _, _) = encoding_rs::GBK.decode(bytes);
+    text.into_owned()
+}
+
+/// charset 名称 → encoding_rs 的 Encoding（认不出返回 None）。
+fn charset_to_encoding(name: &str) -> Option<&'static encoding_rs::Encoding> {
+    let n = name.trim().to_ascii_lowercase();
+    if n.is_empty() {
+        return None;
+    }
+    // WHATWG Encoding 标准的标签匹配（utf-8/gb2312/gbk/gb18030/big5…）
+    encoding_rs::Encoding::for_label(n.as_bytes())
 }
 
 /// 剥 HTML 标签 + 解实体（含数字实体与中文常用实体）。
@@ -410,9 +540,12 @@ mod tests {
             <p>财会〔2026〕12号</p>\
             <p>一、关于不属于单项履约义务的保证类质量保证</p>\
             <script>var a = 1;</script></body></html>";
-        let (title, body) = extract_regulation_body(html);
+        let (title, body, dn) = extract_regulation_body(html);
         assert_eq!(title, "企业会计准则解释第18号");
-        assert!(body.contains("财会〔2026〕12号") == false, "文号应被剥出正文: {body}");
+        // 2026-10-31 设计修正：文号**留在正文**（法规正文的有用信息，batch 侧
+        // 的 frontmatter docNumber 也与正文并存），只抽出返回给 issuer 推导。
+        assert_eq!(dn, "财会〔2026〕12号", "文号必须被抽出来供 issuer 推导");
+        assert!(body.contains("财会〔2026〕12号"), "文号保留在正文: {body}");
         assert!(body.contains("单项履约义务"), "{body}");
         assert!(!body.contains("var a"), "script 内容必须剔除: {body}");
         assert!(!body.contains(".x{}"), "style 内容必须剔除: {body}");
@@ -421,7 +554,7 @@ mod tests {
     #[test]
     fn extract_body_decodes_entities() {
         let html = "<p>关于&lt;上市公司&gt;的&amp;有关规定&#12288;第&#x4E00;条</p>";
-        let (title, _body) = extract_regulation_body(html);
+        let (title, _body, _dn) = extract_regulation_body(html);
         assert!(title.contains("上市公司"), "{title}");
         assert!(!title.contains("&lt;"), "{title}");
     }
@@ -473,6 +606,74 @@ mod tests {
         assert_eq!(fm.skipped_lines().len(), 0, "不得产生解析不了的行");
         assert!(page.contains("# 企业会计准则解释第18号"));
         assert!(page.contains("一、正文第一段"));
+    }
+
+    #[test]
+    fn decode_gbk_bytes_without_charset_header() {
+        // 春晖实测形态：响应头无 charset，正文是 GBK 字节（「中国证监会公告」）
+        let gbk: Vec<u8> = vec![
+            0xD6, 0xD0, 0xB9, 0xFA, 0xD6, 0xA4, 0xBC, 0xE0, 0xBB, 0xE1, 0xB9, 0xAB, 0xB8, 0xE6,
+        ];
+        let text = decode_html_bytes(&gbk, "");
+        assert_eq!(text, "中国证监会公告", "无 charset 时必须兜底 GBK，不能按 UTF-8 出乱码");
+        assert!(!text.contains('\u{FFFD}'), "不得出现替换字符: {text}");
+    }
+
+    #[test]
+    fn decode_utf8_bytes_when_valid() {
+        let raw = "现代站点 UTF-8".as_bytes().to_vec();
+        let text = decode_html_bytes(&raw, "");
+        assert_eq!(text, "现代站点 UTF-8", "合法 UTF-8 应优先按 UTF-8 解");
+    }
+
+    #[test]
+    fn decode_honors_charset_header() {
+        let raw = "检验".as_bytes().to_vec();
+        let text = decode_html_bytes(&raw, "gb2312");
+        assert!(!text.is_empty(), "显式 charset 必须走对应编码器");
+    }
+
+    #[test]
+    fn decode_honors_meta_charset() {
+        let html = b"<html><head><meta charset=\"gb2312\"></head><body></body></html>";
+        let text = decode_html_bytes(html, "");
+        assert!(text.contains("meta charset"), "{text}");
+    }
+
+    #[test]
+    fn derive_issuer_by_doc_number_prefix() {
+        assert_eq!(derive_issuer("财会〔2026〕12号", "", ""), "财政部");
+        assert_eq!(derive_issuer("证监发〔2026〕3号", "", ""), "中国证监会");
+        assert_eq!(derive_issuer("上证发〔2026〕5号", "", ""), "上海证券交易所");
+    }
+
+    #[test]
+    fn derive_issuer_by_title_form() {
+        assert_eq!(
+            derive_issuer("", "", "中华人民共和国证券法"),
+            "全国人大常委会",
+            "x 法 → 全国人大常委会"
+        );
+        assert_eq!(
+            derive_issuer("", "中华人民共和国国务院令第800号\n总理 李强", "采购条例"),
+            "国务院",
+            "条例 + 国务院令 → 国务院"
+        );
+    }
+
+    #[test]
+    fn derive_issuer_unknown_is_honest_other() {
+        assert_eq!(derive_issuer("", "一段普通正文", "某通知"), "其他", "推不出就如实兜底");
+    }
+
+    #[test]
+    fn extract_returns_doc_number_and_keeps_it_in_body() {
+        let html = "<p>某管理办法</p><p>财会〔2026〕12号</p><p>第一条 为了…</p>";
+        let (title, body, dn) = extract_regulation_body(html);
+        assert_eq!(title, "某管理办法");
+        assert_eq!(dn, "财会〔2026〕12号", "文号必须被抽出来供 issuer 推导");
+        assert!(body.contains("财会〔2026〕12号"), "文号保留在正文");
+        assert!(body.contains("第一条"));
     }
 
     #[test]

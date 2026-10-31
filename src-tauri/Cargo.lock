@@ -4762,6 +4762,7 @@ dependencies = [
  "calamine 0.34.0",
  "chrono",
  "docx-rs",
+ "encoding_rs",
  "epub",
  "futures",
  "html2text",
