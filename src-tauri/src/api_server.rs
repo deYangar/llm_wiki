@@ -688,6 +688,10 @@ fn handle_request(
         (&Method::Post, ["projects", project_id, "pages", "write"]) => {
             handle_write_page(app, project_id, body)
         }
+        // §九 法规 ingest（批次 5.2）：源 URL → 抓取 → 组页 → 幂等入库
+        (&Method::Post, ["projects", project_id, "ingest"]) => {
+            handle_ingest(app, project_id, body)
+        }
         (&Method::Patch, ["projects", project_id, "pages", "frontmatter"]) => {
             handle_patch_frontmatter(app, project_id, body)
         }
@@ -748,7 +752,11 @@ fn is_token_required_request(method: &Method, path: &str) -> bool {
     (method == &Method::Post
         && matches!(
             parts.as_slice(),
-            ["projects", _, "pages", "embed"] | ["projects", _, "pages", "write"]
+            ["projects", _, "pages", "embed"]
+                | ["projects", _, "pages", "write"]
+                // §九 ingest（批次 5.2）：写库 + 出站抓取 = 双重破坏面，
+                // 与 pages/write 同级 fail-closed（F8「读开放、写授权」口径）。
+                | ["projects", _, "ingest"]
         ))
         || method == &Method::Delete
             && matches!(parts.as_slice(), ["projects", _, "pages", "embedding"])
@@ -2341,6 +2349,198 @@ struct WritePageRequest {
     content: String,
     #[serde(default)]
     allow_overwrite: bool,
+}
+
+/// §九 法规 ingest（批次 5.2，2026-10-31）。
+///
+/// 契约见 `crate::ingest_api` 模块头。要点：
+/// * 先建 `source_url` 索引做**幂等判重**（同源命中即跳过，不重抓）；
+/// * 抓取在同步上下文里用 reqwest blocking（端点本身是同步 handler）；
+/// * 落盘走 `write_wiki_page_verified` —— 与 pages/write 同一套护栏
+///   （路径沙箱 / 原子替换 / 回读写验证 / 文件历史），端点的写入不能
+///   比常规写页更弱。
+fn handle_ingest(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let req: crate::ingest_api::IngestRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    if req.items.is_empty() {
+        return err(400, "items is required (at least one { url } entry)");
+    }
+    if req.items.len() > 200 {
+        return err(400, "at most 200 items per ingest call");
+    }
+
+    let url_index = crate::ingest_api::build_url_index(&project.path);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("llm-wiki-ingest/0.6.13")
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return err(500, format!("Failed to build HTTP client: {e}")),
+    };
+
+    let mut outcomes: Vec<crate::ingest_api::IngestOutcome> = Vec::new();
+    let (mut created, mut updated, mut skipped, mut failed) = (0usize, 0usize, 0usize, 0usize);
+
+    for item in &req.items {
+        let url = item.url.trim();
+        if url.is_empty() || !url.starts_with("http") {
+            failed += 1;
+            outcomes.push(crate::ingest_api::IngestOutcome {
+                url: item.url.clone(),
+                status: "failed".into(),
+                path: None,
+                title: None,
+                reason: Some("url must be an absolute http(s) URL".into()),
+            });
+            continue;
+        }
+        // 幂等：source_url 已入库 → 跳过。allow_overwrite=true 时照常重抓重写。
+        if !req.allow_overwrite {
+            if let Some(existing) = url_index.get(url) {
+                skipped += 1;
+                outcomes.push(crate::ingest_api::IngestOutcome {
+                    url: url.to_string(),
+                    status: "skipped_exists".into(),
+                    path: Some(existing.clone()),
+                    title: None,
+                    reason: Some("source_url already indexed".into()),
+                });
+                continue;
+            }
+        }
+
+        let resp = match client.get(url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                failed += 1;
+                outcomes.push(crate::ingest_api::IngestOutcome {
+                    url: url.to_string(),
+                    status: "failed".into(),
+                    path: None,
+                    title: None,
+                    reason: Some(format!("fetch failed: {e}")),
+                });
+                continue;
+            }
+        };
+        let status_code = resp.status();
+        if !status_code.is_success() {
+            failed += 1;
+            outcomes.push(crate::ingest_api::IngestOutcome {
+                url: url.to_string(),
+                status: "failed".into(),
+                path: None,
+                title: None,
+                reason: Some(format!("HTTP {status_code}")),
+            });
+            continue;
+        }
+        // 春晖是 GBK 老站；其它源多为 UTF-8。`resp.text()` 按 charset 头解码，
+        // 无 charset 时退 UTF-8 —— GBK 源的乱码由调用方在 title 里覆盖。
+        let html = match resp.text() {
+            Ok(t) => t,
+            Err(e) => {
+                failed += 1;
+                outcomes.push(crate::ingest_api::IngestOutcome {
+                    url: url.to_string(),
+                    status: "failed".into(),
+                    path: None,
+                    title: None,
+                    reason: Some(format!("decode failed: {e}")),
+                });
+                continue;
+            }
+        };
+
+        let (page_title, body) = crate::ingest_api::extract_regulation_body(&html);
+        let title = {
+            let t = item.title.trim();
+            if t.is_empty() {
+                page_title
+            } else {
+                t.to_string()
+            }
+        };
+        if title.trim().is_empty() || body.trim().is_empty() {
+            failed += 1;
+            outcomes.push(crate::ingest_api::IngestOutcome {
+                url: url.to_string(),
+                status: "failed".into(),
+                path: None,
+                title: None,
+                reason: Some("could not extract title/body from the page".into()),
+            });
+            continue;
+        }
+
+        let rel = crate::ingest_api::regulation_rel_path(&title);
+        let content =
+            crate::ingest_api::build_regulation_page(&title, url, "", "现行有效", &body);
+
+        if req.dry_run {
+            outcomes.push(crate::ingest_api::IngestOutcome {
+                url: url.to_string(),
+                status: "dry_run".into(),
+                path: Some(rel),
+                title: Some(title),
+                reason: Some(format!("{} chars", content.chars().count())),
+            });
+            continue;
+        }
+
+        let existed = std::path::Path::new(&project.path).join(&rel).exists();
+        match agent::tools::write_wiki_page_verified(
+            &project.path,
+            &rel,
+            &content,
+            req.allow_overwrite || !existed,
+        ) {
+            Ok(_) => {
+                if existed {
+                    updated += 1;
+                } else {
+                    created += 1;
+                }
+                outcomes.push(crate::ingest_api::IngestOutcome {
+                    url: url.to_string(),
+                    status: if existed { "updated" } else { "created" }.into(),
+                    path: Some(rel),
+                    title: Some(title),
+                    reason: None,
+                });
+            }
+            Err(e) => {
+                failed += 1;
+                outcomes.push(crate::ingest_api::IngestOutcome {
+                    url: url.to_string(),
+                    status: "failed".into(),
+                    path: Some(rel),
+                    title: None,
+                    reason: Some(e),
+                });
+            }
+        }
+    }
+
+    let body = crate::ingest_api::IngestResponse {
+        ok: failed == 0,
+        results: outcomes,
+        created,
+        updated,
+        skipped,
+        failed,
+    };
+    match serde_json::to_value(&body) {
+        Ok(v) => ok(v),
+        Err(e) => err(500, format!("Failed to serialize response: {e}")),
+    }
 }
 
 fn handle_write_page(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {

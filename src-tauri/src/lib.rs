@@ -5,6 +5,7 @@ pub mod commands;
 mod cors;
 mod frontmatter;
 mod heartbeat;
+mod ingest_api;
 mod panic_guard;
 mod proxy;
 mod server_bind;
