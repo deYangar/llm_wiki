@@ -55,7 +55,8 @@ describe("normalizeTwoLevelTableHeaders", () => {
     expect(lines[2]).toBe(
       "| 总资产 | 45,419.34 | 217,593.95 | 379.08% | 42,513.07 | 219,062.52 | 415.28% |",
     )
-    expect(lines.length).toBe(4, "二级表头行被吸收，总行数少一")
+    // 二级表头行被吸收，总行数少一
+    expect(lines).toHaveLength(4)
   })
 
   it("幂等：合并后的结果再跑一遍不再命中", () => {
@@ -104,8 +105,8 @@ describe("normalizeTwoLevelTableHeaders", () => {
       "| a \\| b | c |",
     ].join("\n")
     const { markdown, stats } = normalizeTwoLevelTableHeaders(escaped)
-    expect(stats.skipped).toBe(1, "单级表不合并")
-    expect(markdown).toBe(escaped, "原文逐字节保留")
+    expect(stats.skipped).toBe(1)
+    expect(markdown).toBe(escaped)
   })
 })
 
