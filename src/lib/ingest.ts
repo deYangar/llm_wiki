@@ -93,7 +93,7 @@ const SUMMARIZE_LOGIC_VERSION = "1"
 // 实测「## 问题 5.1、关于客户」整行不命中，5/6/18 三个题位被吞进前题
 // （判卷 29 吞并硬证据的主力）；子题页 title 剥除残迹（纯数字「2」「3」
 // title 17 页）。量词小数（266.77）防误收保持。
-const QA_SPLIT_LOGIC_VERSION = "4"
+const QA_SPLIT_LOGIC_VERSION = "5"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
@@ -2207,15 +2207,23 @@ async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]>
     let fallbackUsage: LlmFallbackUsage | undefined
     let fallbackDetail = ""
     const hasGeneratedNos = split.questions.some((q) => q.questionNoIsGenerated)
+    // 编号重启形态（v5，2026-11-03 批A 三轮回炉）：多轮合订/大节分组内
+    // 子编号从 1 重编的文书，规则通道把重启段当回退跳过、末题吞全文
+    // （五新隧装核查意见 16 锚 4 序列实测）——manualQueue 带关键词，据此
+    // 触发 L6；L6 定位成功（非生成题号数不少于规则）才替换，失败保留
+    // 规则结果（最坏=现状，不倒退）。
+    const restartSuspected = !!split.manualQueue?.includes("编号重启")
     if (
-      (split.questions.length === 0 || hasGeneratedNos) &&
+      (split.questions.length === 0 || hasGeneratedNos || restartSuspected) &&
       useWikiStore.getState().qaSplitConfig.llmFallbackEnabled
     ) {
       throwIfIngestAborted(signal, activityId)
       activity.updateItem(activityId, {
-        detail: hasGeneratedNos
-          ? "qa-split: 规则通道含生成题号，LLM 兜底识别真边界（L6）..."
-          : "qa-split: 规则通道 0 题，LLM 兜底识别题边界（L6）...",
+        detail: restartSuspected
+          ? "qa-split: 疑似编号重启文书，LLM 兜底识别真边界（L6）..."
+          : hasGeneratedNos
+            ? "qa-split: 规则通道含生成题号，LLM 兜底识别真边界（L6）..."
+            : "qa-split: 规则通道 0 题，LLM 兜底识别题边界（L6）...",
       })
       const outcome = await llmFallbackSplit(sourceContent, qaKind!, {
         callLlm: (systemPrompt, userPrompt) =>

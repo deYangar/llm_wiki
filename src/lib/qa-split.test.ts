@@ -2037,3 +2037,112 @@ describe("qa-split — 子题号支持（M4.2 批A 检查门，恒运昌实测 2
     expect(split.questions.every((q) => q.questionNo !== 266.77)).toBe(true)
   })
 })
+
+describe("qa-split — 目录裸页码尾与编号重启（M4.2 批A 三轮回炉，2026-11-03）", () => {
+  const doc = [
+    "某会计师事务所关于某公司向特定对象发行股票申请文件的",
+    "审核问询函回复之专项说明",
+    "",
+    "问题1、关于募投项目 3",
+    "问题2、关于融资规模和效益测算 8",
+    "问题3、关于经营情况 92",
+    "问题4、关于财务性投资 146",
+    "",
+    "## 问题 1、关于募投项目",
+    "请发行人说明本次募集资金投向。",
+    "回复：",
+    "本次募集资金均投向主营业务。",
+    "## 问题 2、关于融资规模和效益测算",
+    "请发行人说明融资规模的合理性。",
+    "回复：",
+    "融资规模与现有资产结构匹配。",
+    "## 问题 3、关于经营情况",
+    "请发行人说明经营业绩波动原因。",
+    "回复：",
+    "经营业绩波动主要受行业周期影响。",
+    "## 问题 4、关于财务性投资",
+    "请发行人说明财务性投资情况。",
+    "回复：",
+    "财务性投资占比符合监管要求。",
+  ].join("\n")
+
+  it("目录裸页码行不再抢先立锚：4 题全立在正文 ## 锚（中科星图会计师核查意见形态）", () => {
+    const split = splitQaDocument(doc, "reply")
+    const nos = split.questions.map((q) => q.questionNo)
+    expect(nos).toEqual([1, 2, 3, 4])
+    // 题干段是正文锚起的块：q1 题干含正文问询句而非目录行
+    const q1 = split.questions.find((q) => q.questionNo === 1)!
+    expect(q1.questionText).toContain("本次募集资金投向")
+    // q4 回复不再吞全文（区段止于自身内容）
+    expect(split.questions[3]!.replyText).not.toContain("经营业绩波动主要受行业周期影响")
+  })
+
+  it("title 不带目录页码尾巴（「关于募投项目 3」→「关于募投项目」）", () => {
+    const split = splitQaDocument(doc, "reply")
+    for (const q of split.questions) {
+      expect(q.title).not.toMatch(/\s\d{1,4}$/)
+    }
+    expect(split.questions[0]!.title).toContain("募投项目")
+  })
+
+  it("裸页码目录行进 tocQuestionNumbers（H4 对账锚定可回填缺口）", () => {
+    const split = splitQaDocument(doc, "reply")
+    expect(split.tocNumbers).toEqual([1, 2, 3, 4])
+  })
+
+  it("编号重启：回退标题行 ≥2 → manualQueue 带关键词（ingest 侧触发 L6）", () => {
+    const restart = [
+      "某独立财务顾问关于审核问询函的回复之核查意见",
+      "",
+      "## 问题 1、关于协同效应与整合",
+      "请说明协同效应。",
+      "回复：",
+      "协同效应显著。",
+      "## 问题 2、关于业绩承诺",
+      "请说明业绩补偿安排。",
+      "回复：",
+      "补偿安排已披露。",
+      "## 问题 3、关于募集配套资金",
+      "请说明配套募集资金用途。",
+      "回复：",
+      "用途符合规定。",
+      "## 问题 4、关于交叉持股",
+      "请说明消除交叉持股安排。",
+      "回复：",
+      "一年内消除。",
+      "## 问题 1、关于收益法评估",
+      "请说明收益法评估增值率合理性。",
+      "回复：",
+      "评估增值合理。",
+      "## 问题 2、关于资产基础法评估",
+      "请说明资产基础法评估参数。",
+      "回复：",
+      "参数选取谨慎。",
+    ].join("\n")
+    const split = splitQaDocument(restart, "reply")
+    // 重启段不重复立题（1-4 保持唯一）
+    const nos = split.questions.map((q) => q.questionNo)
+    expect(nos.filter((n) => n === 1).length).toBe(1)
+    expect(split.manualQueue ?? "").toContain("编号重启")
+  })
+
+  it("正文 # 标题行尾数字不误剥（isTocBarePageTail 只认无 # 前缀行）", () => {
+    const headingTail = [
+      "某回复",
+      "",
+      "## 问题 3、2024 年经营情况",
+      "请说明经营情况。",
+      "回复：",
+      "经营稳健。",
+      "## 问题 5、其他",
+      "请补充说明。",
+      "回复：",
+      "无补充。",
+    ].join("\n")
+    const split = splitQaDocument(headingTail, "reply")
+    const q3 = split.questions.find((q) => q.questionNo === 3)
+    // 「2024 年经营情况」是标题内容不是页码
+    expect(q3!.title).toContain("经营情况")
+    expect(split.questions.map((q) => q.questionNo)).toEqual([3, 5])
+  })
+})

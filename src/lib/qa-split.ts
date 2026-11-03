@@ -378,13 +378,28 @@ function extractQuestionNo(line: string): number {
  *  且抢先立 head，把后续真题号压成回退。点串（2+）+行尾数字=目录
  *  页码引导，标记/目录两侧统一用它。 */
 const TOC_PAGE_TAIL = /[.．…]{2,}\s*\d{1,4}\s*$/
+/** 目录裸页码尾（M4.2 批A 三轮回炉，2026-11-03）：目录行「问题1、关于
+ *  本次募投项目必要性及发行方案 3」无任何点线，尾「空白+1-4 位数字」
+ *  就是页码——不排除会进正文标记序列抢先立 head（目录恒在正文前），
+ *  正文 `## 问题N` 同号全部被判回退跳过：题干段退化为单行目录、末题
+ *  吞全文（中科星图会计师核查意见 4,180 行实测：目录锚 1-4 立题、
+ *  正文锚 L35/L172/L2554/L3671 全跳过、q4 吞 4,140 行）。只认无 #
+ *  前缀行（MinerU 对正文题号标题必出 #）；剥除后前置文本 ≥6 字符
+ *  （挡正文短行误伤）。 */
+function isTocBarePageTail(line: string): boolean {
+  const trimmed = line.trim()
+  if (trimmed.startsWith("#")) return false
+  const m = trimmed.match(/\s\d{1,4}\s*$/)
+  if (!m || m.index === undefined) return false
+  return trimmed.slice(0, m.index).trim().length >= 6
+}
 
 function bodyQuestionMarkers(text: string): LineMarker[] {
   const out: LineMarker[] = []
   const lines = text.split(/\r?\n/)
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]
-    if (TOC_DOT_LEADER.test(line) || TOC_PAGE_TAIL.test(line)) continue
+    if (TOC_DOT_LEADER.test(line) || TOC_PAGE_TAIL.test(line) || isTocBarePageTail(line)) continue
     if (!H3_BODY_LINE.test(line)) continue
     const no = extractQuestionNo(line)
     if (no > 0 && no <= MAX_QUESTION_NO) out.push({ line: i, no })
@@ -392,11 +407,15 @@ function bodyQuestionMarkers(text: string): LineMarker[] {
   return out
 }
 
-/** 目录页「问题N、」题号（带点线）。 */
+/** 目录页「问题N、」题号（带点线或裸页码尾）。 */
 function tocQuestionNumbers(text: string): number[] {
   const seen = new Set<number>()
   for (const line of text.split(/\r?\n/)) {
-    if (!TOC_DOT_LEADER.test(line) && !TOC_PAGE_TAIL.test(line)) continue
+    if (
+      !TOC_DOT_LEADER.test(line) &&
+      !TOC_PAGE_TAIL.test(line) &&
+      !isTocBarePageTail(line)
+    ) continue
     const m = H3_ANYWHERE.exec(line)
     H3_ANYWHERE.lastIndex = 0
     if (!m) continue
@@ -517,13 +536,18 @@ function splitQaDocumentImpl(text: string, kind: QaDocumentKind): QaSplitResult 
     if (missesBoundary) {
       if (heads.length >= 1) {
         const anchored = cutByKnownAnchors(lines, heads, replyMarkers, opinionStyle)
+        // manualQueue 合并保留（v5，2026-11-03）：monotonic 的「编号重启」
+        // 标记是 ingest 侧触发 L6 的关键词，不能被 trailing 文案顶掉。
         return {
           kind, channel: "H4",
           questions: anchored.questions,
           tocNumbers: toc,
-          manualQueue: anchored.trailing > 0
-            ? `末题锚后仍有 ${anchored.trailing} 个回复块（归末题回复，可能吞并无锚尾题）`
-            : null,
+          manualQueue: [
+            manualQueue,
+            anchored.trailing > 0
+              ? `末题锚后仍有 ${anchored.trailing} 个回复块（归末题回复，可能吞并无锚尾题）`
+              : null,
+          ].filter(Boolean).join("；") || null,
         }
       }
       return {
@@ -550,7 +574,7 @@ function splitQaDocumentImpl(text: string, kind: QaDocumentKind): QaSplitResult 
   const h5: LineMarker[] = []
   for (let i = 0; i < lines.length; i += 1) {
     const trimmed = lines[i].trim()
-    if (TOC_DOT_LEADER.test(trimmed)) continue
+    if (TOC_DOT_LEADER.test(trimmed) || isTocBarePageTail(trimmed)) continue
     // md 化的序数大节（山高环能实测「## 一、关于《审核问询函》问题1.」）
     // 剥 ## 前缀后同形态收——MinerU 对律师函序数节输出 # 标题。
     const stripped = trimmed.replace(/^#{1,4}\s*/, "")
@@ -682,6 +706,7 @@ function monotonicMarkers(
   const kept: MarkedLine[] = []
   let sameNoSkipped = 0
   let backSkipped = 0
+  let backHeadingSkipped = 0
   let last = 0
   for (const marker of markers) {
     if (marker.no > last) {
@@ -701,14 +726,24 @@ function monotonicMarkers(
       }
       continue
     }
+    // 回退细分（M4.2 批A 三轮回炉，2026-11-03）：被压掉的回退锚若本身是
+    // 正文标题行形态（# 前缀题号标题），两处及以上 = 「编号重启」文书
+    // （多轮合订/大节分组内子编号从 1 重编：五新隧装核查意见 16 锚 4
+    // 序列、乔路铭第二轮回复实测）——规则通道无法给重启段唯一题号，
+    // manualQueue 带关键词，ingest 侧据此触发 L6 LLM 判定真边界。
+    const lineText = text ? (text.split("\n")[marker.line] ?? "") : ""
     backSkipped += 1
+    if (/^\s*#{1,4}\s*(?:关于\s*)?(?:问询\s*)?问题/.test(lineText)) {
+      backHeadingSkipped += 1
+    }
   }
   const skipped = sameNoSkipped + backSkipped
+  const restart = backHeadingSkipped >= 2
   return {
     kept,
     manualQueue:
       skipped > 0
-        ? `${skipped} 个非递增题号标记被跳过（同题合并 ${sameNoSkipped} / 回退 ${backSkipped}）`
+        ? `${skipped} 个非递增题号标记被跳过（同题合并 ${sameNoSkipped} / 回退 ${backSkipped}${restart ? `，编号重启形态（回退标题行 ${backHeadingSkipped} 个，规则通道不可信）` : ""}）`
         : null,
     sameNoSkipped,
     backSkipped,
@@ -946,8 +981,13 @@ function titleFromBlock(
     if (NON_TITLE_LINE.test(line)) continue
     // ① 目录页码尾巴（「……33」/「.... 12」/两点尾「..33」）一律剥——
     //    不依赖 TOC_DOT_LEADER 的 4+ 点判定（鼎佳实测目录「..33」仅两点）；
+    //    裸页码尾（无点线，「…发行方案 3」北汽蓝谷实测）仅对无 # 前缀行
+    //    剥除（正文 # 标题行尾数字是内容不是页码）；
     //    剥空（整行就是点线页码）则该行不配当标题，继续找下一实质行
-    const tocStripped = line.replace(/[.．…]{2,}\s*\d{1,4}\s*$/u, "").trim()
+    let tocStripped = line.replace(/[.．…]{2,}\s*\d{1,4}\s*$/u, "").trim()
+    if (tocStripped === line.trim() && isTocBarePageTail(line)) {
+      tocStripped = tocStripped.replace(/\s\d{1,4}\s*$/u, "").trim()
+    }
     if (!tocStripped) continue
     let stripped = tocStripped
       .replace(/^#{1,4}\s*/, "")
