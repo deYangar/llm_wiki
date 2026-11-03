@@ -80,7 +80,14 @@ const SUMMARIZE_LOGIC_VERSION = "1"
 // "2" (2026-10-27): aa41a70 (10-24) changed qa-split rules (裸行题号 / H4 前言
 // 剥离 / title 纯标题制) without bumping — this bump makes that change visible
 // to the cache so re-ingest actually re-splits with the fixed rules.
-const QA_SPLIT_LOGIC_VERSION = "2"
+// "3" (2026-11-03, M4.1+M5.1 验收缺陷 4/5 合并修复)：① missesBoundary 对账
+// 回退改已知题号锚定（cutByKnownAnchors，中科星图 7-2 形态零生成题号）；
+// ② monotonicMarkers 同题多块合并（意见书「问题10(1)(2)(3)」不再全文吞并）；
+// ③ 源页标题带文书名 + split_summary 平键 + related 题号索引；④ 题干标题
+// 净化（目录页码尾/保留词/占位回落）；⑤ L6 扩触发（含生成题号也走 LLM
+// 边界）；⑥ warn 防线（生成题号/单题吞并不再静默 ok）；⑦ generated 低置
+// 信页隔离区。
+const QA_SPLIT_LOGIC_VERSION = "3"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
@@ -2099,6 +2106,64 @@ export async function quarantineStaleQaSplitPages(
   return stale.map((page) => page.relPath)
 }
 
+/** M4.1 改动 5（2026-11-02）：H4 生成题号低置信页隔离——重拆后仍带
+ *  questionNoIsGenerated 的 question 页（真无题号且 L6 失败的回落产物）
+ *  移入隔离区（不在正式 wiki/questions 区），manifest reason 标
+ *  "h4-generated-low-confidence"。统一验收口径：库内 generated 残留
+ *  应逐份有账（都在隔离区）。 */
+async function quarantineGeneratedQaSplitPages(
+  pp: string,
+  sourceIdentity: string,
+  sourceSummarySlug: string,
+  generatedNos: number[],
+): Promise<string[]> {
+  if (generatedNos.length === 0) return []
+  const escapedSlug = sourceSummarySlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const questionRe = new RegExp(`^${escapedSlug}-q(\\d+)\\.md$`)
+  const targets: { absPath: string; relPath: string }[] = []
+  const nos = new Set(generatedNos.map(String))
+  let nodes
+  try {
+    nodes = await listDirectory(`${pp}/wiki/questions`)
+  } catch {
+    return []
+  }
+  for (const node of nodes) {
+    if (node.is_dir) continue
+    const m = node.name.match(questionRe)
+    if (!m || !nos.has(m[1])) continue
+    targets.push({ absPath: node.path || `${pp}/wiki/questions/${node.name}`, relPath: `wiki/questions/${node.name}` })
+  }
+  if (targets.length === 0) return []
+
+  const batchId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(36).slice(2, 8)}`
+  const batchDir = `${pp}/.llm-wiki/quarantine/pages/${batchId}`
+  await createDirectory(batchDir)
+  for (const page of targets) {
+    const content = await readFile(page.absPath)
+    await writeFile(`${batchDir}/${page.relPath.replace(/\//g, "__")}`, content)
+    await deleteFile(page.absPath)
+  }
+  try {
+    const manifestPath = `${pp}/.llm-wiki/quarantine/manifest.jsonl`
+    const existing = await tryReadFile(manifestPath)
+    const entry = JSON.stringify({
+      at: new Date().toISOString(),
+      source: sourceIdentity,
+      reason: "h4-generated-low-confidence",
+      batchDir,
+      pages: targets.map((page) => page.relPath),
+    })
+    await writeFile(manifestPath, `${existing.trimEnd()}${existing.trim() ? "\n" : ""}${entry}\n`)
+  } catch (err) {
+    console.warn(
+      `[ingest:qa-split] Failed to append quarantine manifest for "${sourceIdentity}":`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return targets.map((page) => page.relPath)
+}
+
 async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]> {
   const {
     projectPath: pp,
@@ -2128,16 +2193,23 @@ async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]>
     //    校验红线）。规则通道 0 题时（T1 manualQueue / T2 单题意见书），LLM
     //    只提供题边界候选，机械校验器逐字定位/序列/覆盖过滤后才采信；切块
     //    仍走 cutQuestions，正文永远是原文切片。失败回落人工队列，如实记录。
+    //    M4.1（2026-11-02 拍板①）扩触发：规则通道产出含生成题号
+    //    （questionNoIsGenerated，即将走 H4 编号）时也触发——L6 定位成功
+    //    → 用 LLM 边界（真题号零生成）；失败 → 回落规则 H4 结果并保留
+    //    generated 标记（写盘后进隔离区，不污染正式 questions 区）。
     let fallbackTags: string[] = []
     let fallbackUsage: LlmFallbackUsage | undefined
     let fallbackDetail = ""
+    const hasGeneratedNos = split.questions.some((q) => q.questionNoIsGenerated)
     if (
-      split.questions.length === 0 &&
+      (split.questions.length === 0 || hasGeneratedNos) &&
       useWikiStore.getState().qaSplitConfig.llmFallbackEnabled
     ) {
       throwIfIngestAborted(signal, activityId)
       activity.updateItem(activityId, {
-        detail: "qa-split: 规则通道 0 题，LLM 兜底识别题边界（L6）...",
+        detail: hasGeneratedNos
+          ? "qa-split: 规则通道含生成题号，LLM 兜底识别真边界（L6）..."
+          : "qa-split: 规则通道 0 题，LLM 兜底识别题边界（L6）...",
       })
       const outcome = await llmFallbackSplit(sourceContent, qaKind!, {
         callLlm: (systemPrompt, userPrompt) =>
@@ -2156,10 +2228,20 @@ async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]>
         signal,
       })
       if (outcome.split.questions.length > 0) {
-        split = outcome.split
-        fallbackTags = outcome.tags
-        fallbackUsage = outcome.usage
-        fallbackDetail = outcome.detail
+        // 扩触发场景下 L6 结果须优于规则结果（真题号）才替换；否则保留
+        // 规则 H4（generated 标记在，后续防线接手）
+        const betterThanRules =
+          split.questions.length === 0 ||
+          outcome.split.questions.filter((q) => !q.questionNoIsGenerated).length >=
+            split.questions.filter((q) => !q.questionNoIsGenerated).length
+        if (betterThanRules) {
+          split = outcome.split
+          fallbackTags = outcome.tags
+          fallbackUsage = outcome.usage
+          fallbackDetail = outcome.detail
+        } else {
+          fallbackDetail = `L6 结果不优于规则通道（${outcome.split.questions.length} 题），保留规则结果`
+        }
       } else {
         // 0 题结果不落盘不缓存，原因带回人工队列路径如实暴露
         fallbackDetail = outcome.split.manualQueue ?? outcome.detail
@@ -2174,6 +2256,8 @@ async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]>
           // L4：L6 通道恒写 tagsApplied（含 0=标签全被值域丢弃），与
           // 「非 L6 通道未打标=字段不出现」在对账文件里可区分。
           tagsApplied: split.channel === "L6" ? fallbackTags.length : undefined,
+          // M5.1 改动 4：warn 防线——生成题号/单题吞并不再静默 ok
+          warnReasons: status === "ok" ? qaSplitWarnReasons(split, sourceContent) : undefined,
         }),
       )
 
@@ -2243,6 +2327,25 @@ async function ingestQaSplitDocument(args: QaSplitIngestArgs): Promise<string[]>
       // title 带本次拆题计数，merge 锁旧 title 会留旧计数。
       { summaryIsDeterministic: true },
     )
+    // M4.1 改动 5：generated 低置信页写盘后移隔离区（真无题号且 L6 失败
+    // 的回落产物不留在正式 questions 区；隔离不阻断——页面进了 quarantine
+    // 目录逐份有账，warn report 同时可见）
+    const generatedNos = split.questions
+      .filter((q) => q.questionNoIsGenerated)
+      .map((q) => q.questionNo)
+    if (generatedNos.length > 0) {
+      const quarantinedGen = await quarantineGeneratedQaSplitPages(
+        pp,
+        sourceIdentity,
+        sourceSummarySlug,
+        generatedNos,
+      )
+      if (quarantinedGen.length > 0) {
+        await appendIngestWarningLog(pp, sourceIdentity, [
+          `[qa-split] ${quarantinedGen.length} 个生成题号低置信页移入隔离区（h4-generated-low-confidence）：${quarantinedGen.join("、")}`,
+        ])
+      }
+    }
     const writtenPaths = uniqueNormalizedPaths(writeResult.writtenPaths)
 
     if (writeResult.hardFailures.length > 0) {

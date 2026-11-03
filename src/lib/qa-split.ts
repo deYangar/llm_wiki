@@ -368,12 +368,18 @@ function extractQuestionNo(line: string): number {
 }
 
 /** 正文「问题N、」行首标记（排除目录点线行）。 */
+/** 行尾页码点线（M5.1，2026-11-03 鼎佳实测）：目录条目尾「..33」只有
+ *  两点，不命中 TOC_DOT_LEADER 的 4+ 点判定——该目录行混进正文标记
+ *  且抢先立 head，把后续真题号压成回退。点串（2+）+行尾数字=目录
+ *  页码引导，标记/目录两侧统一用它。 */
+const TOC_PAGE_TAIL = /[.．…]{2,}\s*\d{1,4}\s*$/
+
 function bodyQuestionMarkers(text: string): LineMarker[] {
   const out: LineMarker[] = []
   const lines = text.split(/\r?\n/)
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]
-    if (TOC_DOT_LEADER.test(line)) continue
+    if (TOC_DOT_LEADER.test(line) || TOC_PAGE_TAIL.test(line)) continue
     if (!H3_BODY_LINE.test(line)) continue
     const no = extractQuestionNo(line)
     if (no > 0 && no <= MAX_QUESTION_NO) out.push({ line: i, no })
@@ -385,7 +391,7 @@ function bodyQuestionMarkers(text: string): LineMarker[] {
 function tocQuestionNumbers(text: string): number[] {
   const seen = new Set<number>()
   for (const line of text.split(/\r?\n/)) {
-    if (!TOC_DOT_LEADER.test(line)) continue
+    if (!TOC_DOT_LEADER.test(line) && !TOC_PAGE_TAIL.test(line)) continue
     const m = H3_ANYWHERE.exec(line)
     H3_ANYWHERE.lastIndex = 0
     if (!m) continue
@@ -402,7 +408,25 @@ function tocQuestionNumbers(text: string): number[] {
  * 题目与回复正文是原文行切片的逐字拼接——零改写零删减是质量红线，
  * buildQuestionFileBlocks 内还有 includes() 自检兜底。
  */
+/** M5.1 改动 3 出口防线：title 回落「问题N（题干待人工）」的题不静默——
+ *  汇总进 manualQueue（各通道 return 统一后处理）。 */
 export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResult {
+  const result = splitQaDocumentImpl(text, kind)
+  const pending = result.questions
+    .filter((q) => q.title.includes("题干待人工"))
+    .map((q) => `q${q.questionNo}`)
+  if (pending.length > 0) {
+    result.manualQueue = [
+      result.manualQueue,
+      `题干待人工：${pending.join("、")}（title 无实质行，占位回落）`,
+    ]
+      .filter(Boolean)
+      .join("；")
+  }
+  return result
+}
+
+function splitQaDocumentImpl(text: string, kind: QaDocumentKind): QaSplitResult {
   const lines = text.split(/\r?\n/)
   const replyMarkers = collectReplyMarkers(lines)
   const toc = tocQuestionNumbers(text)
@@ -429,7 +453,7 @@ export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResu
 
   const h1 = headingChannel(H1_LINE)
   if (h1.length >= 2) {
-    const { kept, manualQueue } = monotonicMarkers(h1)
+    const { kept, manualQueue } = monotonicMarkers(h1, text)
     return {
       kind, channel: "H1",
       questions: cutQuestions(lines, kept, replyMarkers, "H1", opinionStyle),
@@ -449,7 +473,7 @@ export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResu
       ? validateT4Structure(lines, collectT4Markers(lines, "A"))
       : null
   if (h2.length >= 2) {
-    const { kept, manualQueue } = monotonicMarkers(h2)
+    const { kept, manualQueue } = monotonicMarkers(h2, text)
     // H2 防误拆：候选 ≥2 但 monotonic 后只剩 1（序号重启=顿号小节形态，
     // 中贝通信实测 6 节拆 1 题）——弱信号让位，续走 H3/T4/H5/H4。
     if (kept.length >= 2) {
@@ -469,19 +493,34 @@ export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResu
   }
 
   if (bodyMarkers.length >= 2) {
-    const { kept, manualQueue } = monotonicMarkers(bodyMarkers)
+    const { kept, manualQueue } = monotonicMarkers(bodyMarkers, text)
     // 对账回退（2026-10-27 B-Step3 上能电气实测）：正文题号标记比目录
     // 列的题号少（kept < toc）或回复块明显多于题数（delta >= 2）= 正文
     // 有题的边界标记被解析通道丢失（「问题三」标题行在 .cache 产物里
-    // 缺失、题干直接顶上），H3 切出的题会吞并后续整题——回退 H4 按
-    // 回复块切（每块一题，题号按块序生成，不丢题）。目录与回复块都齐
-    // 的文档（kept == toc == reply）不受影响；无目录文档 toc=0 永不触发。
-    const keptNos = new Set(kept.map((k) => k.no))
+    // 缺失、题干直接顶上），H3 切出的题会吞并后续整题。
+    // M4.1（2026-11-02）改造：不再「整体弃 H3 → 按回复块编题号」——
+    // 有已识别题号锚（head ≥1）时按锚切分（真题号零生成，中科星图
+    // 7-2：4 锚 18 块 → 4 题）；head=0 才回退旧 cutByReplyBlocks。
+    // 目录与回复块都齐的文档（kept == toc == reply）不受影响；无目录
+    // 文档 toc=0 永不触发（仅 replyDelta 分支可能）。
+    const heads = kept.filter((k) => k.block === "head")
+    const keptNos = new Set(heads.map((k) => k.no))
     const tocMissing = toc.filter((n) => !keptNos.has(n)).length
-    const replyDelta = replyMarkers.length - kept.length
+    const replyDelta = replyMarkers.length - heads.length
     const missesBoundary = kind === "reply" && replyMarkers.length >= 1 &&
       (tocMissing >= 1 || replyDelta >= 2)
     if (missesBoundary) {
+      if (heads.length >= 1) {
+        const anchored = cutByKnownAnchors(lines, heads, replyMarkers, opinionStyle)
+        return {
+          kind, channel: "H4",
+          questions: anchored.questions,
+          tocNumbers: toc,
+          manualQueue: anchored.trailing > 0
+            ? `末题锚后仍有 ${anchored.trailing} 个回复块（归末题回复，可能吞并无锚尾题）`
+            : null,
+        }
+      }
       return {
         kind, channel: "H4",
         questions: cutByReplyBlocks(lines, replyMarkers),
@@ -516,7 +555,7 @@ export function splitQaDocument(text: string, kind: QaDocumentKind): QaSplitResu
     if (num > 0 && num <= 99) h5.push({ line: i, no: num })
   }
   if (h5.length >= 2) {
-    const { kept } = monotonicMarkers(h5)
+    const { kept } = monotonicMarkers(h5, text)
     const h5Count = kept.length
     const blockDelta = Math.abs(h5Count - replyMarkers.length)
     if (kept.length >= 2 && (blockDelta <= 2 || (replyMarkers.length === 0 && h5Count >= 3))) {
@@ -616,37 +655,64 @@ function contextualH2Markers(lines: string[]): LineMarker[] {
   return out
 }
 
-/**
- * 问答函题号单调递增。非递增的标记行通常是正文里恰好行首出现「问题N、」
- * 的引用/表格残留——跳过标记但不丢内容（该行归前一题的正文）。
- */
-function monotonicMarkers(markers: LineMarker[]): {
-  kept: LineMarker[]
+/** 同题多块标记（M5.1 改动 1，2026-11-02）：意见书「问题10(1)(2)(3)」
+ *  会在正文重复出现同号题块锚——严格递增把后三个 10 当正文引用跳过，
+ *  2,116 行全文塞进孤页 q10（鼎佳信达实测）。同号标记保留为该题的
+ *  分段锚（sub）：cutQuestions 不重复起题，块内容并入该题正文；
+ *  回退（< last）仍跳过（真引用）。sub 生效须双轴佐证（防正文引用
+ *  恰好同号误合并）：该行命中 H3_BODY_LINE 行首锚形态，或文书本身
+ *  是意见书（LEGAL_OPINION_MARK 已在正文命中）；目录点线行恒排除。 */
+type MarkedLine = LineMarker & { block: "head" | "sub" }
+
+function monotonicMarkers(
+  markers: LineMarker[],
+  text = "",
+): {
+  kept: MarkedLine[]
   manualQueue: string | null
+  sameNoSkipped: number
+  backSkipped: number
 } {
-  const kept: LineMarker[] = []
-  let skipped = 0
+  const isOpinion = text ? LEGAL_OPINION_MARK.test(text.slice(0, 12000)) : false
+  const kept: MarkedLine[] = []
+  let sameNoSkipped = 0
+  let backSkipped = 0
   let last = 0
   for (const marker of markers) {
     if (marker.no > last) {
-      kept.push(marker)
+      kept.push({ ...marker, block: "head" })
       last = marker.no
-    } else {
-      skipped += 1
+      continue
     }
+    if (marker.no === last) {
+      const lineText = text ? (text.split("\n")[marker.line] ?? "") : ""
+      const lineLooksLikeAnchor =
+        H3_BODY_LINE.test(lineText) && !TOC_DOT_LEADER.test(lineText)
+      if (isOpinion || lineLooksLikeAnchor) {
+        kept.push({ ...marker, block: "sub" })
+        sameNoSkipped += 1
+      } else {
+        backSkipped += 1
+      }
+      continue
+    }
+    backSkipped += 1
   }
+  const skipped = sameNoSkipped + backSkipped
   return {
     kept,
     manualQueue:
       skipped > 0
-        ? `${skipped} 个非递增题号标记被跳过（疑似正文引用）`
+        ? `${skipped} 个非递增题号标记被跳过（同题合并 ${sameNoSkipped} / 回退 ${backSkipped}）`
         : null,
+    sameNoSkipped,
+    backSkipped,
   }
 }
 
 function cutQuestions(
   lines: string[],
-  markers: LineMarker[],
+  markers: (LineMarker | MarkedLine)[],
   replyMarkers: number[],
   channel: SplitChannel,
   /** 补充法律意见书形态：题块内没有「回复：」标记行，用第一个论证小节
@@ -654,10 +720,28 @@ function cutQuestions(
   opinionStyle = false,
 ): SplitQuestion[] {
   const out: SplitQuestion[] = []
+  // M5.1 改动 1：sub 标记（同题多块）不起新题——把序列按 head 分组，
+  // 每题块延伸到下一个 head 之前（sub 块内容并入该题，verbatim 不丢）。
+  const heads: { marker: LineMarker; end: number }[] = []
   for (let idx = 0; idx < markers.length; idx += 1) {
-    const marker = markers[idx]
+    const marker = markers[idx] as MarkedLine
+    if (marker.block && marker.block === "sub") continue
+    let nextHead = idx + 1
+    while (
+      nextHead < markers.length &&
+      (markers[nextHead] as MarkedLine).block === "sub"
+    ) {
+      nextHead += 1
+    }
+    const end =
+      nextHead < markers.length
+        ? (markers[nextHead] as LineMarker).line - 1
+        : lines.length - 1
+    heads.push({ marker, end })
+  }
+  for (let hIdx = 0; hIdx < heads.length; hIdx += 1) {
+    const { marker, end } = heads[hIdx]
     const start = marker.line
-    const end = idx + 1 < markers.length ? markers[idx + 1].line - 1 : lines.length - 1
     // 回复起点：题块内第一个回复标记行
     let replyStart: number | null = null
     for (const r of replyMarkers) {
@@ -773,6 +857,78 @@ function cutByReplyBlocks(lines: string[], replyMarkers: number[]): SplitQuestio
 const NON_TITLE_LINE =
   /^[\d\s-]{1,14}$|^\||^如无特别说明|^[\u4e00-\u9fa5A-Za-z0-9]{2,16}(?:证券|会计师|律师|资产评估|评估|财务顾问|保荐)[\u4e00-\u9fa5]{0,10}(?:公司|事务所|中心|集团)?(?:[（(][^）)]{1,60}[)）])?\s*$/
 
+/** M4.1（2026-11-02 验收缺陷 4）：已知题号锚定切分——missesBoundary
+ *  对账回退不再「整体弃 H3 按回复块编题号」（中科星图 7-2：4 真题号 +
+ *  18 回复块被编成 18 个假题），改为把已识别题号锚（head）作为题块边界：
+ *  每锚一题（真题号、零生成），区间内回复块只作 replyStart 分段；末锚
+ *  之后的区间外回复块归末题回复尾部并计数回传（写 manualQueue）。
+ *  首锚前的封面/目录由首块剥离逻辑处理（与 cutByReplyBlocks 同款）。 */
+function cutByKnownAnchors(
+  lines: string[],
+  anchors: LineMarker[],
+  replyMarkers: number[],
+  opinionStyle: boolean,
+): { questions: SplitQuestion[]; trailing: number } {
+  const questions: SplitQuestion[] = []
+  let trailing = 0
+  for (let aIdx = 0; aIdx < anchors.length; aIdx += 1) {
+    const anchor = anchors[aIdx]
+    const start = aIdx === 0 ? anchor.line : anchor.line
+    const end =
+      aIdx + 1 < anchors.length ? anchors[aIdx + 1].line - 1 : lines.length - 1
+    // 题内回复起点：区间内第一个回复标记
+    let replyStart: number | null = null
+    for (const r of replyMarkers) {
+      if (r > start && r <= end) {
+        replyStart = r
+        break
+      }
+    }
+    if (replyStart === null && opinionStyle) {
+      for (let i = start + 1; i <= end; i += 1) {
+        if (
+          /^#{0,4}\s*[（(][一二三四五六七八九十]{1,3}[)）]\s*\S/.test(lines[i]) ||
+          /^#{1,4}\s*[一二三四五六七八九十]{1,3}\s*[、.．]\s*\S/.test(lines[i]) ||
+          /^#{1,4}\s*[0-9]{1,3}\s*[、.．]\s*\S/.test(lines[i])
+        ) {
+          replyStart = i
+          break
+        }
+      }
+    }
+    const questionEnd = replyStart === null ? end : replyStart - 1
+    questions.push({
+      questionNo: anchor.no,
+      title: titleFromBlock(lines, start, questionEnd, anchor.no),
+      questionText: lines.slice(start, questionEnd + 1).join("\n").trimEnd(),
+      replyText:
+        replyStart === null
+          ? ""
+          : lines.slice(replyStart, end + 1).join("\n").trimEnd(),
+      channel: "H4",
+      questionNoIsGenerated: false,
+      startLine: start,
+      replyStartLine: replyStart,
+      endLine: end,
+    })
+  }
+  // 末锚之后的区间外回复块：末题区间本就延伸到文件尾（已含在其
+  // replyText 里，内容不丢）——此处只计数回传，调用方写 manualQueue
+  // 标记「末锚后仍有 N 个回复块（可能吞并无锚尾题）」供人工复核。
+  const lastAnchorLine = anchors.length
+    ? anchors[anchors.length - 1].line
+    : lines.length
+  trailing = replyMarkers.filter((r) => r > lastAnchorLine).length
+  return { questions, trailing }
+}
+
+/** M5.1 改动 3（2026-11-02）：题干标题取到目录行/保留词的病——
+ *  鼎佳 q10 标题带目录页码尾巴「…影响..33」、科马 q1 标题「释 义」。
+ *  三道净化：① 目录点线行剥尾部页码后可用（剥空跳过）；② 保留词
+ *  （释义/目录/CONTENTS）跳过取下一实质行；③ 全块无实质行回退
+ *  「问题N（题干待人工）」（splitQaDocument 出口据此写 manualQueue）。 */
+const TITLE_RESERVED_WORDS = /^(?:释\s*义|目\s*录|CONTENTS|前\s*言|声\s*明)$/u
+
 function titleFromBlock(
   lines: string[],
   start: number,
@@ -783,7 +939,12 @@ function titleFromBlock(
     const line = lines[i].trim()
     if (!line || line.startsWith("## Page") || /^[-—·\s]+$/.test(line)) continue
     if (NON_TITLE_LINE.test(line)) continue
-    const stripped = line
+    // ① 目录页码尾巴（「……33」/「.... 12」/两点尾「..33」）一律剥——
+    //    不依赖 TOC_DOT_LEADER 的 4+ 点判定（鼎佳实测目录「..33」仅两点）；
+    //    剥空（整行就是点线页码）则该行不配当标题，继续找下一实质行
+    const tocStripped = line.replace(/[.．…]{2,}\s*\d{1,4}\s*$/u, "").trim()
+    if (!tocStripped) continue
+    let stripped = tocStripped
       .replace(/^#{1,4}\s*/, "")
       // 意见书前缀：「一.」「一、」「《审核问询函》」「关于问询」
       .replace(/^[一二三四五六七八九十]{1,3}\s*[.、．]\s*/, "")
@@ -791,11 +952,16 @@ function titleFromBlock(
       .replace(/^(?:关于\s*)?(?:问询\s*)?问题\s*[0-9一二三四五六七八九十]{1,3}\s*[、．:：.]?\s*/, "")
       .replace(/^问题\s*[0-9一二三四五六七八九十]{1,3}\s*/, "")
       .trim()
+    // ② 保留词（释义/目录…）→ 剥空形态，继续找下一实质行
+    if (stripped && TITLE_RESERVED_WORDS.test(stripped)) {
+      stripped = ""
+    }
     // 剥空（裸题号行「问题一」上能电气形态）→ 继续找第一个实质行当标题
-    // （题干首句）；全块剥空才回退「第N题」。
-    if (stripped) return stripped.slice(0, 40).trim() || `第${questionNo}题`
+    // （题干首句）；全块剥空才回退占位（M5.1：带「题干待人工」标记，
+    // 出口扫到即写 manualQueue，不静默）。
+    if (stripped) return stripped.slice(0, 40).trim() || `问题${questionNo}（题干待人工）`
   }
-  return `第${questionNo}题`
+  return `问题${questionNo}（题干待人工）`
 }
 
 // ---- W7.2 轮次与函类型识别（不依赖文件名） ------------------------------
@@ -1122,13 +1288,22 @@ export function buildQuestionFileBlocks(
   // sources 摘要页（writeFileBlocks 会把 wiki/sources/ 前缀重定向到 canonical slug 路径）
   const summaryLines = [
     "type: source",
-    `title: "${yamlEscape(questionSummaryTitle(pathMeta, roundMeta, split))}"`,
+    `title: "${yamlEscape(questionSummaryTitle(pathMeta, roundMeta, split, sourceIdentity))}"`,
     "parser: qa-split",
+    `split_summary: "${yamlEscape(splitSummaryKey(split))}"`,
     "tags: []",
   ]
+  // M5.3（2026-11-02）：源页挂题号索引——related 回指各 question 页，
+  // 前端「原文壳」据此直达题目列表（此前源页是 950B 壳无任何出口）。
+  const relatedLines = split.questions.map(
+    (q) => `  - "[[${slug}-q${q.questionNo}]]"`,
+  )
+  if (relatedLines.length > 0) {
+    summaryLines.push("related:", ...relatedLines)
+  }
   blocks.push(
     `---FILE: wiki/sources/${slug}.md---\n---\n${summaryLines.join("\n")}\n---\n\n` +
-      `# ${questionSummaryTitle(pathMeta, roundMeta, split)}\n\n` +
+      `# ${questionSummaryTitle(pathMeta, roundMeta, split, sourceIdentity)}\n\n` +
       `本来源为问答函类文档，已按 qa-split 规则逐题拆分至 \`wiki/questions/\`（识别通道 ${split.channel}，共 ${split.questions.length} 题）。\n\n` +
       `- 来源文件：${sourceIdentity}\n- 轮次：${roundMeta.roundKind}${roundMeta.roundNo ? `（第${roundMeta.roundNo}轮）` : "（轮次未识别）"}\n- 识别依据：${roundMeta.basis}\n\n` +
       `> 题目与回复原文逐字转录于各 question 页；本页仅为来源索引，不承载题目内容。\n---END FILE---`,
@@ -1288,15 +1463,46 @@ function sectionTitleFull(
   return `${round}·问题${question.questionNo}·${section.title}`
 }
 
+/** M5.1 改动 2（2026-11-02）：源页标题带文书名——旧模板 92% 产出
+ *  「公司 第N轮审核问询函」，专项意见书被题名成问询函，搜索命中而
+ *  不可识别（鼎佳精密实测）。docShort 从文件名清洗（纯正则零 LLM）：
+ *  去扩展名 → 去「{company}：/／」前缀 → 折叠空白。对齐库内归纳式
+ *  通道的好形态（「蘅东光·广东华商律师事务所补充法律意见书（一）」）。
+ *  同名消歧：清洗保留括号序号（（一）（二））覆盖绝大多数；真同名
+ *  （光电股份族）由存量修复脚本全库消歧 + M5.4 对账防线「同 case 同轮
+ *  零撞名」兜底——本函数不做 IO。 */
+export function docShortFromSourceIdentity(
+  sourceIdentity: string,
+  company: string,
+): string {
+  let stem = sourceIdentity.split("/").pop() ?? ""
+  stem = stem.replace(/\.md$/i, "").replace(/\.pdf$/i, "").trim()
+  const prefixRe = new RegExp(`^${escapeRegExp(company)}\\s*[:：]\\s*`)
+  stem = stem.replace(prefixRe, "")
+  stem = stem.replace(/\s+/g, " ").trim()
+  return stem
+}
+
 function questionSummaryTitle(
   pathMeta: QaPathMeta,
   roundMeta: QaRoundMeta,
   split: QaSplitResult,
+  sourceIdentity = "",
 ): string {
-  // 无轮号时 round 置空只拼一次 roundKind——旧模板此处把 roundKind 拼了两次，
-  // 产出「ST联合 注册反馈注册反馈（qa-split H4·1题）」（99 方案 3.2 附带修复）
-  const round = roundMeta.roundNo ? `第${roundMeta.roundNo}轮` : ""
-  return `${pathMeta.company} ${round}${roundMeta.roundKind}（qa-split ${split.channel}·${split.questions.length}题）`
+  // 无轮号时只拼一次 roundKind
+  const round = roundMeta.roundNo ? `第${roundMeta.roundNo}轮·` : ""
+  const docShort = docShortFromSourceIdentity(sourceIdentity, pathMeta.company)
+  if (docShort) {
+    return `${pathMeta.company}·${docShort}（${round}${roundMeta.roundKind}）`
+  }
+  // 文书名清洗落空（空 sourceIdentity 等）：回退旧形态（不带机读后缀）
+  return `${pathMeta.company} ${round}${roundMeta.roundKind}`
+}
+
+/** 机读摘要（通道·题数）——从 title 挪进 frontmatter 平键
+ *  split_summary（title 面向用户，机读信息不占标题位）。 */
+function splitSummaryKey(split: QaSplitResult): string {
+  return `${split.channel}·${split.questions.length}题`
 }
 
 function yamlEscape(value: string): string {
@@ -1837,12 +2043,36 @@ export interface QaSplitReportEntry {
   sections: number
   tocNumbers: number
   round: string
-  status: "ok" | "manual-queue" | "rejected"
+  status: "ok" | "warn" | "manual-queue" | "rejected"
   detail: string
   /** L6 兜底通道成本对账（仅 L6 通道出现；stream 客户端不回传 token 计数，如实记字符数）。 */
   llmUsage?: LlmFallbackUsage
   /** L6 打标搭车：写入 question 页的标签数。 */
   tagsApplied?: number
+}
+
+/** M5.1 改动 4（2026-11-02）新入库防线：跳过即静默 ok 的病（鼎佳
+ *  report status:"ok" 无任何告警面）。两条 warn 判据：
+ *  ① sameNoSkipped>0 且合并后题数 < 正文标记数（同题多块合并仍吞并）；
+ *  ② 拆出 1 题 && 正文 > 30,000 字符 && kind==="reply"（全文吞并形态）。
+ *  warn 不阻断入库（页面照建），ipoanswer 侧对账会拦（双保险）。 */
+export function qaSplitWarnReasons(
+  split: QaSplitResult | null,
+  sourceText: string,
+): string[] {
+  if (!split || split.kind !== "reply") return []
+  const reasons: string[] = []
+  const generatedCount = split.questions.filter((q) => q.questionNoIsGenerated).length
+  if (generatedCount > 0) {
+    reasons.push(`${generatedCount} 题为生成题号（H4 编号，待人工复核）`)
+  }
+  if (
+    split.questions.length === 1 &&
+    sourceText.length > 30000
+  ) {
+    reasons.push("单题吞并形态：拆出 1 题但正文 >30,000 字符")
+  }
+  return reasons
 }
 
 export function buildQaSplitReportEntry(
@@ -1853,7 +2083,7 @@ export function buildQaSplitReportEntry(
   status: QaSplitReportEntry["status"],
   detail: string,
   sections = 0,
-  extra?: { llmUsage?: LlmFallbackUsage; tagsApplied?: number },
+  extra?: { llmUsage?: LlmFallbackUsage; tagsApplied?: number; warnReasons?: string[] },
 ): QaSplitReportEntry {
   return {
     at: new Date().toISOString(),
@@ -1868,8 +2098,11 @@ export function buildQaSplitReportEntry(
     round: roundMeta
       ? `${roundMeta.roundKind}·${roundMeta.roundNo ?? "?"}轮·${roundMeta.issuer}`
       : "?",
-    status,
-    detail,
+    status: status === "ok" && (extra?.warnReasons?.length ?? 0) > 0 ? "warn" : status,
+    detail:
+      status === "ok" && (extra?.warnReasons?.length ?? 0) > 0
+        ? [detail, ...extra!.warnReasons!].filter(Boolean).join("；")
+        : detail,
     ...(extra?.llmUsage ? { llmUsage: extra.llmUsage } : {}),
     // L4：tagsApplied 由调用方控制——L6 通道恒传（含 0=标签全被值域丢弃），
     // 与「非 L6 通道未打标=字段不出现」在对账文件里可区分。

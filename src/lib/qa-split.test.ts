@@ -3,6 +3,8 @@ import { describe, it, expect } from "vitest"
 import {
   buildQaSplitReportEntry,
   buildQuestionFileBlocks,
+  docShortFromSourceIdentity,
+  qaSplitWarnReasons,
   questionTitle,
   classifyQaDocument,
   cn2num,
@@ -1693,5 +1695,267 @@ describe("qa-split — R3 first-question recognition (2026-10-24 三案例)", ()
     // 第一题纯标题，第二题重复回退「问题2·」前缀
     expect(titles.some((t) => t.includes("关于同业竞争") && !t.includes("问题"))).toBe(true)
     expect(titles.some((t) => t.includes("问题2·关于同业竞争"))).toBe(true)
+  })
+})
+
+// ══ M4.1 + M5.1（2026-11-02 验收缺陷 4/5）回归 fixture ════════════════════
+// 素材取自真实文书实测形态：鼎佳信达补充法律意见书（一）（2,116 行，
+// 正文题块 2,10,10,10）/ 中科星图 7-2 会计师回复（4 真题号锚 0 回复块）/
+// 科马材料律师意见书（q1 标题「释 义」）。
+
+/** 鼎佳信达形态：目录 4 条目（问题2 + 问题10(1)(2)(3) 三子块），
+ *  正文题块锚 2,10,10,10 —— D1 病灶：严格递增把后三个 10 当引用跳过，
+ *  2,116 行全文塞进孤页 q10。 */
+const DINGJIA_SAMPLE = `广东信达律师事务所
+关于苏州鼎佳精密科技股份有限公司的补充法律意见书（一）
+
+致：苏州鼎佳精密科技股份有限公司
+
+本所接受发行人委托，就其公开发行股票并在北交所上市事项出具本补充法律意见书。
+
+一、问询问题2.关联交易的合理性及是否存在占用发行人资产....5
+二、问询问题10.其他问题（1）外协加工及劳务外包的影响....15
+三、问询问题10.其他问题（2）进一步说明发行人工业用地规划调整的影响..33
+四、问询问题10.其他问题（3）房屋建筑物瑕疵的影响....40
+
+## 一、问询问题 2.关联交易的合理性及是否存在占用发行人资产
+
+请发行人补充说明关联交易的必要性及定价公允性。
+
+（一）关联交易情况
+
+经核查，报告期内发行人关联交易定价公允。
+
+## 二、问询问题 10.其他问题（1）外协加工及劳务外包的影响
+
+请发行人说明外协加工及劳务外包的具体情况。
+
+经核查，发行人外协加工占比可控。
+
+## 三、问询问题10.其他问题（2）进一步说明发行人工业用地规划调整的影响
+
+请发行人进一步说明工业用地规划调整的影响。
+
+经核查，上述土地规划调整不会对发行人生产经营构成重大不利影响。
+
+## 四、问询问题 10.其他问题（3）房屋建筑物瑕疵的影响
+
+请发行人说明房屋建筑物瑕疵的影响及整改措施。
+
+经核查，发行人已就相关瑕疵房屋制定整改计划。`
+
+/** 科马材料形态（D3）：首个实质行是「释 义」目录词条行。 */
+const KEMA_SAMPLE = `北京某律师事务所
+关于科马材料股份有限公司首次公开发行股票的法律意见书
+
+释 义
+
+本法律意见书中，除非另有说明，下列词语具有如下含义。
+
+一、问询问题 1.关于主体资格
+
+请发行人说明历史上股权变更的合规性。
+
+（一）股权沿革情况
+
+经核查，发行人股权沿革清晰、合规。
+
+二、问询问题 2.关于业务合规
+
+请发行人说明业务资质的完备性。
+
+（一）资质情况
+
+经核查，发行人已取得经营所需全部资质。`
+
+/** 中科星图 7-2 形态（M4.1）：目录 4 题 + 正文 4 锚 + 回复块多于锚
+ *  （replyDelta >= 2 触发 missesBoundary 锚定）。 */
+const ZHONGKE_SAMPLE = `立信会计师事务所（特殊普通合伙）
+关于中科星图股份有限公司向特定对象发行股票申请文件的审核问询函的回复
+
+问题1、关于募投项目 3
+问题2、关于融资规模和效益测算 8
+问题3、关于经营情况 92
+问题4、关于财务性投资 146
+
+## 问题 1、关于募投项目
+
+请发行人说明本次募投项目的必要性。
+
+回复：
+
+募投项目与现有业务具有协同性。
+
+## 问题 2、关于融资规模和效益测算
+
+请发行人说明融资规模的测算依据。
+
+回复：
+
+本次融资规模测算合理。
+
+补充回复：
+
+考虑摊薄影响后仍然合理。
+
+## 问题 3、关于经营情况
+
+请发行人说明经营业绩变动原因。
+
+回复：
+
+经营业绩增长主要系需求带动。
+
+## 问题 4、关于财务性投资
+
+请发行人说明财务性投资情况。
+
+回复：
+
+最近一期末不存在金额较大的财务性投资。
+
+补充回复：
+
+已剔除本次募集资金。`
+
+describe("qa-split — M5.1 同题多块合并（鼎佳信达 D1）", () => {
+  it("题块 2,10,10,10 → 2 题（10 三块并一题），全文零丢失", () => {
+    const split = splitQaDocument(DINGJIA_SAMPLE, "reply")
+    expect(split.channel).toBe("H3")
+    const nos = split.questions.map((q) => q.questionNo)
+    expect(nos).toEqual([2, 10])
+    // q10 页含三块内容（verbatim：题面+回复拼接覆盖三个子块，零丢失）
+    const q10 = split.questions.find((q) => q.questionNo === 10)!
+    expect(q10.questionText.length).toBeGreaterThan(50)
+    const whole = q10.questionText + "\n" + q10.replyText
+    expect(whole).toContain("外协加工")
+    expect(whole).toContain("工业用地规划调整")
+    expect(whole).toContain("房屋建筑物瑕疵")
+    // verbatim 红线
+    const normalized = DINGJIA_SAMPLE.replace(/\r\n/g, "\n")
+    for (const q of split.questions) {
+      expect(normalized.includes(q.questionText)).toBe(true)
+      if (q.replyText) expect(normalized.includes(q.replyText)).toBe(true)
+    }
+  })
+
+  it("title 无目录页码尾巴（D3：…影响..33 形态剥离）", () => {
+    const split = splitQaDocument(DINGJIA_SAMPLE, "reply")
+    for (const q of split.questions) {
+      expect(q.title).not.toMatch(/\.{2,}\s*\d+/)
+      expect(q.title).not.toMatch(/…{2,}/)
+    }
+  })
+
+  it("科马：q1 title 不得为「释 义」（保留词回落）", () => {
+    const split = splitQaDocument(KEMA_SAMPLE, "reply")
+    const q1 = split.questions.find((q) => q.questionNo === 1)!
+    expect(q1.title).not.toMatch(/^释\s*义$/)
+  })
+})
+
+describe("qa-split — M4.1 已知题号锚定（missesBoundary 改造）", () => {
+  it("中科星图 7-2：4 锚 + 6 回复块 → 4 题、零生成题号", () => {
+    const split = splitQaDocument(ZHONGKE_SAMPLE, "reply")
+    const nos = split.questions.map((q) => q.questionNo)
+    expect(nos).toEqual([1, 2, 3, 4])
+    expect(split.questions.every((q) => !q.questionNoIsGenerated)).toBe(true)
+    // 末锚后的补充回复块归末题（内容不丢）+ manualQueue 计数
+    const q4 = split.questions.find((q) => q.questionNo === 4)!
+    expect(q4.replyText).toContain("已剔除本次募集资金")
+  })
+
+  it("上能电气回归：裸行「问题一」仍走 H3（不因锚定改造回归）", () => {
+    const doc = [
+      "关于上能电气股份有限公司",
+      "向特定对象发行股票申请文件的审核问询函回复",
+      "",
+      "问题一",
+      "请发行人说明主营业务情况。",
+      "回复：",
+      "发行人主营业务为光伏逆变器。",
+      "问题二",
+      "请发行人说明关联交易情况。",
+      "回复：",
+      "报告期内关联交易占比较低。",
+    ].join("\n")
+    const split = splitQaDocument(doc, "reply")
+    expect(split.channel).toBe("H3")
+    expect(split.questions.map((q) => q.questionNo)).toEqual([1, 2])
+  })
+})
+
+describe("qa-split — M5.1 源页标题带文书名（D2）", () => {
+  it("docShort 清洗：鼎佳文件名 → 去公司前缀保文书名", () => {
+    const short = docShortFromSourceIdentity(
+      "scheduled-import/问答/2024/北交所/公开发行并上市/注册/鼎佳精密/鼎佳精密：广东信达律师事务所关于鼎佳精密的补充法律意见书（一）.pdf",
+      "鼎佳精密",
+    )
+    expect(short).toBe("广东信达律师事务所关于鼎佳精密的补充法律意见书（一）")
+  })
+
+  it("源页块：title 含文书名 + split_summary 进 frontmatter + related 题号索引", () => {
+    const split = splitQaDocument(DINGJIA_SAMPLE, "reply")
+    const pathMeta = extractPathMeta(
+      "scheduled-import/问答/2024/北交所/公开发行并上市/注册/鼎佳精密/鼎佳精密：广东信达律师事务所关于鼎佳精密的补充法律意见书（一）.pdf",
+    )
+    const roundMeta = extractRoundMeta(DINGJIA_SAMPLE, "鼎佳精密：广东信达律师事务所关于鼎佳精密的补充法律意见书（一）.pdf")
+    const build = buildQuestionFileBlocks(
+      DINGJIA_SAMPLE,
+      split,
+      pathMeta,
+      roundMeta,
+      "scheduled-import/问答/2024/北交所/公开发行并上市/注册/鼎佳精密/鼎佳精密：广东信达律师事务所关于鼎佳精密的补充法律意见书（一）.pdf",
+      "dingjia-xinda-1",
+    )
+    const sourceBlock = build.fileBlocksText
+    expect(sourceBlock).toContain("广东信达律师事务所关于鼎佳精密的补充法律意见书（一）")
+    expect(sourceBlock).toContain('split_summary: "H3·2题"')
+    expect(sourceBlock).toContain("[[dingjia-xinda-1-q2]]")
+    expect(sourceBlock).toContain("[[dingjia-xinda-1-q10]]")
+    // 旧机读后缀不占标题位
+    expect(sourceBlock).not.toMatch(/title: "[^"]*qa-split H3/)
+  })
+})
+
+describe("qa-split — M5.1 warn 防线（D4：跳过不再静默 ok）", () => {
+  it("生成题号 → qaSplitWarnReasons 报告 + report status 升 warn", () => {
+    const doc = [
+      "某核查意见",
+      "",
+      "请发行人说明专项事项。",
+      "回复：",
+      "经核查，专项事项合规。",
+      "回复：",
+      "补充核查意见：无异议。",
+      "回复：",
+      "再次补充：仍无异议。",
+    ].join("\n")
+    const split = splitQaDocument(doc, "reply")
+    expect(split.questions.length).toBeGreaterThan(0)
+    const reasons = qaSplitWarnReasons(split, doc)
+    expect(reasons.join("；")).toContain("生成题号")
+    const entry = buildQaSplitReportEntry(
+      "test-source.pdf",
+      split,
+      null,
+      split.questions.length,
+      "ok",
+      "目录题号 0 个",
+      0,
+      { warnReasons: reasons },
+    )
+    expect(entry.status).toBe("warn")
+    expect(entry.detail).toContain("生成题号")
+  })
+
+  it("单题吞并形态（1 题 && >30,000 字符）→ warn", () => {
+    const bigText = ["某回复文件", "", "问题 1.关于总体情况", "回复：", ...Array(1600).fill("正文内容填充行，用于超过三万字符阈值，凑足长度。")].join("\n")
+    expect(bigText.length).toBeGreaterThan(30000)
+    const split = splitQaDocument(bigText, "reply")
+    if (split.questions.length === 1) {
+      const reasons = qaSplitWarnReasons(split, bigText)
+      expect(reasons.join("；")).toContain("单题吞并")
+    }
   })
 })
