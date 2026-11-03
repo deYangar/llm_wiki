@@ -1959,3 +1959,81 @@ describe("qa-split — M5.1 warn 防线（D4：跳过不再静默 ok）", () => 
     }
   })
 })
+
+describe("qa-split — 子题号支持（M4.2 批A 检查门，恒运昌实测 2026-11-03）", () => {
+  const doc = [
+    "恒运昌及中介机构关于首轮审核问询函的回复",
+    "",
+    "## 问题 1、关于主要产品",
+    "请发行人说明产品构成。",
+    "回复：",
+    "发行人主要产品为特种电机。",
+    "## 问题 2、关于引进业务",
+    "请发行人说明引进业务模式。",
+    "回复：",
+    "引进业务收入确认合规。",
+    "## 问题 4、关于核心技术",
+    "请发行人说明核心技术来源。",
+    "回复：",
+    "核心技术自主研发。",
+    "## 问题 5.1、关于客户——关于单一客户依赖",
+    "请发行人说明单一客户依赖风险。",
+    "回复：",
+    "前五大客户集中度较高但可持续。",
+    "## 问题 5.2、关于客户——关于主要客户",
+    "请发行人披露主要客户情况。",
+    "回复：",
+    "主要客户合作稳定。",
+    "## 问题 6.1、关于收入——关于收入确认",
+    "请发行人说明收入确认政策。",
+    "回复：",
+    "收入确认符合企业会计准则。",
+    "## 问题 7、关于成本和毛利率",
+    "请发行人分析毛利率波动。",
+    "回复：",
+    "毛利率波动合理。",
+  ].join("\n")
+
+  it("恒运昌形态：5.1/5.2/6.1 各自成题，不再被 4/7 吞并", () => {
+    const split = splitQaDocument(doc, "reply")
+    const nos = split.questions.map((q) => q.questionNo)
+    expect(nos).toContain(5.1)
+    expect(nos).toContain(5.2)
+    expect(nos).toContain(6.1)
+    expect(nos).toContain(7)
+    // 5.1 题的边界不越过 5.2 题干（吞并回归防线）
+    const q51 = split.questions.find((q) => q.questionNo === 5.1)
+    expect(q51!.questionText).toContain("单一客户依赖")
+    expect(q51!.questionText).not.toContain("主要客户情况")
+  })
+
+  it("子题号 title 无「.1」残迹", () => {
+    const split = splitQaDocument(doc, "reply")
+    const q51 = split.questions.find((q) => q.questionNo === 5.1)
+    expect(q51!.title).not.toMatch(/^\.?\d/)
+    expect(q51!.title).toContain("客户")
+  })
+
+  it("目录「问题 5.1、关于客户....152」识别子题号（toc 对账不再缺位）", () => {
+    const toc = [
+      "目录",
+      "问题 4、关于核心技术....115",
+      "问题 5.1、关于客户——关于单一客户依赖....152",
+      "问题 5.2、关于客户——关于主要客户....160",
+    ].join("\n")
+    const split = splitQaDocument(toc, "reply")
+    expect(split.tocNumbers).toContain(5.1)
+    expect(split.tocNumbers).toContain(5.2)
+  })
+
+  it("量词小数防误收回归：句中「问题 266.77 181.93」仍不命中边界", () => {
+    const decimal = [
+      "某回复",
+      "回复：",
+      "其中：产品质量问题 266.77 181.93 84.29",
+      "处理措施：已整改。",
+    ].join("\n")
+    const split = splitQaDocument(decimal, "reply")
+    expect(split.questions.every((q) => q.questionNo !== 266.77)).toBe(true)
+  })
+})

@@ -16,9 +16,13 @@
  * (year/exchange/deal/board/status/company) comes from the curated path.
  */
 
-/** 中文数字 → 阿拉伯数字（v4 映射 + 单字「一」~「九」直取，v4 亦漏此形态）。 */
+/** 中文数字 → 阿拉伯数字（v4 映射 + 单字「一」~「九」直取，v4 亦漏此形态）。
+ *  2026-11-03 M4.2 批A 检查门：加小数子题号（5.1/18.2）分支——恒运昌实测
+ *  「## 问题 5.1、关于客户——关于单一客户依赖」整行不命中 H3，5/6/18 三个
+ *  题位被吞进前题（q4 吞 5.1+5.2）。 */
 export function cn2num(s: string): number {
   if (/^\d+$/.test(s)) return parseInt(s, 10)
+  if (/^\d+\.\d+$/.test(s)) return parseFloat(s)
   const CN: Record<string, number> = {
     一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
   }
@@ -66,7 +70,7 @@ const QUESTION_CONTEXT_LINE =
 /** H3: `问题N、`/`问题N：`/`问题N.`（后者排除小数 N. 后跟数字）。用于行内任意位置。
  *  2026-10-24 R3 补：中文题号后跟半角点（目录「问题一...... 3」点线形态，
  *  上能电气实测——原正则中文分支只认全角分隔符，toc 收不到中文题号）。 */
-const H3_ANYWHERE = /问题\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*[、．:：]|问题\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*\.(?!\d)/g
+const H3_ANYWHERE = /问题\s*([0-9]{1,3}(?:[.．][0-9]{1,2})?|[一二三四五六七八九十]{1,3})\s*[、．:：]|问题\s*([0-9]{1,3}(?:[.．][0-9]{1,2})?|[一二三四五六七八九十]{1,3})\s*\.(?!\d)/g
 /** H3 边界行（行首锚）。四种实测形态：
  *  1. 「问题N、/问题N：/问题N.」裸行（防小数 N. 后跟数字；北交所函件半角点形态）
  *  2. 「一. 关于问询问题 1.关于XX」——补充法律意见书：中文序数前缀（日播时尚实测）
@@ -85,7 +89,7 @@ const H3_ANYWHERE = /问题\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})
  *     之类句中/带尾缀形态不收。
  *  引号开头的引用行（「"一.关于问询问题 1…"之"（三）」）不命中——前缀字符集不含引号。 */
 const H3_BODY_LINE =
-  /^[ \t]{0,8}(?:#{1,4}[ \t]+)?(?:[一二三四五六七八九十]{1,3}\s*[.、．]\s*)?(?:(?:《[^》]{2,60}》\s*)?(?:关于\s*)?(?:问询\s*)?问题\s*(?:[0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*(?:[（(][^)）]{0,12}[)）])?\s*(?:[、．:：]|\.(?!\d)|$)|《[^》]{2,60}》\s*[0-9]{1,3}\s*(?:[、．:：]|\.(?!\d))\s*(?:关于|其他))/
+  /^[ \t]{0,8}(?:#{1,4}[ \t]+)?(?:[一二三四五六七八九十]{1,3}\s*[.、．]\s*)?(?:(?:《[^》]{2,60}》\s*)?(?:关于\s*)?(?:问询\s*)?问题\s*(?:[0-9]{1,3}(?:[.．][0-9]{1,2})?|[一二三四五六七八九十]{1,3})\s*(?:[（(][^)）]{0,12}[)）])?\s*(?:[、．:：]|\.(?!\d)|$)|《[^》]{2,60}》\s*[0-9]{1,3}\s*(?:[、．:：]|\.(?!\d))\s*(?:关于|其他))/
 /** 目录行特征：4+ 连续 `.` 或 2+ 连续 `…`（页码引导点线；中文省略号
  *  习惯「……」两字符成对，2026-10-12 埃泰克目录实测）。 */
 const TOC_DOT_LEADER = /\.{4,}|…{2,}/
@@ -353,11 +357,12 @@ interface LineMarker {
 }
 
 /** 从一行文本提取「问题N」题号（H3 语义：问题N+分隔符，或《函名》N.(关于|其他)直起形态；
- *  题号后允许「（原问题N）」类括号注记——主号优先，注记号不取）。 */
+ *  题号后允许「（原问题N）」类括号注记——主号优先，注记号不取。
+ *  2026-11-03 子题号支持（M4.2 批A 检查门：5.1/18.2 形态）。 */
 function extractQuestionNo(line: string): number {
-  const punct = line.match(/问题\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*(?:[（(][^)）]{0,12}[)）])?\s*[、．:：]/)
+  const punct = line.match(/问题\s*([0-9]{1,3}(?:[.．][0-9]{1,2})?|[一二三四五六七八九十]{1,3})\s*(?:[（(][^)）]{0,12}[)）])?\s*[、．:：]/)
   if (punct) return cn2num(punct[1])
-  const dot = line.match(/问题\s*([0-9]{1,3})\s*(?:[（(][^)）]{0,12}[)）])?\.(?!\d)/)
+  const dot = line.match(/问题\s*([0-9]{1,3}(?:[.．][0-9]{1,2})?)\s*(?:[（(][^)）]{0,12}[)）])?\.(?!\d)/)
   if (dot) return cn2num(dot[1])
   const letterNum = line.match(/《[^》]{2,60}》\s*([0-9]{1,3})\s*(?:[、．:：]|\.(?!\d))\s*(?:关于|其他)/)
   if (letterNum) return cn2num(letterNum[1])
@@ -949,8 +954,12 @@ function titleFromBlock(
       // 意见书前缀：「一.」「一、」「《审核问询函》」「关于问询」
       .replace(/^[一二三四五六七八九十]{1,3}\s*[.、．]\s*/, "")
       .replace(/^《[^》]{2,60}》\s*/, "")
-      .replace(/^(?:关于\s*)?(?:问询\s*)?问题\s*[0-9一二三四五六七八九十]{1,3}\s*[、．:：.]?\s*/, "")
-      .replace(/^问题\s*[0-9一二三四五六七八九十]{1,3}\s*/, "")
+      // 2026-11-03 子题号（5.1/18.2）剥除——M4.2 批A 判卷实锤纯数字 title
+      // （「问题 3.2 关于xx」剥「问题 3」后剩「.2 关于xx」起题号残迹）。
+      .replace(/^(?:关于\s*)?(?:问询\s*)?问题\s*[0-9一二三四五六七八九十]{1,3}(?:[.．][0-9]{1,2})?\s*[、．:：.]?\s*/, "")
+      .replace(/^问题\s*[0-9一二三四五六七八九十]{1,3}(?:[.．][0-9]{1,2})?\s*/, "")
+      // 无「问题」前缀的裸子题号 heading（「3.2 关于xx」）
+      .replace(/^[0-9]{1,3}[.．][0-9]{1,2}\s*[、．:：.]?\s*/, "")
       .trim()
     // ② 保留词（释义/目录…）→ 剥空形态，继续找下一实质行
     if (stripped && TITLE_RESERVED_WORDS.test(stripped)) {
@@ -1288,7 +1297,7 @@ export function buildQuestionFileBlocks(
   // sources 摘要页（writeFileBlocks 会把 wiki/sources/ 前缀重定向到 canonical slug 路径）
   const summaryLines = [
     "type: source",
-    `title: "${yamlEscape(questionSummaryTitle(pathMeta, roundMeta, split, sourceIdentity))}"`,
+    `title: "${yamlEscape(questionSummaryTitle(pathMeta, roundMeta, sourceIdentity))}"`,
     "parser: qa-split",
     `split_summary: "${yamlEscape(splitSummaryKey(split))}"`,
     "tags: []",
@@ -1303,7 +1312,7 @@ export function buildQuestionFileBlocks(
   }
   blocks.push(
     `---FILE: wiki/sources/${slug}.md---\n---\n${summaryLines.join("\n")}\n---\n\n` +
-      `# ${questionSummaryTitle(pathMeta, roundMeta, split, sourceIdentity)}\n\n` +
+      `# ${questionSummaryTitle(pathMeta, roundMeta, sourceIdentity)}\n\n` +
       `本来源为问答函类文档，已按 qa-split 规则逐题拆分至 \`wiki/questions/\`（识别通道 ${split.channel}，共 ${split.questions.length} 题）。\n\n` +
       `- 来源文件：${sourceIdentity}\n- 轮次：${roundMeta.roundKind}${roundMeta.roundNo ? `（第${roundMeta.roundNo}轮）` : "（轮次未识别）"}\n- 识别依据：${roundMeta.basis}\n\n` +
       `> 题目与回复原文逐字转录于各 question 页；本页仅为来源索引，不承载题目内容。\n---END FILE---`,
@@ -1486,7 +1495,6 @@ export function docShortFromSourceIdentity(
 function questionSummaryTitle(
   pathMeta: QaPathMeta,
   roundMeta: QaRoundMeta,
-  split: QaSplitResult,
   sourceIdentity = "",
 ): string {
   // 无轮号时只拼一次 roundKind

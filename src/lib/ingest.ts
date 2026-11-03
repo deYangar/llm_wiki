@@ -34,6 +34,7 @@ import {
   extractPathMeta,
   extractRoundMeta,
   llmFallbackSplit,
+  qaSplitWarnReasons,
   splitQaDocument,
   splitReplySections,
   type LlmFallbackUsage,
@@ -87,7 +88,12 @@ const SUMMARIZE_LOGIC_VERSION = "1"
 // 净化（目录页码尾/保留词/占位回落）；⑤ L6 扩触发（含生成题号也走 LLM
 // 边界）；⑥ warn 防线（生成题号/单题吞并不再静默 ok）；⑦ generated 低置
 // 信页隔离区。
-const QA_SPLIT_LOGIC_VERSION = "3"
+// "4" (2026-11-03, M4.2 批A 检查门回炉)：子题号（5.1/18.2）支持——H3_
+// BODY_LINE/H3_ANYWHERE/extractQuestionNo/cn2num/titleFromBlock 五处。恒运昌
+// 实测「## 问题 5.1、关于客户」整行不命中，5/6/18 三个题位被吞进前题
+// （判卷 29 吞并硬证据的主力）；子题页 title 剥除残迹（纯数字「2」「3」
+// title 17 页）。量词小数（266.77）防误收保持。
+const QA_SPLIT_LOGIC_VERSION = "4"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000

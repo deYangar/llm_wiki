@@ -5,7 +5,10 @@
 队列清空（或全部终态）即退出。
 
 用法：
-  python case_library_monitor.py [--interval 60]
+  python case_library_monitor.py [--interval 60] [--wiki "C:/library/问询2025"]
+
+2026-11-03 M4.2：库路径参数化（原写死 C:/library/wiki，10-30 库改名后失效），
+双库各起一个监控进程。
 """
 import argparse
 import json
@@ -15,7 +18,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-WIKI = Path("C:/library/wiki")
+WIKI = Path("C:/library/问询2025")
 QUEUE = WIKI / ".llm-wiki" / "ingest-queue.json"
 WARN = WIKI / ".llm-wiki" / "ingest-warnings.log"
 HEALTH = "http://127.0.0.1:19828/api/v1/health"
@@ -49,10 +52,18 @@ def snapshot():
 
 
 def main():
+    global WIKI, QUEUE, WARN
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=int, default=60)
+    ap.add_argument("--wiki", type=Path, default=None,
+                    help="库根目录（默认 C:/library/问询2025；2024 库传 C:/library/问询2024）")
     args = ap.parse_args()
+    if args.wiki:
+        WIKI = args.wiki
+        QUEUE = WIKI / ".llm-wiki" / "ingest-queue.json"
+        WARN = WIKI / ".llm-wiki" / "ingest-warnings.log"
+        print(f"监控库：{WIKI}", flush=True)
 
     t0 = time.time()
     s0 = snapshot()
