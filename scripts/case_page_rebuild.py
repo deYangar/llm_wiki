@@ -49,7 +49,7 @@ from pathlib import Path
 
 API_BASE = "http://127.0.0.1:19828"
 DEFAULT_PROJECT = "283b69c0-157e-47a8-b1e3-f476d0735a7c"      # 2025 wiki 实例
-DEFAULT_CASES_DIR = "C:/library/wiki/wiki/cases"
+DEFAULT_CASES_DIR = "C:/library/问询2025/wiki/cases"   # 10-30 库目录改名（wiki→问询2025）后修正
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPORT_DIR = REPO_ROOT / "plans" / "2026-10-29-a3-case-page-rebuild" / "reports"
 PAGE_SIZE = 500
