@@ -969,7 +969,10 @@ function cutByKnownAnchors(
  *  「问题N（题干待人工）」（splitQaDocument 出口据此写 manualQueue）。 */
 const TITLE_RESERVED_WORDS = /^(?:释\s*义|目\s*录|CONTENTS|前\s*言|声\s*明)$/u
 
-function titleFromBlock(
+/** 导出供存量重算管道复用（缺陷①B，2026-11-04）：重算脚本按
+ *  split.question_range 取题干块重新走本函数（单一事实源，与引擎
+ *  增量产出零漂移），不重拆文档。 */
+export function titleFromBlock(
   lines: string[],
   start: number,
   end: number,
@@ -1360,12 +1363,18 @@ export function stripQuestionNoPrefix(stem: string, questionNo: number): string 
  * 同文档内标题重复时由调用方 buildQuestionFileBlocks 消歧（回退
  * 「问题N·」前缀），questionTitle 本身保持单题纯标题。
  */
+/** 导出供存量重算管道复用（缺陷①B，2026-11-04）：与 questionTitle
+ *  同链（剥题号前缀 → 词边界截断），重算脚本对题干块直调。 */
+export function retitleFromStem(stem: string, questionNo: number): string {
+  const cleaned = stripQuestionNoPrefix(stem, questionNo)
+  return truncateTitleAtBoundary(cleaned).trim() || `第${questionNo}题`
+}
+
 export function questionTitle(question: SplitQuestion): string {
-  const cleaned = stripQuestionNoPrefix(question.title, question.questionNo)
   // 缺陷①（2026-11-04）：slice(0,40) 硬切改为词边界回退——切点不落
   // 数字串中间，截断补「…」。sectionTitleFull/questionSummaryTitle
   // 同日实勘为纯拼接无 40 截断，不受此缺陷影响，不改。
-  return truncateTitleAtBoundary(cleaned).trim() || `第${question.questionNo}题`
+  return retitleFromStem(question.title, question.questionNo)
 }
 
 /**
