@@ -15,6 +15,7 @@ import {
   sanitizeFallbackTags,
   splitQaDocument,
   splitReplySections,
+  truncateTitleAtBoundary,
 } from "./qa-split"
 import type { QaSplitResult, SplitQuestion } from "./qa-split"
 import { FILE_BLOCK_REGEX } from "./ingest"
@@ -1536,6 +1537,70 @@ describe("qa-split — questionTitle is the bare stem (R3 §六.4, B4 prefix ret
 
   it("keeps a heading whose number is another question's", () => {
     expect(titleOf("8、关于股份支付", 7)).toBe("8、关于股份支付")
+  })
+})
+
+// ── 缺陷①（2026-11-04 方案 §2.3.A）：题干截断词边界回退 ──────────────
+
+describe("qa-split — truncateTitleAtBoundary (word-boundary cut, no orphan digit tail)", () => {
+  /** ST联合 q1 题干首句原句（2026-11-04 取证）：旧 slice(0,40) 切点恰好
+   *  落在「6 个月」的「6」后面，产出「…业务 6」孤立数字尾巴——不是
+   *  目录页码粘连，是 TITLE_MAX=40 硬切不截词。 */
+  const stUnionStem =
+    "上市公司年报审计机构中审华会计师事务所(特殊普通合伙)被暂停从事证券服务业务 6 个月，暂停证券业务期限为2024年11月8日至2025年5月7日"
+
+  function titleOf(stem: string, questionNo = 1): string {
+    const question: SplitQuestion = {
+      questionNo,
+      title: stem,
+      questionText: stem,
+      replyText: "答",
+      channel: "H1",
+      questionNoIsGenerated: false,
+      startLine: 0,
+      replyStartLine: 1,
+      endLine: 2,
+    }
+    return questionTitle(question)
+  }
+
+  it("short stems pass through unchanged (no ellipsis)", () => {
+    expect(truncateTitleAtBoundary("关于股份支付")).toBe("关于股份支付")
+    expect(truncateTitleAtBoundary("x".repeat(40))).toBe("x".repeat(40))
+  })
+
+  it("ST联合题干：切点回退到空白边界，无孤立「 6」尾巴，以「…」结尾", () => {
+    const t = titleOf(stUnionStem)
+    expect(t.endsWith("…")).toBe(true)
+    expect(t).not.toMatch(/[\d]\s*$/)
+    expect(t).not.toContain("业务 6")
+    expect(t).toContain("被暂停从事证券服务")
+  })
+
+  it("千分位金额串不在中间断开（…237,802.69 形态）", () => {
+    const stem =
+      "报告期内发行人主营业务收入分别为234,499.54万元、237,802.69万元和241,116.28万元，请发行人结合业务模式说明"
+    const t = titleOf(stem)
+    expect(t.endsWith("…")).toBe(true)
+    // 不以裸数字/千分位逗号结尾（孤立「…4,387」形态）
+    expect(t).not.toMatch(/[\d,]\s*$/)
+    // 窗口内出现的金额串必须完整（第一个金额未被从中间切开）
+    expect(t).toContain("234,499.54")
+  })
+
+  it("CJK 句读也是安全切点（。；：、，）", () => {
+    const stem = "这是一个非常长的题干标题句子，前半部分讲完了业务背景、后半部分还有内容继续延伸扩展说明补充"
+    const t = titleOf(stem)
+    expect(t.endsWith("…")).toBe(true)
+    expect(["。", "；", "：", "、", "，", " "]).toContain(t.slice(-2, -1))
+  })
+
+  it("保底路径：前 20 字无边界 → 数字串边界或原样硬切，不更糟", () => {
+    // 前 20 字全是汉字且整窗无标点空白的极端形态
+    const stem = "关于重大资产重组标的公司的历史沿革与股权结构演变情况的详细说明以及其他需要说明的事项"
+    const t = titleOf(stem)
+    expect(t.length).toBeGreaterThan(0)
+    if (t !== stem) expect(t.endsWith("…")).toBe(true)
   })
 })
 

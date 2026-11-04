@@ -1249,6 +1249,57 @@ export interface QuestionPageBuild {
 
 const TITLE_MAX = 40
 
+/** 词边界回退的保底长度：切点至少保留这么多字，防止把标题切太碎。 */
+const TITLE_SAFE_CUT_MIN = 20
+
+/** 数字/字母连续串成员（含千分位逗号与小数点）——切点落在这种串中间
+ * 会产出「…业务 6」「…4,387」孤立数字尾巴（2026-11-04 缺陷①取证）。 */
+const TITLE_ALNUM_RUN = /[\dA-Za-z,，.%]/
+
+/**
+ * 题干截断的词边界回退（缺陷①，2026-11-04 方案 §2.3.A）。
+ *
+ * 旧版 ``slice(0, TITLE_MAX)`` 硬切不截词不截句读——ST联合题干切点
+ * 恰好落在「6 个月」的「6」后面，产出「…业务 6」孤立数字尾巴（全库
+ * title 尾数字形态 151 行 PG / 540 页 wiki）。规则：
+ *
+ * 1. 不超限原样返回；
+ * 2. 窗口内向后找最近安全切点（CJK 句读或空白之后），保底 20 字；
+ * 3. 切点落在数字/字母连续串中间 → 回退到该串起点之前；
+ * 4. 截断补「…」——「这是截断标题」一眼可辨，消除数字结尾误读；
+ * 5. 前 20 字无任何边界（极端形态）→ 40 处最近的非数字串位置，
+ *    仍无则原样硬切（保底路径，与现状同形不更糟）。
+ */
+export function truncateTitleAtBoundary(cleaned: string): string {
+  if (cleaned.length <= TITLE_MAX) return cleaned
+  const window = cleaned.slice(0, TITLE_MAX)
+  const isBoundary = (ch: string) => "。；：、，；;: ".includes(ch)
+  // 步骤 2/3：最近的「边界之后、非数字串中间」切点
+  for (let i = window.length; i >= TITLE_SAFE_CUT_MIN; i--) {
+    const prev = window[i - 1] ?? ""
+    if (!isBoundary(prev)) continue
+    // 数字串中间判定：切点两侧同为数字串成员（「234,|499」「237,|802.69」
+    // 的逗号是标点也是数字一部分）→ 回退到整个数字串起点之前
+    const next = cleaned[i] ?? ""
+    if (TITLE_ALNUM_RUN.test(prev) && next && TITLE_ALNUM_RUN.test(next)) {
+      let j = i - 1
+      while (j > TITLE_SAFE_CUT_MIN && TITLE_ALNUM_RUN.test(window[j - 1] ?? "")) j -= 1
+      if (TITLE_ALNUM_RUN.test(window[j - 1] ?? "")) continue // 回退后仍不完整 → 弃
+      return cleaned.slice(0, j).trim() + "…"
+    }
+    return cleaned.slice(0, i).trim() + "…"
+  }
+  // 步骤 5：窗口内无任何句读/空白边界 → 40 处最近的非数字串位置
+  for (let i = window.length; i >= TITLE_SAFE_CUT_MIN; i--) {
+    const prev = window[i - 1] ?? ""
+    const next = cleaned[i] ?? ""
+    if (!TITLE_ALNUM_RUN.test(prev) || !next || !TITLE_ALNUM_RUN.test(next)) {
+      return cleaned.slice(0, i).trim() + "…"
+    }
+  }
+  return window // 原样硬切（与现状同形，不更糟）
+}
+
 function yamlScalar(value: string): string {
   if (/[:#\[\]{},\"]/.test(value) || value.trim() !== value || !value) {
     return `"${yamlEscape(value)}"`
@@ -1306,7 +1357,10 @@ export function stripQuestionNoPrefix(stem: string, questionNo: number): string 
  */
 export function questionTitle(question: SplitQuestion): string {
   const cleaned = stripQuestionNoPrefix(question.title, question.questionNo)
-  return cleaned.slice(0, TITLE_MAX).trim() || `第${question.questionNo}题`
+  // 缺陷①（2026-11-04）：slice(0,40) 硬切改为词边界回退——切点不落
+  // 数字串中间，截断补「…」。sectionTitleFull/questionSummaryTitle
+  // 同日实勘为纯拼接无 40 截断，不受此缺陷影响，不改。
+  return truncateTitleAtBoundary(cleaned).trim() || `第${question.questionNo}题`
 }
 
 /**
