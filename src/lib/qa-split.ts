@@ -1008,7 +1008,12 @@ function titleFromBlock(
     // 剥空（裸题号行「问题一」上能电气形态）→ 继续找第一个实质行当标题
     // （题干首句）；全块剥空才回退占位（M5.1：带「题干待人工」标记，
     // 出口扫到即写 manualQueue，不静默）。
-    if (stripped) return stripped.slice(0, 40).trim() || `问题${questionNo}（题干待人工）`
+    // 缺陷①（2026-11-04）：此处的 slice(0,40) 硬切正是「题干整段当标题+
+    // 截断」形态的产出点（ST联合「…业务 6」实锤）——与 questionTitle
+    // 同源同修，统一走词边界回退。
+    if (stripped) {
+      return truncateTitleAtBoundary(stripped).trim() || `问题${questionNo}（题干待人工）`
+    }
   }
   return `问题${questionNo}（题干待人工）`
 }
