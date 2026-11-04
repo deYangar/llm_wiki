@@ -14,8 +14,14 @@ use crate::panic_guard::run_guarded_async;
 const DEFAULT_RESULTS: usize = 20;
 const MAX_RESULTS: usize = 50;
 const RRF_K: f64 = 60.0;
-const FILENAME_EXACT_BONUS: f64 = 200.0;
-const PHRASE_IN_TITLE_BONUS: f64 = 50.0;
+// Signal-strength ordering (2026-11-04 修复): a full query phrase in the
+// title (the user is looking for this exact name — e.g. a legal-opinion
+// document by its file name) must outrank the same phrase repeated in body
+// text (10 occurrences capped at 200), which in turn outranks token hits.
+// The old 50 let question pages (which carry the full document body after
+// qa-split) bury their thin source pages on document-name queries.
+const FILENAME_EXACT_BONUS: f64 = 400.0;
+const PHRASE_IN_TITLE_BONUS: f64 = 260.0;
 const PHRASE_IN_CONTENT_PER_OCC: f64 = 20.0;
 const MAX_PHRASE_OCC_COUNTED: usize = 10;
 const TITLE_TOKEN_WEIGHT: f64 = 5.0;
@@ -1288,6 +1294,42 @@ fn needle_needs_case_fold(s: &str) -> bool {
     })
 }
 
+/// Phrase matching that survives separator-form drift (2026-11-04):
+/// a document-name query carries the file name's punctuation
+/// ("鼎佳精密：广东信达律师事务所关于…（一）") while the page title uses
+/// the new template's separators ("鼎佳精密·广东信达…"). A raw
+/// `contains` never fires across that drift, so a thin source page
+/// (title = the document name, body ~1KB) loses to the qa-split question
+/// pages that carry the full document body. Normalize by stripping
+/// separator punctuation on both sides before the fallback contains.
+///
+/// Title text ONLY (not the `title+file_name` compound): qa-split question
+/// page slugs embed the source document path, so the compound form lets
+/// question pages claim the phrase bonus through their file name and the
+/// bonus loses all discriminating power (2026-11-04 measured: every
+/// question page +260 alongside the source page, ordering unchanged).
+fn phrase_loose_contains(title: &str, query_phrase: &str) -> bool {
+    let norm = |s: &str| {
+        s.chars()
+            .filter(|c| {
+                !is_query_separator(*c)
+                    && !matches!(
+                        c,
+                        '·' | '：' | ':' | '（' | '）' | '(' | ')' | '、' | '，'
+                            | ',' | '。' | '.' | '；' | ';' | '《' | '》' | '「' | '」'
+                    )
+            })
+            .collect::<String>()
+    };
+    let nq = norm(query_phrase);
+    // Long queries only: a normalized 2-char "phrase" would match far too
+    // loosely. The document-name use case is 15+ chars.
+    if nq.chars().count() < 6 {
+        return false;
+    }
+    norm(title).contains(&nq)
+}
+
 fn score_file(
     project_path: &str,
     path: &Path,
@@ -1319,7 +1361,9 @@ fn score_file(
     let stem = file_name.trim_end_matches(".md").to_lowercase();
 
     let filename_exact = !query_phrase.is_empty() && stem == query_phrase;
-    let title_has_phrase = !query_phrase.is_empty() && title_lower.contains(query_phrase);
+    let title_has_phrase = !query_phrase.is_empty()
+        && (title_lower.contains(query_phrase)
+            || phrase_loose_contains(&title.to_lowercase(), query_phrase));
     // contains() short-circuits; counting only runs on files that actually
     // hold the phrase, so zero-hit candidates skip the full match_indices
     // scan entirely.
