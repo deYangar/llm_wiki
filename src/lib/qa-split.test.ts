@@ -1603,6 +1603,42 @@ describe("qa-split — truncateTitleAtBoundary (word-boundary cut, no orphan dig
     expect(t.length).toBeGreaterThan(0)
     if (t !== stem) expect(t.endsWith("…")).toBe(true)
   })
+
+  it("数字+空格+量词不在空格上切（春风动力「…9 月 1」形态，2026-11-05 残留）", () => {
+    const stem =
+      "根据申报材料，1）根据《电动自行车安全技术规范》，2025 年 9 月 1 日以后，所有新生产的电动自行车都必须符合新标准要求。2）截至报告期末"
+    const t = titleOf(stem, 4.2)
+    expect(t.endsWith("…")).toBe(true)
+    // 不以悬空数字收尾（旧形态「…9 月 1…」）
+    expect(t).not.toMatch(/[\dA-Za-z,，.%-]\s*…$/)
+    // 日期切在完整「月」词上，而非「1 日」中间
+    expect(t).toContain("2025 年 9 月")
+    expect(t).not.toContain("9 月 1")
+  })
+
+  it("金额串+空格+万元（切点恰在「15,900.00|万元」）→ 丢弃整串，与串中间回退同则", () => {
+    // 前缀精确 30 字：15,900.00 占位 31-38、空格在 39，40 窗切点两侧恰为「00|万」
+    const stem =
+      "公司本次向特定对象发行股票募集资金总额不超过人民币金额上限的 15,900.00 万元，用于补充流动资金和项目建设支出"
+    const t = titleOf(stem)
+    expect(t.endsWith("…")).toBe(true)
+    expect(t).not.toMatch(/[\d,]\s*…$/)
+    expect(t).not.toContain("15,900.00")
+  })
+
+  it("数字后是真分隔（、）不受悬空防线影响", () => {
+    const stem = "关于本次发行上市涉及的问题 5、请发行人进一步说明募集资金使用的具体情况并补充披露相关风险因素"
+    const t = titleOf(stem, 5)
+    expect(t.endsWith("…")).toBe(true)
+    expect(t).toContain("问题 5、")
+  })
+
+  it("字母串尾悬空（型号 XNW5004 的…）同样回退", () => {
+    const stem = "请发行人结合核心产品型号 XNW5004 的技术先进性与市场占有率情况，进一步说明主营业务收入变动的合理性及可持续性"
+    const t = titleOf(stem, 1)
+    expect(t).not.toMatch(/[\dA-Za-z]\s*…$/)
+    expect(t).toContain("型号")
+  })
 })
 
 describe("qa-split — titleFromBlock 行合并（挂账① 窄栏断行族，2026-11-05）", () => {
@@ -2286,5 +2322,66 @@ describe("qa-split — 目录裸页码尾与编号重启（M4.2 批A 三轮回�
     // 「2024 年经营情况」是标题内容不是页码
     expect(q3!.title).toContain("经营情况")
     expect(split.questions.map((q) => q.questionNo)).toEqual([3, 5])
+  })
+})
+
+describe("qa-split — 目录邻居防线（残留挂账·吉和昌，2026-11-05）", () => {
+  /** 吉和昌补充法律意见书（二）实测形态：目录条目页码粘连在文字尾
+   *  （「…的合规性5」无点线、无前置空白），TOC 三过滤器全漏、抢先立
+   *  head 把真 ## 问题头压成同题合并——题干被灌 50 行目录、title 带「5」。
+   *  修法：marker 的下一非空行是目录行（点线/页码尾）→ 本行是目录条目。 */
+  const doc = [
+    "## 目 录",
+    "",
+    "第一部分 第二轮审核问询回复 .... 5",
+    "《第二轮审核问询函》问题1.超产能生产、危险化学品使用等环节的合规性5",
+    "第二部分 本次发行上市相关法律事项更新 .... 47",
+    "一、发行人的基本情况 .... 47",
+    "",
+    "# 广东信达律师事务所关于某公司的补充法律意见书（二）",
+    "",
+    "## 第一部分 第二轮审核问询回复",
+    "",
+    "## 《第二轮审核问询函》问题 1.超产能生产、危险化学品使用等环节的合规性",
+    "",
+    "根据申请文件及问询回复：（1）子公司报告期内存在超产能生产情形。",
+    "",
+    "请发行人说明超产能生产是否违反环保及安全生产相关监管要求。",
+    "",
+    "## 回复：",
+    "",
+    "经核查，发行人已完成整改。",
+    "",
+    "## 《审核问询函》问题 3.危险化学品使用、管理等是否合规",
+    "",
+    "根据申请文件：公司生产中使用危险化学品。",
+    "",
+    "## 回复：",
+    "",
+    "经核查，合规。",
+  ].join("\n")
+
+  it("目录条目（页码粘连尾）不立锚：q1 立在正文 ## 问题头，题干无目录行", () => {
+    const split = splitQaDocument(doc, "reply")
+    expect(split.questions.map((q) => q.questionNo)).toEqual([1, 3])
+    const q1 = split.questions.find((q) => q.questionNo === 1)!
+    // 题干从正文 ## 锚起：含真问询句、不含目录/封面行
+    expect(q1.questionText).toContain("根据申请文件及问询回复")
+    expect(q1.questionText).not.toContain(".... 47")
+    expect(q1.questionText).not.toContain("基本情况")
+    expect(q1.startLine).toBe(11) // 0-based：## 问题头行（目录条目在 3）
+  })
+
+  it("title 从正文头取：「…的合规性」无页码尾巴「5」", () => {
+    const split = splitQaDocument(doc, "reply")
+    const q1 = split.questions.find((q) => q.questionNo === 1)!
+    expect(q1.title).toBe("超产能生产、危险化学品使用等环节的合规性")
+    expect(q1.title).not.toMatch(/\d$/)
+  })
+
+  it("正文锚的下一非空行是题干（非目录行）→ 不误伤", () => {
+    const split = splitQaDocument(doc, "reply")
+    const q3 = split.questions.find((q) => q.questionNo === 3)!
+    expect(q3.questionText).toContain("根据申请文件：公司生产中使用危险化学品")
   })
 })

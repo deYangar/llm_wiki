@@ -401,6 +401,24 @@ function bodyQuestionMarkers(text: string): LineMarker[] {
     const line = lines[i]
     if (TOC_DOT_LEADER.test(line) || TOC_PAGE_TAIL.test(line) || isTocBarePageTail(line)) continue
     if (!H3_BODY_LINE.test(line)) continue
+    // 目录邻居防线（2026-11-05 残留挂账·吉和昌）：目录条目的页码可粘连在
+    // 文字尾（无点线、无前置空白，「…的合规性5」），三个 TOC 过滤器全漏、
+    // 抢先立 head 把真 ## 问题头压成同题合并。但目录条目的下一非空行必是
+    // 又一条目录行，真题头的下一非空行是题干——邻居是目录行 → 不立锚。
+    // 邻居判据只认 TOC_PAGE_TAIL（点线+行尾页码整行形态）：纯点线行
+    // （嘉晨「……」装饰分隔）与裸页码尾（时代新材题干行尾恰断在金额中段）
+    // 都会被句内省略号/断行数字仿冒，宽判据实测误伤 8 文书（2026-11-05）。
+    let nextContent = ""
+    for (let k = i + 1; k <= Math.min(i + 4, lines.length - 1); k += 1) {
+      const nl = lines[k].trim()
+      if (nl && !nl.startsWith("## Page")) {
+        nextContent = nl
+        break
+      }
+    }
+    if (nextContent && TOC_PAGE_TAIL.test(nextContent)) {
+      continue
+    }
     const no = extractQuestionNo(line)
     if (no > 0 && no <= MAX_QUESTION_NO) out.push({ line: i, no })
   }
@@ -1326,6 +1344,20 @@ export function truncateTitleAtBoundary(cleaned: string): string {
       while (j > TITLE_SAFE_CUT_MIN && TITLE_ALNUM_RUN.test(window[j - 1] ?? "")) j -= 1
       if (TITLE_ALNUM_RUN.test(window[j - 1] ?? "")) continue // 回退后仍不完整 → 弃
       return cleaned.slice(0, j).trim() + "…"
+    }
+    // 悬空尾防线（2026-11-05 残留挂账·春风动力）：MinerU 抽取的数字与
+    // 量词之间带空格（「2025 年 9 月 1 日」「15,900.00 万元」），切点落在
+    // 串后空格上时数字串看似完整结束，但截断 title 以悬空数字收尾、单位
+    // 在后文——与串中间切断同族（全库「数字…」尾 132 页实测）。后继是
+    // 非边界非串成员（量词汉字）→ 不安全，回退继续找前一真边界。
+    // 末字符只认真数字/字母：全角逗号在 TITLE_ALNUM_RUN 里是千分位成员，
+    // 但「…股票，」的句读逗号结尾不是悬空数字（东山精密实测：逗号边界被
+    // 误跳 → 循环穷尽坠 step5 → 反而切出「…150,000.00」真悬空金额）。
+    const sliceEnd = cleaned.slice(0, i).trimEnd()
+    const lastCh = sliceEnd[sliceEnd.length - 1] ?? ""
+    if (lastCh && /[\dA-Za-z]/.test(lastCh)) {
+      const afterCh = cleaned.slice(i).trimStart()[0] ?? ""
+      if (afterCh && !TITLE_ALNUM_RUN.test(afterCh) && !isBoundary(afterCh)) continue
     }
     return cleaned.slice(0, i).trim() + "…"
   }
