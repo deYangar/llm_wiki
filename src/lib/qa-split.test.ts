@@ -15,6 +15,7 @@ import {
   sanitizeFallbackTags,
   splitQaDocument,
   splitReplySections,
+  titleFromBlock,
   truncateTitleAtBoundary,
 } from "./qa-split"
 import type { QaSplitResult, SplitQuestion } from "./qa-split"
@@ -1601,6 +1602,82 @@ describe("qa-split — truncateTitleAtBoundary (word-boundary cut, no orphan dig
     const t = titleOf(stem)
     expect(t.length).toBeGreaterThan(0)
     if (t !== stem) expect(t.endsWith("…")).toBe(true)
+  })
+})
+
+describe("qa-split — titleFromBlock 行合并（挂账① 窄栏断行族，2026-11-05）", () => {
+  /** 源 PDF 窄栏行宽 ~40 字恰 ≤ TITLE_MAX(40)，断行走「不超限原样返回」、
+   *  行尾悬在数字串中间直通 title。修法：行尾悬空并下一实质行到自然边界，
+   *  三道防线（目录行/结构行/80 字上限）。 */
+
+  it("悬空负号续行（国科天成形态）：合并后金额完整、无中断尾", () => {
+    // 真实行宽：line1 25 字 ≤ TITLE_MAX，行尾悬「-」——旧行为原样直通
+    const lines = [
+      "报告期内现金流量净额分别为-9,611.36 万元和-",
+      "1,944.38 万元。",
+    ]
+    const t = titleFromBlock(lines, 0, lines.length - 1, 1)
+    // 合并后 37 字 ≤ 40：整句原样返回，负号金额完整
+    expect(t).toBe("报告期内现金流量净额分别为-9,611.36 万元和-1,944.38 万元。")
+    expect(t).not.toMatch(/[\d,-]\s*$/) // 「…-」「…-2,9」悬尾禁绝
+  })
+
+  it("40 字整断金额（茂莱光学形态）：首行以金额收尾、次行「万元…」→ 合并后正常", () => {
+    // line1 32 字 ≤ TITLE_MAX 行尾悬「6」（金额尾数字被切开）
+    const lines = [
+      "请补充披露租赁房产会计处理对各期损益的金额影响50,282.86",
+      "万元、4,387.21 万元",
+    ]
+    const t = titleFromBlock(lines, 0, lines.length - 1, 1)
+    // 合并后 43 字 > 40 → 词边界截断；跨行金额必须拼回完整串（不许行尾悬「50,282.86」直通）
+    expect(t).toContain("50,282.86万元")
+    expect(t.endsWith("…")).toBe(true)
+    expect(t).not.toMatch(/[\d,]\s*$/)
+  })
+
+  it("目录行防线（吉和昌形态）：下一行是目录点线页码行 → 不合并", () => {
+    const lines = [
+      "超产能生产、危险化学品使用等环节的合规性",
+      "第二部分 本次发行上市相关法律事项更新 .... 47",
+    ]
+    const t = titleFromBlock(lines, 0, lines.length - 1, 1)
+    // 目录行不并入；首行不悬空（「性」是自然边界）→ 行为与现状一致
+    expect(t).toBe("超产能生产、危险化学品使用等环节的合规性")
+  })
+
+  it("行为不变回归：行尾自然边界（万元。）不触发合并", () => {
+    const lines = [
+      "发行人报告期内实现的营业收入分别为10,000.00万元。",
+      "第二行是另一个完整句子不应该被拼进来。",
+    ]
+    const t = titleFromBlock(lines, 0, lines.length - 1, 1)
+    expect(t).toBe("发行人报告期内实现的营业收入分别为10,000.00万元。")
+    expect(t).not.toContain("第二行")
+  })
+
+  it("合并上限防线：悬空长行不越过 80 字无限长拼", () => {
+    const lines = [
+      "首行悬空结束于数字串5",
+      "0123456789012345678901234567890123456789",
+      "0123456789012345678901234567890123456789",
+    ]
+    const t = titleFromBlock(lines, 0, lines.length - 1, 1)
+    // 合并到 80 字上限后停，交给词边界截断——产出 ≤41 字（40+…）的截断形
+    expect(t.length).toBeLessThanOrEqual(41)
+  })
+
+  it("空行=段落边界不跨段拼（防误拼防线，2026-11-05 实测回退）", () => {
+    // 「悬空尾 + 空行 + 独立段」形态（信诺维「关于 XNW5004 / (空) /
+    // 根据首轮回复…」实测 45+ 页）：跳空行续拼会把合法型号/题号尾 title
+    // 误拼成两段杂糅——空行 break，title 保持单段形态。
+    const lines = [
+      "关于 XNW5004",
+      "",
+      "根据首轮回复和招股说明书：（1）EZH2 抑制剂的临床进展情况。",
+    ]
+    const t = titleFromBlock(lines, 0, lines.length - 1, 1)
+    expect(t).toBe("关于 XNW5004")
+    expect(t).not.toContain("根据首轮回复")
   })
 })
 

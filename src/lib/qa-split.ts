@@ -969,6 +969,14 @@ function cutByKnownAnchors(
  *  「问题N（题干待人工）」（splitQaDocument 出口据此写 manualQueue）。 */
 const TITLE_RESERVED_WORDS = /^(?:释\s*义|目\s*录|CONTENTS|前\s*言|声\s*明)$/u
 
+/** 挂账①（2026-11-05）：源 PDF 窄栏物理断行（行宽 ~40 字恰 ≤ TITLE_MAX）
+ *  使断行行走「不超限原样返回」、行尾悬在数字串中间直通 title（国科天成
+ *  「-2,9」「-」悬尾、茂莱光学「43,872.54 万元、4」切窗中段等 8 条断行族）。
+ *  修法：行尾悬空时并入下一实质行，直到自然边界或上限，再走词边界截断。 */
+const DANGLING_TAIL = /[\dA-Za-z,，.%-]$/u // 行尾是数字/字母/千分位/负号成员
+const BOUNDARY_TAIL = /[。；：、，；;:！？\s]$/u // 行尾已是自然边界
+const TITLE_MERGE_MAX = 80 // 合并上限（防目录/结构区长拼）
+
 /** 导出供存量重算管道复用（缺陷①B，2026-11-04）：重算脚本按
  *  split.question_range 取题干块重新走本函数（单一事实源，与引擎
  *  增量产出零漂移），不重拆文档。 */
@@ -1015,7 +1023,29 @@ export function titleFromBlock(
     // 截断」形态的产出点（ST联合「…业务 6」实锤）——与 questionTitle
     // 同源同修，统一走词边界回退。
     if (stripped) {
-      return truncateTitleAtBoundary(stripped).trim() || `问题${questionNo}（题干待人工）`
+      // 挂账①（2026-11-05）：行尾悬空（数字/字母/千分位/负号成员收尾）时
+      // 并入下一实质行——CJK 断行无空格直拼；三道防线：目录点线页码行、
+      // 结构行（数字开头的金额续行「1,944.38 万元」除外，不能误杀）、
+      // 80 字上限；并到自然边界即停，再统一走词边界截断。
+      let merged = stripped
+      for (let j = i + 1; j <= end && merged.length < TITLE_MERGE_MAX; j += 1) {
+        if (!DANGLING_TAIL.test(merged)) break // 行尾自然 → 不并
+        const nextLine = lines[j].trim()
+        // 空行 = 段落边界，不跨段拼（2026-11-05 实测：空行分隔的「悬空尾+
+        // 独立段」形态——如「关于 XNW5004 / (空) / 根据首轮回复…」——跳空行
+        // 续拼会把 45+ 页合法型号/题号尾 title 误拼成两段杂糅；空行分隔的
+        // 断行（春风动力「…9 月 1」形态，全库实测仅 1 条）如实挂账单独处理）
+        if (!nextLine || nextLine.startsWith("## Page")) break
+        if (/^[-—·\s]+$/.test(nextLine)) break
+        // 目录行防线（吉和昌形态）：点线页码/裸页码尾行不并
+        if (/[.．…]{2,}\s*\d{1,4}\s*$/u.test(nextLine)) break
+        // 结构行防线：## 标题、回复段标记等不并（数字开头的续行除外——
+        // 金额续行「1,944.38 万元」以数字开头，不能误杀）
+        if (NON_TITLE_LINE.test(nextLine) && !/^[\dA-Za-z,，.%-]/.test(nextLine)) break
+        merged = `${merged}${nextLine}` // CJK 断行无空格直拼
+        if (BOUNDARY_TAIL.test(merged)) break // 并到自然边界 → 停
+      }
+      return truncateTitleAtBoundary(merged).trim() || `问题${questionNo}（题干待人工）`
     }
   }
   return `问题${questionNo}（题干待人工）`
@@ -1260,9 +1290,11 @@ const TITLE_MAX = 40
 /** 词边界回退的保底长度：切点至少保留这么多字，防止把标题切太碎。 */
 const TITLE_SAFE_CUT_MIN = 20
 
-/** 数字/字母连续串成员（含千分位逗号与小数点）——切点落在这种串中间
+/** 数字/字母连续串成员（含千分位逗号与小数点；2026-11-05 挂账①补负号
+ * ——国科天成「-12,969.72」整串含负号，否则词边界回退把「-」当非串
+ * 成员、切点可落在「-」后产出「…-」尾巴）——切点落在这种串中间
  * 会产出「…业务 6」「…4,387」孤立数字尾巴（2026-11-04 缺陷①取证）。 */
-const TITLE_ALNUM_RUN = /[\dA-Za-z,，.%]/
+const TITLE_ALNUM_RUN = /[\dA-Za-z,，.%-]/
 
 /**
  * 题干截断的词边界回退（缺陷①，2026-11-04 方案 §2.3.A）。
