@@ -705,6 +705,140 @@ def build_context(args):
 
 # ---------------------------------------------------------------- 三种模式（§9）
 
+def cmd_refresh_related(ctx, args):
+    """②（方案 docs/方案-新挂账四条-20261105 §2.3）：定向重算目标 case 页
+    「## 相关页面」段——related_lines 按当前实存题页（fetch_questions 全量
+    聚合）重算，链接天然全部指向现存页；整组隔离文书（jto63f/1y1orv5）
+    按拍板 ②-1 自然少链。frontmatter 一律不动，其余正文段逐字保留；链接
+    形态与现存同形（questions/ 前缀）。默认 dry-run 打印逐页 diff 与旧链
+    →现状映射表；--apply 才写盘（写前逐页备份到 .llm-wiki/a3-backups/）。
+    """
+    targets = [t.strip() for t in (args.targets or "").split(",") if t.strip()]
+    if getattr(args, "targets_file", ""):
+        tf = Path(args.targets_file)
+        targets += [l.strip() for l in tf.read_text(encoding="utf-8").splitlines()
+                    if l.strip() and not l.startswith("#")]
+    targets = list(dict.fromkeys(targets))  # 去重保序
+    if not targets:
+        die(2, "--refresh-related 需要 --targets 或 --targets-file（case 页文件名清单）")
+    by_company = {}
+    for gd in ctx["gds"]:
+        by_company[gd["company"]] = gd
+    qdir = ctx["cases_dir"].parent / "questions"
+    results = []
+    for name in targets:
+        if not name.endswith(".md"):
+            name += ".md"
+        path = ctx["cases_dir"] / name
+        if not path.exists():
+            results.append({"file": name, "error": "file_missing"})
+            continue
+        raw = path.read_bytes().decode("utf-8").lstrip("\ufeff")
+        fm_text, body = split_page(raw)
+        if fm_text is None:
+            results.append({"file": name, "error": "no_frontmatter"})
+            continue
+        have = parse_fm(fm_text)
+        company = str(have.get("company") or "").strip()
+        gd = by_company.get(company)
+        if gd is None:  # 互含兜底（归纳通道全称残余）
+            for k, v in by_company.items():
+                if company and (company in k or k in company):
+                    gd = v
+                    break
+        if gd is None:
+            results.append({"file": name, "error": f"no_group({company})"})
+            continue
+        # 新 related 行（与现存同形：questions/ 前缀；行内所有 [[slug|alias]]
+        # 统一加前缀——slug 不含 / 故幂等不叠加）
+        new_lines = [re.sub(r"\[\[([^\]/|]+)\|", r"[[questions/\1|", ln)
+                     for ln in related_lines(gd)]
+        m = re.search(r"^## 相关页面[^\n]*$", body, re.M)
+        if not m:
+            results.append({"file": name, "error": "no_related_section"})
+            continue
+        seg_start = m.end()
+        nxt = re.search(r"^## [^\n]*$", body[m.start() + 1:], re.M)
+        seg_end = m.start() + 1 + nxt.start() if nxt else len(body)
+        old_seg = body[seg_start:seg_end]
+        old_lines = [l for l in old_seg.split("\n") if l.strip()]
+        # 幂等
+        if old_lines == new_lines:
+            results.append({"file": name, "changed": False,
+                            "old_n": len(old_lines), "new_n": len(new_lines)})
+            continue
+        # 旧链 → 现状映射（供过目：断链目标→同文书幸存页/无幸存=自然少链）
+        mapping = []
+        for l in old_lines:
+            mm = re.match(r"\[\[questions/([^\]|]+)(?:\|([^\]]*))?\]\]", l.strip())
+            if not mm:
+                continue
+            slug_full = mm.group(1)
+            exists = (qdir / (slug_full.rsplit("/", 1)[-1] + ".md")).exists()
+            if exists:
+                continue
+            stem = slug_full.rsplit("/", 1)[-1]
+            base = re.sub(r"-q[\d.]+$", "", stem)
+            survivors = sorted(
+                (qdir / f.name).name for f in qdir.glob(f"{base}-q*.md"))
+            mapping.append({"broken": stem,
+                            "kept_same_doc": [s for s in survivors
+                                              if s != stem]})
+        new_body = body[:seg_start] + "\n\n" + "\n".join(new_lines) + "\n" \
+            + body[seg_end:]
+        final_raw = raw[:len(raw) - len(body)] + new_body  # fm 段原样接新 body
+        results.append({"file": name, "changed": True,
+                        "old_n": len(old_lines), "new_n": len(new_lines),
+                        "removed": [l for l in old_lines if l not in new_lines],
+                        "added": [l for l in new_lines if l not in old_lines],
+                        "mapping": mapping, "_final_raw": final_raw})
+    changed = [r for r in results if r.get("changed")]
+    verbose = len(results) <= 8  # 小批量打明细，大批量落盘报告
+    for r in results:
+        if r.get("error"):
+            print(f"[ERR ] {r['file']}: {r['error']}")
+        elif r.get("changed"):
+            print(f"[DIFF] {r['file']}: {r['old_n']} → {r['new_n']} 行"
+                  f"（- {len(r['removed'])} / + {len(r['added'])}）")
+            if verbose:
+                for l in r["removed"]:
+                    print(f"   - {l[:150]}")
+                for l in r["added"]:
+                    print(f"   + {l[:150]}")
+                for mp in r["mapping"]:
+                    kept = mp["kept_same_doc"]
+                    note = f"同文书幸存 {len(kept)} 页" if kept else "无幸存页（整组隔离→自然少链）"
+                    print(f"   map {mp['broken'][-44:]} → {note}")
+        else:
+            print(f"[SAME] {r['file']}（幂等，无变更）")
+    print(f"[refresh-related] 目标 {len(results)} 页：变更 {len(changed)} / 幂等 "
+          f"{sum(1 for r in results if not r.get('error') and not r.get('changed'))} / "
+          f"错误 {sum(1 for r in results if r.get('error'))}")
+    if not verbose:
+        report = {"generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                  "mode": "refresh-related", "targets": len(results),
+                  "changed": len(changed), "results": [
+                      {k: v for k, v in r.items() if not k.startswith("_")}
+                      for r in results]}
+        rp = report_path("refresh-related", args)
+        write_report(rp, report)
+        print(f"[报告] {rp}")
+    if args.apply and changed:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = ctx["cases_dir"].parent.parent / ".llm-wiki" / "a3-backups" / \
+            f"refresh-related-{stamp}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        for r in changed:
+            src = ctx["cases_dir"] / r["file"]
+            shutil.copy2(src, backup_dir / r["file"])
+            src.write_bytes(r["_final_raw"].encode("utf-8"))
+        print(f"[备份] 原文件 → {backup_dir}")
+        print(f"[done] 写盘 {len(changed)} 页（frontmatter 未动）")
+    elif args.apply:
+        print("[done] 无变更可写")
+    return results
+
+
 def report_path(kind, args):
     suffix = ".json" if args.project == DEFAULT_PROJECT else f"-{args.project[:8]}.json"
     return REPORT_DIR / (kind + suffix)
@@ -843,13 +977,22 @@ def main():
     ap = argparse.ArgumentParser(description="A3 案例库 case 页补建收尾批（方案 plans/2026-10-29-a3-case-page-rebuild）")
     ap.add_argument("--apply", action="store_true", help="写库（写入前先跑全部前置断言）")
     ap.add_argument("--verify", action="store_true", help="不写库：§8 全量匹配 + 幂等 diff")
+    ap.add_argument("--refresh-related", action="store_true",
+                    help="②（方案-新挂账四条-20261105）：定向重算目标页「## 相关页面」段"
+                         "（frontmatter 不动；配合 --targets；与 --apply 连用才写盘）")
+    ap.add_argument("--targets", default="",
+                    help="--refresh-related 的目标 case 页（逗号分隔文件名，可省 .md）")
+    ap.add_argument("--targets-file", default="",
+                    help="--refresh-related 的目标清单文件（每行一个文件名，# 注释）")
     ap.add_argument("--project", default=DEFAULT_PROJECT, help="底座项目 uuid（默认 2025 wiki 实例）")
     ap.add_argument("--cases-dir", default=DEFAULT_CASES_DIR, help="case 页落盘目录")
     args = ap.parse_args()
     if args.apply and args.verify:
         die(2, "--apply 与 --verify 互斥")
     ctx = build_context(args)
-    if args.verify:
+    if args.refresh_related:
+        cmd_refresh_related(ctx, args)
+    elif args.verify:
         cmd_verify(ctx, args)
     elif args.apply:
         cmd_apply(ctx, args)
