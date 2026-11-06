@@ -14,12 +14,13 @@
                           启动前部署 app-state（路径改写到实际解压位置 +
                           目标机原设置备份/还原）
       data\app-state.json 模板 —— 取开发机 %APPDATA% 活配置（含 key，勿外传）
-      data\wiki\          案例库（md + media 原文页图片 + .llm-wiki 向量库）
-      data\知识库\        准则库
+      data\<库名>\        四库（2026-10-30 改名定稿，同名拷贝进包）：
+                          审计知识库 / 问询2025 / 准则库 / 问询2024
+                          （md + media 原文页图片 + .llm-wiki 向量库）
 
-    raw/（PDF 原件 + MinerU 解析缓存，案例库 6.7G）默认不带 —— 网站运行
-    （问答/检索/图谱/原文页）完全不读 raw；只有目标机要重跑拆题/重解析时
-    才需要（-WithRaw 带上）。新增文档的增量导入不受影响（新文档本无缓存）。
+    raw/（PDF 原件 + MinerU 解析缓存，四库合计约 10.7G）默认不带 —— 网站
+    运行（问答/检索/图谱/原文页）完全不读 raw；只有目标机要重跑拆题/重解析
+    时才需要（-WithRaw 带上）。新增文档的增量导入不受影响（新文档本无缓存）。
 
     ⚠️ 库是活库：C:\library 正被本机安装版使用。组装时若 19828 在听只警告
     不中止（idle 状态无写入，拷贝安全）；正在跑导入/嵌入时不要组装。
@@ -112,13 +113,16 @@ Write-Ok "模板就绪（含 key —— 整合包勿外传）"
 $rawXor = if ($WithRaw) { @() } else { @('raw') }
 $rawNote = if ($WithRaw) { '含 raw（-WithRaw：目标机可重跑导入）' } else { '排除 raw（运行不需要；-WithRaw 可带上）' }
 
-Write-Step "案例库 C:\library\wiki（$rawNote）"
-Copy-Tree 'C:\library\wiki' (Join-Path $staging 'data\wiki') $rawXor
-Write-Ok "案例库就绪"
-
-Write-Step "准则库 C:\library\知识库（$rawNote）"
-Copy-Tree 'C:\library\知识库' (Join-Path $staging 'data\知识库') $rawXor
-Write-Ok "准则库就绪"
+# 四库（2026-10-30 改名定稿）：C:\library\<名> → 包内 data\<名>（同名拷贝，
+# 与 app-state.json 注册路径一一对应，fix-state-paths.py 按同名改写）
+$libs = @('审计知识库', '问询2025', '准则库', '问询2024')
+foreach ($lib in $libs) {
+    $src = "C:\library\$lib"
+    if (-not (Test-Path $src)) { Die "库源不存在：$src（四库清单或 C:\library 布局又变了？）" }
+    Write-Step "库 $lib（$rawNote）"
+    Copy-Tree $src (Join-Path $staging "data\$lib") $rawXor
+    Write-Ok "$lib 就绪"
+}
 
 # ---------------------------------------------------------------- 体积报告
 Write-Step "产物体积"

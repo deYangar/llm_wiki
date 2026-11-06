@@ -10,9 +10,9 @@
 备份纪律：目标机已有**非本包**的 app-state.json 时，先备份到包内 backups\\
 （带时间戳，还原取最新）；已是本包部署版则直接覆盖，不产生堆积备份。
 
-路径改写：模板里的 C:/library/wiki、C:/library/知识库（开发机原路径）递归
-替换为本包实际路径——键名也替换（scheduledImportConfig:<path> 等键带路径），
-逻辑与 tools/portable/archive-20261012/run-full-import.py 的 deep_replace 同源。
+路径改写：模板里的 C:/library/<四库名>（开发机原路径）递归替换为本包实际
+路径——键名也替换（scheduledImportConfig:<path> 等键带路径），旧路径
+C:/library/wiki、C:/library/知识库（2026-10-30 改名前）一并兜底改写。
 """
 import json
 import os
@@ -22,13 +22,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent          # wiki 包根（llm-wiki.exe 所在）
 TPL = ROOT / "data" / "app-state.json"
-WIKI = ROOT / "data" / "wiki"
-ZK = ROOT / "data" / "知识库"
 APPSTATE_DST = Path(os.environ.get("APPDATA", "")) / "com.llmwiki.app" / "app-state.json"
 BACKUP_DIR = ROOT / "backups"
 
-OLD_WIKI = "C:/library/wiki"
-OLD_ZK = "C:/library/知识库"
+# 四库（2026-10-30 改名定稿，与 make-runtime-bundle.ps1 的拷贝清单一致）+
+# 两旧路径兜底（app-state 历史残留引用，如 scheduledImportConfig:<path> 键）。
+_LIBS = ("审计知识库", "问询2025", "准则库", "问询2024")
+PATH_PAIRS = [(f"C:/library/{n}", (ROOT / "data" / n).as_posix()) for n in _LIBS]
+PATH_PAIRS += [
+    ("C:/library/wiki", (ROOT / "data" / "问询2025").as_posix()),     # 旧案例库路径
+    ("C:/library/知识库", (ROOT / "data" / "审计知识库").as_posix()),  # 旧准则库路径
+]
 
 
 def posix(p: Path) -> str:
@@ -64,7 +68,7 @@ def is_ours(state_text: str) -> bool:
 def cmd_deploy():
     if not TPL.exists():
         die(f"包不完整：缺少模板 {TPL}")
-    pairs = [(OLD_WIKI, posix(WIKI)), (OLD_ZK, posix(ZK))]
+    pairs = PATH_PAIRS
     new = deep_replace(json.loads(TPL.read_text(encoding="utf-8-sig")), pairs)
 
     if APPSTATE_DST.exists():
@@ -81,7 +85,7 @@ def cmd_deploy():
 
     APPSTATE_DST.parent.mkdir(parents=True, exist_ok=True)
     APPSTATE_DST.write_text(json.dumps(new, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[deploy] 完成：{posix(WIKI)} / {posix(ZK)}")
+    print(f"[deploy] 完成：{len(_LIBS)} 库路径已指向本包（{posix(ROOT / 'data')}）")
 
 
 def cmd_restore():
